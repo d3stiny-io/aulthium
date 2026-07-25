@@ -134,6 +134,22 @@ e.g. <<<DIR_LIST path=".">>> on its own line, character-for-character. Do NOT us
 <tool_call>, <function_call>, JSON, or anything resembling a generic tool-calling convention — none of those
 are recognized and the action will silently fail to run. If you are not issuing one of the exact markers
 above, just write plain text.
+
+=== WORKED EXAMPLE ===
+
+User: "what's in notes.txt?"
+Your entire reply should be just:
+<<<FILE_READ path="notes.txt">>>
+
+(Nothing else on that line, no quotes around the whole thing, no backticks, no <tool_call> wrapper — just
+that one line by itself. You'll be sent the file contents in a follow-up message, and only then should you
+write your real answer as plain text.)
+
+User: "create a file called hello.txt with 'hi there' in it"
+Your entire reply should be just:
+<<<FILE_WRITE path="hello.txt">>>
+hi there
+<<<END_FILE_WRITE>>>
 EOF
 }
 
@@ -484,8 +500,8 @@ show_help() {
   echo
   printf "${C_ACCENT2}┌─ COMMANDS ────────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> help" "show this menu"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model" "open the free-model picker"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model <name>" "switch to a model by name"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model" "open the model picker (choose Free or Paid first)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model <name>" "switch to a model by name (confirmation required)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> current" "show current model"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir" "show the current sandbox folder"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir <path>" "change the sandbox folder"
@@ -558,6 +574,70 @@ fetch_free_models() {
   rm -f "$tmp"
 }
 
+fetch_paid_models() {
+  # Returns a sorted list of non-free (billed) model IDs, one per line.
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! curl -fsSL "$OPENROUTER_MODELS_URL" -o "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  jq -r '
+    .data[]
+    | .id
+    | select(endswith(":free") | not)
+  ' "$tmp" 2>/dev/null | sort -u
+
+  rm -f "$tmp"
+}
+
+# Asks the user to pick a tier (free vs paid) before any model list is shown.
+# Prints "free" or "paid" to stdout and returns 0, or returns 1 if cancelled.
+# Callers capture this with $(...), so every line of on-screen chrome below
+# is explicitly sent to stderr — only the final 'free'/'paid' result may
+# ever go to stdout.
+prompt_model_tier() {
+  local ans
+  while true; do
+    echo >&2
+    printf "${C_ACCENT2}┌─ MODEL PICKER ────────────────────────────────${C_RESET}\n" >&2
+    printf "${C_MUTED}│${C_RESET} current: ${C_OK}%s${C_RESET}\n" "$CURRENT_MODEL" >&2
+    printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n" >&2
+    printf "${C_MUTED}[1]${C_RESET} Free models ${C_DIM}(no cost, OpenRouter free tier)${C_RESET}\n" >&2
+    printf "${C_MUTED}[2]${C_RESET} Paid models ${C_DIM}(billed to your OpenRouter balance)${C_RESET}\n" >&2
+    echo >&2
+    read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Free or Paid? ${C_MUTED}[1/2, q to cancel]${C_RESET}: ")" ans || ans="q"
+    case "$ans" in
+      1|f|F|free|Free|FREE)
+        printf 'free'
+        return 0
+        ;;
+      2|p|P|paid|Paid|PAID)
+        printf 'paid'
+        return 0
+        ;;
+      q|Q)
+        return 1
+        ;;
+      *)
+        warn "Please choose 1 (Free), 2 (Paid), or q to cancel."
+        ;;
+    esac
+  done
+}
+
+# Blocking confirmation shown before any model switch actually takes effect.
+# Returns 0 (confirmed) only on an explicit y/yes; anything else, including a
+# blank Enter, is treated as "no" so a switch never happens by accident.
+confirm_model_switch() {
+  local candidate="$1" ans
+  echo
+  read -r -p "$(printf "${C_WARN}?${C_RESET} Switch to ${C_OK}%s${C_RESET}? ${C_MUTED}[y/N]${C_RESET}: " "$candidate")" ans || ans="n"
+  [[ "$ans" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
+}
+
 match_model_list() {
   # Prints models that match the search string, one per line.
   local query="$1"
@@ -565,68 +645,67 @@ match_model_list() {
   grep -iF "$query" "$models_file" || true
 }
 
-pick_model_ui() {
-  local models_tmp selection_tmp models_count selected_idx selected_model query matches_count match_line
+# Shows the numbered list for one tier and lets the user pick a model from
+# it. Every successful pick still goes through confirm_model_switch before
+# CURRENT_MODEL actually changes — declining drops back into this same list
+# instead of exiting the picker. Returns 0 once a switch is confirmed, or
+# once the user backs out (to the tier prompt) or cancels entirely.
+#   $1 = tier ("free" or "paid")
+# Return codes: 0 = switched, 2 = user asked to go back to tier picker,
+# 1 = cancelled entirely.
+pick_model_from_tier() {
+  local tier="$1"
+  local models_tmp selection_tmp models_count selected_idx query matches_count match_line candidate
   models_tmp="$(mktemp)"
   selection_tmp="$(mktemp)"
 
-  if ! fetch_free_models > "$models_tmp"; then
-    rm -f "$models_tmp" "$selection_tmp"
+  local fetch_fn="fetch_free_models"
+  [[ "$tier" == "paid" ]] && fetch_fn="fetch_paid_models"
+
+  if ! "$fetch_fn" > "$models_tmp"; then
     warn "Could not fetch live models right now."
-    muted "Falling back to a few known free models."
+    muted "Falling back to a few known $tier models."
     echo
-    printf "${C_MUTED}[1]${C_RESET} openrouter/free\n"
-    printf "${C_MUTED}[2]${C_RESET} meta-llama/llama-3.3-8b-instruct:free\n"
-    printf "${C_MUTED}[3]${C_RESET} deepseek/deepseek-chat-v3-0324:free\n"
-    printf "${C_MUTED}[4]${C_RESET} mistralai/mistral-small-3.2-24b-instruct:free\n"
-    printf "${C_MUTED}[5]${C_RESET} google/gemma-3-27b-it:free\n"
+    if [[ "$tier" == "free" ]]; then
+      printf "${C_MUTED}[1]${C_RESET} openrouter/free\n"
+      printf "${C_MUTED}[2]${C_RESET} meta-llama/llama-3.3-8b-instruct:free\n"
+      printf "${C_MUTED}[3]${C_RESET} deepseek/deepseek-chat-v3-0324:free\n"
+      printf "${C_MUTED}[4]${C_RESET} mistralai/mistral-small-3.2-24b-instruct:free\n"
+      printf "${C_MUTED}[5]${C_RESET} google/gemma-3-27b-it:free\n"
+      printf 'openrouter/free\nmeta-llama/llama-3.3-8b-instruct:free\ndeepseek/deepseek-chat-v3-0324:free\nmistralai/mistral-small-3.2-24b-instruct:free\ngoogle/gemma-3-27b-it:free\n' > "$models_tmp"
+    else
+      printf "${C_MUTED}[1]${C_RESET} openai/gpt-4o-mini\n"
+      printf "${C_MUTED}[2]${C_RESET} openai/gpt-4o\n"
+      printf "${C_MUTED}[3]${C_RESET} anthropic/claude-3.5-sonnet\n"
+      printf "${C_MUTED}[4]${C_RESET} google/gemini-flash-1.5\n"
+      printf "${C_MUTED}[5]${C_RESET} meta-llama/llama-3.1-70b-instruct\n"
+      printf 'openai/gpt-4o-mini\nopenai/gpt-4o\nanthropic/claude-3.5-sonnet\ngoogle/gemini-flash-1.5\nmeta-llama/llama-3.1-70b-instruct\n' > "$models_tmp"
+    fi
     echo
-    read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Model number or name ${C_MUTED}(q to cancel)${C_RESET}: ")" query
-    [[ "$query" == "q" ]] && return 0
-
-    case "$query" in
-      1) CURRENT_MODEL="openrouter/free" ;;
-      2) CURRENT_MODEL="meta-llama/llama-3.3-8b-instruct:free" ;;
-      3) CURRENT_MODEL="deepseek/deepseek-chat-v3-0324:free" ;;
-      4) CURRENT_MODEL="mistralai/mistral-small-3.2-24b-instruct:free" ;;
-      5) CURRENT_MODEL="google/gemma-3-27b-it:free" ;;
-      *)
-        if [[ "$query" == *":free" ]]; then
-          CURRENT_MODEL="$query"
-        else
-          warn "Invalid choice."
-          rm -f "$models_tmp" "$selection_tmp"
-          return 1
-        fi
-        ;;
-    esac
-
-    CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    ok "Switched to: $CURRENT_MODEL"
-    rm -f "$models_tmp" "$selection_tmp"
-    return 0
   fi
 
   mapfile -t MODELS < "$models_tmp"
   models_count="${#MODELS[@]}"
 
   if [[ "$models_count" -eq 0 ]]; then
-    warn "No free models found."
+    warn "No $tier models found."
     rm -f "$models_tmp" "$selection_tmp"
     return 1
   fi
 
   clear
   banner
-  printf "${C_ACCENT2}┌─ MODEL PICKER ────────────────────────────────${C_RESET}\n"
+  printf "${C_ACCENT2}┌─ MODEL PICKER — %s ────────────────────────────${C_RESET}\n" "${tier^^}"
   printf "${C_MUTED}│${C_RESET} current: ${C_OK}%s${C_RESET}\n" "$CURRENT_MODEL"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
-  printf "${C_MUTED}[0]${C_RESET} openrouter/free ${C_DIM}(auto-router)${C_RESET}\n"
+  if [[ "$tier" == "free" ]]; then
+    printf "${C_MUTED}[0]${C_RESET} openrouter/free ${C_DIM}(auto-router)${C_RESET}\n"
+  fi
   for i in "${!MODELS[@]}"; do
     printf "${C_MUTED}[%d]${C_RESET} %s\n" "$((i + 1))" "${MODELS[$i]}"
   done
   echo
-  muted "Type a number, part of a name, 'refresh', or 'q' to cancel."
+  muted "Type a number, part of a name, 'refresh', 'back' (choose tier again), or 'q' to cancel."
 
   while true; do
     read -r -p "$(printf "${C_ACCENT2}model>${C_RESET} ")" query || query="q"
@@ -634,36 +713,51 @@ pick_model_ui() {
     case "$query" in
       q|Q)
         rm -f "$models_tmp" "$selection_tmp"
-        return 0
+        return 1
+        ;;
+      back|BACK|b|B)
+        rm -f "$models_tmp" "$selection_tmp"
+        return 2
         ;;
       refresh|REFRESH)
-        rm -f "$models_tmp"
-        pick_model_ui
-        return $?
-        ;;
-      0)
-        CURRENT_MODEL="openrouter/free"
-        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        ok "Switched to: $CURRENT_MODEL"
         rm -f "$models_tmp" "$selection_tmp"
-        return 0
+        pick_model_from_tier "$tier"
+        return $?
         ;;
     esac
 
-    if [[ "$query" =~ ^[0-9]+$ ]]; then
-      selected_idx="$query"
-      if (( selected_idx >= 1 && selected_idx <= models_count )); then
-        CURRENT_MODEL="${MODELS[$((selected_idx - 1))]}"
+    if [[ "$query" == "0" && "$tier" == "free" ]]; then
+      candidate="openrouter/free"
+      if confirm_model_switch "$candidate"; then
+        CURRENT_MODEL="$candidate"
         CURRENT_MODEL_LABEL="$CURRENT_MODEL"
         ok "Switched to: $CURRENT_MODEL"
         rm -f "$models_tmp" "$selection_tmp"
         return 0
       fi
+      muted "Cancelled — pick another model or 'q' to exit."
+      continue
+    fi
+
+    if [[ "$query" =~ ^[0-9]+$ ]]; then
+      selected_idx="$query"
+      if (( selected_idx >= 1 && selected_idx <= models_count )); then
+        candidate="${MODELS[$((selected_idx - 1))]}"
+        if confirm_model_switch "$candidate"; then
+          CURRENT_MODEL="$candidate"
+          CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+          ok "Switched to: $CURRENT_MODEL"
+          rm -f "$models_tmp" "$selection_tmp"
+          return 0
+        fi
+        muted "Cancelled — pick another model or 'q' to exit."
+        continue
+      fi
       warn "Invalid number."
       continue
     fi
 
-    # Fuzzy search against the current list.
+    # Fuzzy search against the current tier's list.
     grep -iF "$query" "$models_tmp" > "$selection_tmp" || true
     matches_count="$(wc -l < "$selection_tmp" | tr -d ' ')"
 
@@ -673,11 +767,16 @@ pick_model_ui() {
     fi
 
     if [[ "$matches_count" -eq 1 ]]; then
-      CURRENT_MODEL="$(cat "$selection_tmp")"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
-      rm -f "$models_tmp" "$selection_tmp"
-      return 0
+      candidate="$(cat "$selection_tmp")"
+      if confirm_model_switch "$candidate"; then
+        CURRENT_MODEL="$candidate"
+        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+        ok "Switched to: $CURRENT_MODEL"
+        rm -f "$models_tmp" "$selection_tmp"
+        return 0
+      fi
+      muted "Cancelled — pick another model or 'q' to exit."
+      continue
     fi
 
     echo
@@ -692,11 +791,16 @@ pick_model_ui() {
     if [[ "$selected_idx" =~ ^[0-9]+$ ]]; then
       match_line="$(sed -n "${selected_idx}p" "$selection_tmp")"
       if [[ -n "$match_line" ]]; then
-        CURRENT_MODEL="$match_line"
-        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        ok "Switched to: $CURRENT_MODEL"
-        rm -f "$models_tmp" "$selection_tmp"
-        return 0
+        candidate="$match_line"
+        if confirm_model_switch "$candidate"; then
+          CURRENT_MODEL="$candidate"
+          CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+          ok "Switched to: $CURRENT_MODEL"
+          rm -f "$models_tmp" "$selection_tmp"
+          return 0
+        fi
+        muted "Cancelled — pick another model or 'q' to exit."
+        continue
       fi
     fi
 
@@ -704,33 +808,66 @@ pick_model_ui() {
   done
 }
 
+# Entry point for the "t> model" command. Always asks Free-or-Paid first,
+# then hands off to pick_model_from_tier, which itself always confirms
+# before committing a switch. 'back' from the tier list returns here so the
+# user can pick a different tier without leaving the picker entirely.
+pick_model_ui() {
+  local tier
+  while true; do
+    tier="$(prompt_model_tier)" || return 0
+    pick_model_from_tier "$tier"
+    case $? in
+      0) return 0 ;;   # switched
+      2) continue ;;    # user chose "back" — ask tier again
+      *) return 0 ;;    # cancelled
+    esac
+  done
+}
+
 set_model_by_name() {
   local input="$1"
-  local models_tmp exact_match fuzzy_match count
-  models_tmp="$(mktemp)"
+  local free_tmp paid_tmp exact_match fuzzy_match count candidate
 
-  if ! fetch_free_models > "$models_tmp"; then
-    rm -f "$models_tmp"
+  free_tmp="$(mktemp)"
+  paid_tmp="$(mktemp)"
+  fetch_free_models > "$free_tmp" || : > "$free_tmp"
+  fetch_paid_models > "$paid_tmp" || : > "$paid_tmp"
+
+  if [[ ! -s "$free_tmp" && ! -s "$paid_tmp" ]]; then
+    rm -f "$free_tmp" "$paid_tmp"
     if [[ "$input" == *":free" ]]; then
-      CURRENT_MODEL="$input"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
-      return 0
+      if confirm_model_switch "$input"; then
+        CURRENT_MODEL="$input"
+        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+        ok "Switched to: $CURRENT_MODEL"
+        return 0
+      fi
+      muted "Cancelled."
+      return 1
     fi
-    err "Could not fetch free models right now."
+    err "Could not fetch models right now."
     return 1
   fi
 
-  exact_match="$(grep -Fx "$input" "$models_tmp" || true)"
+  # Exact match, checking free first, then paid.
+  exact_match="$(grep -Fx "$input" "$free_tmp" || true)"
+  [[ -z "$exact_match" ]] && exact_match="$(grep -Fx "$input" "$paid_tmp" || true)"
   if [[ -n "$exact_match" ]]; then
-    CURRENT_MODEL="$input"
-    CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    ok "Switched to: $CURRENT_MODEL"
-    rm -f "$models_tmp"
-    return 0
+    if confirm_model_switch "$input"; then
+      CURRENT_MODEL="$input"
+      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
+      rm -f "$free_tmp" "$paid_tmp"
+      return 0
+    fi
+    muted "Cancelled."
+    rm -f "$free_tmp" "$paid_tmp"
+    return 1
   fi
 
-  fuzzy_match="$(grep -iF "$input" "$models_tmp" || true)"
+  # Fuzzy match across both lists combined.
+  fuzzy_match="$(cat "$free_tmp" "$paid_tmp" | grep -iF "$input" || true)"
   if [[ -z "$fuzzy_match" ]]; then
     count=0
   else
@@ -738,31 +875,42 @@ set_model_by_name() {
   fi
 
   if [[ "$count" -eq 1 ]]; then
-    CURRENT_MODEL="$(head -n 1 <<< "$fuzzy_match")"
-    CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    ok "Switched to: $CURRENT_MODEL"
-    rm -f "$models_tmp"
-    return 0
+    candidate="$(head -n 1 <<< "$fuzzy_match")"
+    if confirm_model_switch "$candidate"; then
+      CURRENT_MODEL="$candidate"
+      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
+      rm -f "$free_tmp" "$paid_tmp"
+      return 0
+    fi
+    muted "Cancelled."
+    rm -f "$free_tmp" "$paid_tmp"
+    return 1
   fi
 
   if [[ "$count" -gt 1 ]]; then
     echo "$fuzzy_match"
     echo
     warn "More than one match. Use 't> model' to pick one."
-    rm -f "$models_tmp"
+    rm -f "$free_tmp" "$paid_tmp"
     return 1
   fi
 
   if [[ "$input" == *":free" ]]; then
-    CURRENT_MODEL="$input"
-    CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    ok "Switched to: $CURRENT_MODEL"
-    rm -f "$models_tmp"
-    return 0
+    if confirm_model_switch "$input"; then
+      CURRENT_MODEL="$input"
+      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
+      rm -f "$free_tmp" "$paid_tmp"
+      return 0
+    fi
+    muted "Cancelled."
+    rm -f "$free_tmp" "$paid_tmp"
+    return 1
   fi
 
   warn "Model not found."
-  rm -f "$models_tmp"
+  rm -f "$free_tmp" "$paid_tmp"
   return 1
 }
 
@@ -1186,17 +1334,25 @@ process_agent_reply() {
         cleaned+="${C_ACCENT2}${ICON_ZIP} zip list: $path${C_RESET}"$'\n'
         continue
       fi
-      # Tolerance shim: some (usually smaller/free) models fall back on a
-      # <tool_call>ACTION path="..."> habit from their own training instead
-      # of the exact <<<...>>> marker, and keep repeating it even after being
-      # told to fix it. Rather than looping the model forever, accept this
-      # one alternate shape for the single-line actions (not FILE_WRITE or
-      # SHELL_RUN, which need a multi-line body) and dispatch it exactly like
-      # the real marker would be. Trailing junk after the closing >> (like
-      # </arg_value>) is tolerated and ignored.
-      if [[ "$line" =~ ^\<tool_call\>[[:space:]]*(FILE_READ|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ)[[:space:]]+path=\"([^\"]*)\"([[:space:]]+entry=\"([^\"]*)\")?.*\>\>?$ ]]; then
-        local alt_action="${BASH_REMATCH[1]}" alt_path="${BASH_REMATCH[2]}" alt_entry="${BASH_REMATCH[4]}"
-        warn "Accepted non-standard <tool_call> marker as: $alt_action path=\"$alt_path\""
+      # Tolerance shim: some (usually smaller/free) models fall back on
+      # near-miss shapes instead of the exact <<<...>>> marker, and keep
+      # repeating the same wrong shape even after being told to fix it.
+      # Rather than looping the model forever, accept several common
+      # near-miss shapes for the single-line actions (not FILE_WRITE or
+      # SHELL_RUN, which need a multi-line body) and dispatch them exactly
+      # like the real marker would be:
+      #   <tool_call>ACTION path="...">          (seen from some free models)
+      #   <ACTION path="...">                    (single angle brackets)
+      #   <<<ACTION path='...'>>>                (single quotes)
+      #   ```<<<ACTION path="...">>>```          (fenced in backticks)
+      # Trailing junk after the closing bracket (like </arg_value> or a
+      # stray backtick) is tolerated and ignored.
+      local shim_line="$line"
+      shim_line="${shim_line#\`\`\`}"
+      shim_line="${shim_line%\`\`\`}"
+      if [[ "$shim_line" =~ ^\<+(tool_call\>[[:space:]]*)?(FILE_READ|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ)[[:space:]]+path=[\"\']([^\"\']*)[\"\']([[:space:]]+entry=[\"\']([^\"\']*)[\"\'])?.*\>+.*$ ]]; then
+        local alt_action="${BASH_REMATCH[2]}" alt_path="${BASH_REMATCH[3]}" alt_entry="${BASH_REMATCH[5]}"
+        warn "Accepted non-standard marker as: $alt_action path=\"$alt_path\""
         case "$alt_action" in
           FILE_READ)
             read_paths+=("$alt_path")
