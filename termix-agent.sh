@@ -1107,6 +1107,50 @@ process_agent_reply() {
         cleaned+="${C_ACCENT2}${ICON_ZIP} zip list: $path${C_RESET}"$'\n'
         continue
       fi
+      # Tolerance shim: some (usually smaller/free) models fall back on a
+      # <tool_call>ACTION path="..."> habit from their own training instead
+      # of the exact <<<...>>> marker, and keep repeating it even after being
+      # told to fix it. Rather than looping the model forever, accept this
+      # one alternate shape for the single-line actions (not FILE_WRITE or
+      # SHELL_RUN, which need a multi-line body) and dispatch it exactly like
+      # the real marker would be. Trailing junk after the closing >> (like
+      # </arg_value>) is tolerated and ignored.
+      if [[ "$line" =~ ^\<tool_call\>[[:space:]]*(FILE_READ|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ)[[:space:]]+path=\"([^\"]*)\"([[:space:]]+entry=\"([^\"]*)\")?.*\>\>?$ ]]; then
+        local alt_action="${BASH_REMATCH[1]}" alt_path="${BASH_REMATCH[2]}" alt_entry="${BASH_REMATCH[4]}"
+        warn "Accepted non-standard <tool_call> marker as: $alt_action path=\"$alt_path\""
+        case "$alt_action" in
+          FILE_READ)
+            read_paths+=("$alt_path")
+            cleaned+="${C_ACCENT2}${ICON_READ} read: $alt_path${C_RESET}"$'\n'
+            ;;
+          FILE_DELETE)
+            delete_paths+=("$alt_path")
+            cleaned+="${C_ERR}${ICON_DELETE} delete: $alt_path${C_RESET}"$'\n'
+            ;;
+          FOLDER_CREATE)
+            folder_paths+=("$alt_path")
+            cleaned+="${C_WARN}${ICON_FOLDER} folder: $alt_path${C_RESET}"$'\n'
+            ;;
+          FOLDER_DELETE)
+            folder_delete_paths+=("$alt_path")
+            cleaned+="${C_ERR}${ICON_DELETE} delete folder: $alt_path${C_RESET}"$'\n'
+            ;;
+          DIR_LIST)
+            dirlist_paths+=("$alt_path")
+            cleaned+="${C_ACCENT2}${ICON_DIR} list: $alt_path${C_RESET}"$'\n'
+            ;;
+          ZIP_LIST)
+            ziplist_paths+=("$alt_path")
+            cleaned+="${C_ACCENT2}${ICON_ZIP} zip list: $alt_path${C_RESET}"$'\n'
+            ;;
+          ZIP_READ)
+            zipread_paths+=("$alt_path")
+            zipread_entries+=("$alt_entry")
+            cleaned+="${C_ACCENT2}${ICON_ZIP} zip read: $alt_path :: $alt_entry${C_RESET}"$'\n'
+            ;;
+        esac
+        continue
+      fi
       # Fallback: the line looks like an attempted action marker (mentions
       # one of the known action names) but didn't match any exact pattern
       # above — most likely a malformed/near-miss syntax (e.g. <tool_call>
