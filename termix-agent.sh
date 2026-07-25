@@ -255,7 +255,7 @@ status_panel() {
 cleanup_exit() {
   stop_spinner
   printf '\n'
-  say "Termix Agent has been closed."
+  printf "${C_OK}%s${C_RESET}\n" "Termix Agent has been closed." >&2
   exit 0
 }
 
@@ -276,7 +276,7 @@ start_spinner() {
     local i=0
     printf '\033[?25l' >&2
     while true; do
-      printf "\r${C_DIM}${C_ACCENT}%s %s${C_RESET}\033[K" "${frames[$i]}" "$msg" >&2
+      printf "\r${C_MUTED}%s %s${C_RESET}\033[K" "${frames[$i]}" "$msg" >&2
       i=$(( (i + 1) % ${#frames[@]} ))
       sleep 0.08
     done
@@ -1365,6 +1365,39 @@ call_openrouter() {
   printf 'HTTP_CODE:%s' "$http_code" >&2
 }
 
+# Wraps call_openrouter with automatic retry-with-backoff specifically for
+# HTTP 429 (rate limited) — common on OpenRouter's free-tier models under
+# any real load. Drop-in replacement for call_openrouter: same stdout/stderr
+# contract (body on stdout, "HTTP_CODE:<code>" on stderr), so callers don't
+# need to change. Manages its own spinner for both the request wait and the
+# backoff wait between attempts.
+MAX_RATE_LIMIT_RETRIES=3
+call_openrouter_with_retry() {
+  local messages="$1" attempt=0 wait_secs=3 body http_code code_tmp
+
+  while true; do
+    code_tmp="$(mktemp)"
+    start_spinner "thinking..."
+    body="$(call_openrouter "$messages" 2>"$code_tmp")"
+    stop_spinner
+    http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
+    rm -f "$code_tmp"
+
+    if [[ "$http_code" != "429" ]] || (( attempt >= MAX_RATE_LIMIT_RETRIES )); then
+      printf '%s' "$body"
+      printf 'HTTP_CODE:%s' "$http_code" >&2
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+    warn "Rate limited by OpenRouter (HTTP 429). Retrying in ${wait_secs}s... ($attempt/$MAX_RATE_LIMIT_RETRIES)"
+    start_spinner "rate limited, retrying in ${wait_secs}s..."
+    sleep "$wait_secs"
+    stop_spinner
+    wait_secs=$(( wait_secs * 2 ))
+  done
+}
+
 # Some free reasoning models occasionally dump their entire response into an
 # internal "reasoning" field and leave message.content empty even though the
 # request succeeded (finish_reason: stop). Pull that out as a fallback so we
@@ -1385,9 +1418,7 @@ get_completion() {
   local body http_code reply retry_messages reasoning code_tmp
   code_tmp="$(mktemp)"
 
-  start_spinner "thinking..."
-  body="$(call_openrouter "$messages_json" 2>"$code_tmp")"
-  stop_spinner
+  body="$(call_openrouter_with_retry "$messages_json" 2>"$code_tmp")"
   http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
 
   if [[ "$http_code" != "200" ]]; then
@@ -1411,9 +1442,7 @@ get_completion() {
     retry_messages="$(jq -c \
       '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any action or tool blocks if applicable."}]' \
       <<< "$messages_json")"
-    start_spinner "thinking..."
-    body="$(call_openrouter "$retry_messages" 2>"$code_tmp")"
-    stop_spinner
+    body="$(call_openrouter_with_retry "$retry_messages" 2>"$code_tmp")"
     http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
 
     if [[ "$http_code" == "200" ]]; then
