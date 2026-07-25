@@ -23,19 +23,28 @@ WORKSPACE_DIR=""
 # In-memory conversation history only.
 # We keep the system prompt in the history from the start.
 build_system_prompt() {
-  printf '%s\n\n%s%s\n%s\n\n%s\n%s\n%s\n%s\n\n%s\n%s\n\n%s %s %s' \
-    "You are Termix Agent, a helpful terminal-based AI assistant. Answer clearly and concisely. Be practical, friendly, and accurate." \
-    "You can propose file changes inside a single sandbox folder: " "$WORKSPACE_DIR" \
-    'You may ONLY use relative paths inside that folder. Never use absolute paths, never use ".." to escape it, and never ask the user to run destructive shell commands.' \
-    'To create or overwrite a file, output a block EXACTLY like this (nothing else on those marker lines):' \
-    '<<<FILE_WRITE path="relative/path.txt">>>
+  cat <<EOF
+You are Termix Agent, a helpful terminal-based AI assistant. Answer clearly and concisely. Be practical, friendly, and accurate.
+
+You can propose file and folder changes inside a single sandbox folder: $WORKSPACE_DIR
+You may ONLY use relative paths inside that folder. Never use absolute paths, never use ".." to escape it, and never ask the user to run destructive shell commands.
+
+To create or overwrite a file, output a block EXACTLY like this (nothing else on those marker lines):
+<<<FILE_WRITE path="relative/path.txt">>>
 the full file content goes here
-<<<END_FILE_WRITE>>>' \
-    'To delete a single file, output a line EXACTLY like this:' \
-    '<<<FILE_DELETE path="relative/path.txt">>>' \
-    'Every file action you propose will be shown to the user and requires their explicit yes/no confirmation before anything happens.' \
-    'You cannot delete folders, cannot run shell commands, and cannot touch anything outside the sandbox folder.' \
-    'If the user asks for something outside those bounds, explain the limitation instead.'
+<<<END_FILE_WRITE>>>
+
+To delete a single file, output a line EXACTLY like this:
+<<<FILE_DELETE path="relative/path.txt">>>
+
+To create an empty folder on its own (not just as a side effect of writing a file into it), output a line EXACTLY like this:
+<<<FOLDER_CREATE path="relative/folder">>>
+
+Every action you propose will be shown to the user and requires their explicit yes/no confirmation before anything happens. Note that FILE_WRITE will also create any missing parent folders for that file as part of the same confirmation, so you don't need a separate FOLDER_CREATE before writing a file into a new folder — only use FOLDER_CREATE when you want an empty folder with no file in it yet.
+
+You cannot delete folders, cannot run shell commands, and cannot touch anything outside the sandbox folder.
+If the user asks for something outside those bounds, explain the limitation instead.
+EOF
 }
 
 need_cmd() {
@@ -270,11 +279,13 @@ Chat:
   Type any normal message at the chat> prompt.
 
 File agent:
-  The agent can propose creating, overwriting, or deleting a single file
-  inside the sandbox folder (see 't> workdir'). Every proposed change is
-  shown to you and requires a yes/no confirmation before anything touches
-  disk. It cannot delete folders, run shell commands, or reach outside the
-  sandbox folder under any circumstance.
+  The agent can propose creating/overwriting a file, deleting a single file,
+  or creating an empty folder, all inside the sandbox folder (see
+  't> workdir'). Every proposed change is shown to you and requires a
+  yes/no confirmation before anything touches disk — a file write that
+  needs a new parent folder will say so up front. It cannot delete folders,
+  run shell commands, or reach outside the sandbox folder under any
+  circumstance.
 
 EOF
 }
@@ -520,21 +531,31 @@ set_model_by_name() {
 }
 
 handle_write_action() {
-  local rel="$1" content_file="$2" abs lines
+  local rel="$1" content_file="$2" abs lines parent_dir missing_dirs
 
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe write proposal: $rel"; return; }
+
+  parent_dir="$(dirname "$abs")"
+  missing_dirs=""
+  if [[ ! -d "$parent_dir" ]]; then
+    # Show the path relative to the workspace so it's meaningful to the user.
+    missing_dirs="${parent_dir#"$WORKSPACE_DIR"/}"
+  fi
 
   lines="$(wc -l < "$content_file" | tr -d ' ')"
   echo
   say "Agent wants to write a file:"
   echo "  $abs"
   echo "  ($lines lines)"
+  if [[ -n "$missing_dirs" ]]; then
+    echo "  This will also create folder(s): $missing_dirs"
+  fi
   echo "--- preview (first 40 lines) ---"
   sed -n '1,40p' "$content_file"
   echo "--- end preview ---"
 
   if confirm_yes_no "Apply this write?"; then
-    mkdir -p "$(dirname "$abs")" 2>/dev/null
+    mkdir -p "$parent_dir" 2>/dev/null
     if cp "$content_file" "$abs"; then
       say "✓ Wrote $abs"
     else
@@ -542,6 +563,35 @@ handle_write_action() {
     fi
   else
     warn "Skipped write: $rel"
+  fi
+}
+
+handle_folder_create_action() {
+  local rel="$1" abs
+
+  abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe folder proposal: $rel"; return; }
+
+  if [[ -e "$abs" ]]; then
+    if [[ -d "$abs" ]]; then
+      warn "Folder already exists, nothing to do: $abs"
+    else
+      err "A file already exists at that path (not a folder): $abs"
+    fi
+    return
+  fi
+
+  echo
+  say "Agent wants to create a folder:"
+  echo "  $abs"
+
+  if confirm_yes_no "Create this folder?"; then
+    if mkdir -p "$abs"; then
+      say "✓ Created $abs"
+    else
+      err "Failed to create $abs"
+    fi
+  else
+    warn "Skipped folder creation: $rel"
   fi
 }
 
@@ -575,14 +625,14 @@ handle_delete_action() {
   fi
 }
 
-# Scans an assistant reply for FILE_WRITE / FILE_DELETE markers, strips them
-# out of what's shown as plain chat text, and runs each proposed action
-# through the sandboxed, confirmation-gated handlers above.
+# Scans an assistant reply for FILE_WRITE / FILE_DELETE / FOLDER_CREATE
+# markers, strips them out of what's shown as plain chat text, and runs each
+# proposed action through the sandboxed, confirmation-gated handlers above.
 process_agent_reply() {
   local reply="$1"
   local mode="text" path="" write_file="" idx=0
   local cleaned="" line
-  local -a write_paths=() write_files=() delete_paths=()
+  local -a write_paths=() write_files=() delete_paths=() folder_paths=()
   local tmpdir
   tmpdir="$(mktemp -d)"
 
@@ -603,6 +653,12 @@ process_agent_reply() {
         cleaned+="[proposed file delete: $path]"$'\n'
         continue
       fi
+      if [[ "$line" =~ ^\<\<\<FOLDER_CREATE\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        folder_paths+=("$path")
+        cleaned+="[proposed folder create: $path]"$'\n'
+        continue
+      fi
       cleaned+="$line"$'\n'
     else
       if [[ "$line" == '<<<END_FILE_WRITE>>>' ]]; then
@@ -620,6 +676,9 @@ process_agent_reply() {
   local i
   for i in "${!write_paths[@]}"; do
     handle_write_action "${write_paths[$i]}" "${write_files[$i]}"
+  done
+  for path in "${folder_paths[@]}"; do
+    handle_folder_create_action "$path"
   done
   for path in "${delete_paths[@]}"; do
     handle_delete_action "$path"
@@ -644,16 +703,15 @@ ask_api_key() {
   fi
 }
 
-send_chat() {
-  local user_text="$1"
-  local payload tmp_body http_code body reply
+call_openrouter() {
+  # $1 = messages JSON array. Writes response body to stdout, http code to
+  # stderr on a line prefixed with "HTTP_CODE:" so both can be captured.
+  local messages="$1" payload tmp_body http_code body
+
   tmp_body="$(mktemp)"
-
-  append_message "user" "$user_text"
-
   payload="$(jq -nc \
     --arg model "$CURRENT_MODEL" \
-    --argjson messages "$messages_json" \
+    --argjson messages "$messages" \
     '{
       model: $model,
       messages: $messages,
@@ -678,24 +736,85 @@ send_chat() {
   body="$(cat "$tmp_body")"
   rm -f "$tmp_body"
 
+  printf '%s' "$body"
+  printf 'HTTP_CODE:%s' "$http_code" >&2
+}
+
+# Some free reasoning models occasionally dump their entire response into an
+# internal "reasoning" field and leave message.content empty even though the
+# request succeeded (finish_reason: stop). Pull that out as a fallback so we
+# have something usable instead of just failing.
+extract_reasoning_text() {
+  local body="$1"
+  jq -r '
+    .choices[0].message.reasoning
+    // ([.choices[0].message.reasoning_details[]?.text] | join("\n"))
+    // empty
+  ' <<< "$body" 2>/dev/null
+}
+
+send_chat() {
+  local user_text="$1"
+  local body http_code reply retry_messages reasoning code_tmp
+  code_tmp="$(mktemp)"
+
+  append_message "user" "$user_text"
+
+  body="$(call_openrouter "$messages_json" 2>"$code_tmp")"
+  http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
+
   if [[ "$http_code" != "200" ]]; then
     err "OpenRouter request failed (HTTP $http_code)."
     if [[ -n "$body" ]]; then
       echo "$body" | jq -r '.error.message // .message // .error // empty' 2>/dev/null || true
       echo "$body" | jq '.' 2>/dev/null || echo "$body"
     fi
+    rm -f "$code_tmp"
     return 1
   fi
 
   reply="$(jq -r '.choices[0].message.content // empty' <<< "$body" 2>/dev/null)"
+
   if [[ -z "$reply" ]]; then
-    err "No reply content returned."
-    echo "$body" | jq '.' 2>/dev/null || echo "$body"
-    return 1
+    # Some free reasoning models occasionally return finish_reason: stop with
+    # an empty message.content, having dumped everything into an internal
+    # "reasoning" field instead. Give it one retry with an explicit nudge
+    # before giving up.
+    warn "Model returned no final answer. Retrying once..."
+    retry_messages="$(jq -c \
+      '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any <<<FILE_WRITE>>> or <<<FILE_DELETE>>> blocks if applicable."}]' \
+      <<< "$messages_json")"
+    body="$(call_openrouter "$retry_messages" 2>"$code_tmp")"
+    http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
+
+    if [[ "$http_code" == "200" ]]; then
+      reply="$(jq -r '.choices[0].message.content // empty' <<< "$body" 2>/dev/null)"
+    fi
   fi
 
-  append_message "assistant" "$reply"
-  process_agent_reply "$reply"
+  rm -f "$code_tmp"
+
+  if [[ -n "$reply" ]]; then
+    append_message "assistant" "$reply"
+    process_agent_reply "$reply"
+    return 0
+  fi
+
+  # Both attempts came back with empty content. Fall back to the model's
+  # reasoning trace, if any, rather than showing nothing at all.
+  reasoning="$(extract_reasoning_text "$body")"
+  if [[ -n "$reasoning" ]]; then
+    warn "This model didn't return a final answer, only its internal reasoning."
+    echo "Showing that instead — treat it as a rough idea, not a finished answer:"
+    printf '\n\033[1;36mTermix (reasoning trace)>\033[0m %s\n\n' "$reasoning"
+    warn "Consider switching models with 't> model' — this one struggled with this request."
+    append_message "assistant" "$reasoning"
+    return 0
+  fi
+
+  err "No reply content returned."
+  echo "$body" | jq '.' 2>/dev/null || echo "$body"
+  return 1
 }
 
 command_router() {
