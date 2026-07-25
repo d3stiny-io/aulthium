@@ -7,7 +7,7 @@ set -u
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="TERMIX AGENT"
-APP_VERSION="v1.0"
+APP_VERSION="v1.1"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 DEFAULT_MODEL="openrouter/free"
@@ -26,8 +26,30 @@ build_system_prompt() {
   cat <<EOF
 You are Termix Agent, a helpful terminal-based AI assistant. Answer clearly and concisely. Be practical, friendly, and accurate.
 
-You can propose file and folder changes inside a single sandbox folder: $WORKSPACE_DIR
-You may ONLY use relative paths inside that folder. Never use absolute paths, never use ".." to escape it, and never ask the user to run destructive shell commands.
+You operate on a single sandbox folder: $WORKSPACE_DIR
+Every path you reference in a marker below MUST be a relative path inside that folder. Never use absolute paths, and never use ".." to escape it.
+
+=== READING / INSPECTING (no confirmation needed, results are sent back to you) ===
+
+To read a text file's contents, output a line EXACTLY like this:
+<<<FILE_READ path="relative/path.txt">>>
+
+To list the contents of a folder, output a line EXACTLY like this:
+<<<DIR_LIST path="relative/folder">>>
+(use path="." to list the workspace root)
+
+To list the entries inside a zip archive without extracting it, output a line EXACTLY like this:
+<<<ZIP_LIST path="relative/archive.zip">>>
+
+To read one specific entry's contents from inside a zip archive, output a line EXACTLY like this:
+<<<ZIP_READ path="relative/archive.zip" entry="path/inside/zip.txt">>>
+
+You can issue several of the above in one reply. Their results are appended to the conversation as a
+follow-up message and you will automatically be prompted again with that information, so you can request
+something, wait for the result, and then give your real answer or take further action in a later turn.
+Large or binary files are truncated/rejected — you'll be told when that happens.
+
+=== CHANGING FILES (shown to the user, requires explicit yes/no confirmation) ===
 
 To create or overwrite a file, output a block EXACTLY like this (nothing else on those marker lines):
 <<<FILE_WRITE path="relative/path.txt">>>
@@ -40,9 +62,25 @@ To delete a single file, output a line EXACTLY like this:
 To create an empty folder on its own (not just as a side effect of writing a file into it), output a line EXACTLY like this:
 <<<FOLDER_CREATE path="relative/folder">>>
 
-Every action you propose will be shown to the user and requires their explicit yes/no confirmation before anything happens. Note that FILE_WRITE will also create any missing parent folders for that file as part of the same confirmation, so you don't need a separate FOLDER_CREATE before writing a file into a new folder — only use FOLDER_CREATE when you want an empty folder with no file in it yet.
+FILE_WRITE will also create any missing parent folders for that file as part of the same confirmation, so you
+don't need a separate FOLDER_CREATE before writing a file into a new folder — only use FOLDER_CREATE when you
+want an empty folder with no file in it yet. You cannot delete folders, only single files.
 
-You cannot delete folders, cannot run shell commands, and cannot touch anything outside the sandbox folder.
+=== RUNNING SHELL COMMANDS (shown to the user, requires explicit yes/no confirmation) ===
+
+To run one or more shell commands, output a block EXACTLY like this:
+<<<SHELL_RUN>>>
+the shell command(s) go here
+<<<END_SHELL_RUN>>>
+
+The command runs with the workspace folder ($WORKSPACE_DIR) as its current directory, using the user's real
+shell privileges — it is NOT confined to the sandbox the way file actions are, so only propose commands you
+are confident are safe, relevant, and non-destructive, and never propose a command aimed at files or paths
+outside the workspace. The user always sees the exact command text and must approve it before it runs.
+Prefer FILE_READ / FILE_WRITE / DIR_LIST for simple file inspection or edits; reach for SHELL_RUN when you
+actually need to execute something (e.g. running a build, a script, git, or a CLI tool). Output from the
+command (stdout/stderr, possibly truncated) is sent back to you the same way as the reading markers above.
+
 If the user asks for something outside those bounds, explain the limitation instead.
 EOF
 }
@@ -55,20 +93,90 @@ need_cmd() {
   }
 }
 
+# ── Palette ────────────────────────────────────────────────────────────────
+# Single source of truth for color. Everything else in the UI pulls from
+# these instead of inlining escape codes, so the whole app reads as one
+# consistent, deliberate visual identity rather than a patchwork.
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_DIM=$'\033[2m'
+C_ACCENT=$'\033[1;36m'    # cyan    — brand, headers, agent's spoken replies
+C_ACCENT2=$'\033[1;35m'   # magenta — tool/action activity
+C_OK=$'\033[1;32m'        # green   — success
+C_WARN=$'\033[1;33m'      # yellow  — caution
+C_ERR=$'\033[1;31m'       # red     — failure / danger
+C_MUTED=$'\033[2;37m'     # dim     — secondary text, paths, meta
+
+# ── Iconography ────────────────────────────────────────────────────────────
+# One glyph per action type, used everywhere that action is shown so the eye
+# learns to recognize it at a glance. Plain box-drawing/typographic symbols
+# only — no emoji — so it renders identically on Termux, SSH, and desktop.
+ICON_READ="▸"     # inspecting a file
+ICON_DIR="▤"      # listing a folder
+ICON_ZIP="▥"      # zip archive activity
+ICON_WRITE="✎"    # writing/overwriting a file
+ICON_DELETE="✕"   # deleting a file
+ICON_FOLDER="+"   # creating a folder
+ICON_SHELL="❯"    # running a shell command
+ICON_OK="✓"
+ICON_WARN="⚠"
+ICON_ERR="✗"
+
 say() {
-  printf '\033[1;36m%s\033[0m\n' "$*"
+  printf "${C_ACCENT}%s${C_RESET}\n" "$*"
 }
 
 warn() {
-  printf '\033[1;33m%s\033[0m\n' "$*"
+  printf "${C_WARN}${ICON_WARN} %s${C_RESET}\n" "$*"
 }
 
 err() {
-  printf '\033[1;31m%s\033[0m\n' "$*"
+  printf "${C_ERR}${ICON_ERR} %s${C_RESET}\n" "$*"
+}
+
+ok() {
+  printf "${C_OK}${ICON_OK} %s${C_RESET}\n" "$*"
+}
+
+muted() {
+  printf "${C_MUTED}%s${C_RESET}\n" "$*"
+}
+
+# A single 48-char rule used to build boxed section headers/footers of a
+# consistent width, regardless of title length.
+RULE_LINE="────────────────────────────────────────────────"
+
+# box_top "TITLE" "$ICON" "$COLOR" — opens a labeled section, e.g.:
+#   ┌─ ▸ FILE READ ──────────────────────────────
+# Appends the full rule after the label rather than padding to an exact
+# total width — computing that padding via byte-offset substring slicing
+# breaks multi-byte icons under a non-UTF-8 locale (common on minimal
+# Termux/Linux installs), so this trades pixel-perfect alignment for
+# correctness everywhere.
+box_top() {
+  local title="$1" icon="${2:-}" color="${3:-$C_ACCENT2}" label
+  if [[ -n "$icon" ]]; then
+    label="${icon} ${title}"
+  else
+    label="${title}"
+  fi
+  printf "\n%s┌─ %s %s%s\n" "$color" "$label" "$RULE_LINE" "$C_RESET"
+}
+
+# box_line "text" — a body line inside a box, prefixed with a dim rail so it
+# visually nests under the header above it.
+box_line() {
+  printf "${C_MUTED}│${C_RESET} %s\n" "$*"
+}
+
+# box_bottom "$COLOR" — closes a section opened with box_top.
+box_bottom() {
+  local color="${1:-$C_ACCENT2}"
+  printf "${color}└%s${C_RESET}\n" "$RULE_LINE"
 }
 
 banner() {
-  printf '\033[1;36m'
+  printf "${C_ACCENT}"
   cat <<'EOF'
 ████████╗███████╗██████╗ ███╗   ███╗██╗██╗  ██╗
 ╚══██╔══╝██╔════╝██╔══██╗████╗ ████║██║╚██╗██╔╝
@@ -76,11 +184,20 @@ banner() {
    ██║   ██╔══╝  ██╔══██╗██║╚██╔╝██║██║ ██╔██╗
    ██║   ███████╗██║  ██║██║ ╚═╝ ██║██║██╔╝ ██╗
    ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═╝
-
-             T E R M I X   A G E N T
-               AI Terminal Assistant
 EOF
-  printf '\033[0m\n'
+  printf "${C_RESET}${C_DIM}             T E R M I X   A G E N T${C_RESET}\n"
+  printf "${C_MUTED}               AI Terminal Assistant · %s${C_RESET}\n\n" "$APP_VERSION"
+}
+
+# Renders the "connected / model / sandbox" status panel shown at startup
+# and after 't> clear'. Centralized so both call sites always match.
+status_panel() {
+  printf "${C_ACCENT2}┌─ SESSION ─────────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} %-10s ${C_OK}%s${C_RESET}\n" "provider" "OpenRouter — connected"
+  printf "${C_MUTED}│${C_RESET} %-10s %s\n" "model" "$CURRENT_MODEL"
+  printf "${C_MUTED}│${C_RESET} %-10s %s\n" "sandbox" "$WORKSPACE_DIR"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}Type ${C_RESET}t> help${C_MUTED} for commands · ${C_RESET}Ctrl+C${C_MUTED} to exit${C_RESET}\n\n"
 }
 
 cleanup_exit() {
@@ -91,6 +208,16 @@ cleanup_exit() {
 
 trap cleanup_exit INT
 
+want_cmd() {
+  # Like need_cmd but non-fatal: just remembers that a feature is unavailable
+  # so we can tell the model/user instead of crashing the whole app.
+  if ! command -v "$1" >/dev/null 2>&1; then
+    warn "Optional dependency missing: $1 (some features will be disabled)"
+    return 1
+  fi
+  return 0
+}
+
 check_deps() {
   need_cmd curl
   need_cmd jq
@@ -98,11 +225,18 @@ check_deps() {
   need_cmd sort
   need_cmd grep
   need_cmd realpath
+
+  HAVE_UNZIP=1
+  want_cmd unzip || HAVE_UNZIP=0
+  HAVE_FILE=1
+  want_cmd file || HAVE_FILE=0
+  HAVE_TIMEOUT=1
+  want_cmd timeout || HAVE_TIMEOUT=0
 }
 
 confirm_yes_no() {
   local prompt="$1" ans
-  read -r -p "$prompt [y/N]: " ans || ans="n"
+  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} %s ${C_MUTED}[y/N]${C_RESET} " "$prompt")" ans || ans="n"
   [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
@@ -172,7 +306,7 @@ set_workspace_dir() {
   fi
 
   WORKSPACE_DIR="$abs"
-  say "✓ Workspace set to: $WORKSPACE_DIR"
+  ok "Workspace set to: $WORKSPACE_DIR"
   return 0
 }
 
@@ -261,47 +395,62 @@ append_message() {
 }
 
 show_help() {
-  cat <<'EOF'
+  echo
+  printf "${C_ACCENT2}┌─ COMMANDS ────────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> help" "show this menu"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model" "open the free-model picker"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model <name>" "switch to a model by name"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> current" "show current model"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir" "show the current sandbox folder"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir <path>" "change the sandbox folder"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> clear" "clear the terminal"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> reset" "start a new conversation"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> history" "show chat history"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> exit" "exit Termix Agent"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
-Commands:
-  t> help                 Show this menu
-  t> model                Open the free-model picker
-  t> model <name>         Switch to a model by name
-  t> current              Show current model
-  t> workdir              Show the current sandbox folder
-  t> workdir <path>       Change the sandbox folder
-  t> clear                Clear the terminal
-  t> reset                Start a new conversation
-  t> history              Show chat history
-  t> exit                 Exit Termix Agent
+  printf "\n${C_MUTED}Chat: type any normal message at the ${C_RESET}chat>${C_MUTED} prompt.${C_RESET}\n"
 
-Chat:
-  Type any normal message at the chat> prompt.
+  printf "\n${C_ACCENT2}┌─ FILE AGENT ──────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_READ} ${ICON_DIR} ${ICON_ZIP}${C_RESET}  read files, list folders, inspect zips —\n"
+  printf "${C_MUTED}│${C_RESET}       runs automatically, no confirmation (read-only),\n"
+  printf "${C_MUTED}│${C_RESET}       results are fed back to the agent for its next turn.\n"
+  printf "${C_MUTED}│${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} ${C_WARN}${ICON_WRITE} ${ICON_DELETE} ${ICON_FOLDER}${C_RESET}  write/overwrite a file, delete a single file,\n"
+  printf "${C_MUTED}│${C_RESET}       or create an empty folder — every one of these is\n"
+  printf "${C_MUTED}│${C_RESET}       shown to you and needs a yes/no confirmation first.\n"
+  printf "${C_MUTED}│${C_RESET}       Folders can't be deleted; nothing ever reaches\n"
+  printf "${C_MUTED}│${C_RESET}       outside the sandbox folder.\n"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
-File agent:
-  The agent can propose creating/overwriting a file, deleting a single file,
-  or creating an empty folder, all inside the sandbox folder (see
-  't> workdir'). Every proposed change is shown to you and requires a
-  yes/no confirmation before anything touches disk — a file write that
-  needs a new parent folder will say so up front. It cannot delete folders,
-  run shell commands, or reach outside the sandbox folder under any
-  circumstance.
-
-EOF
+  printf "\n${C_ACCENT2}┌─ SHELL AGENT ─────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} ${C_ERR}${ICON_SHELL}${C_RESET}      the agent can propose shell command(s), shown\n"
+  printf "${C_MUTED}│${C_RESET}       to you in full before you approve or decline.\n"
+  printf "${C_MUTED}│${C_RESET}       Unlike file actions, shell commands are ${C_BOLD}NOT${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET}       confined to the sandbox — they run with your real\n"
+  printf "${C_MUTED}│${C_RESET}       shell privileges, so only approve what you trust.\n"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
 }
 
 show_history() {
   local count
   count="$(jq 'length' <<< "$messages_json")"
   if [[ "$count" -le 1 ]]; then
-    echo "No history yet."
+    muted "No history yet."
     return
   fi
 
+  echo
   jq -r '
     .[1:][] |
-    "\(.role): \(.content)"
-  ' <<< "$messages_json"
+    "\(.role)\u0001\(.content)"
+  ' <<< "$messages_json" | while IFS=$'\001' read -r role content; do
+    case "$role" in
+      user) printf "${C_ACCENT2}%-10s${C_RESET}%s\n\n" "you" "$content" ;;
+      assistant) printf "${C_ACCENT}%-10s${C_RESET}%s\n\n" "termix" "$content" ;;
+      *) printf "${C_MUTED}%-10s${C_RESET}%s\n\n" "$role" "$content" ;;
+    esac
+  done
 }
 
 fetch_free_models() {
@@ -338,16 +487,15 @@ pick_model_ui() {
   if ! fetch_free_models > "$models_tmp"; then
     rm -f "$models_tmp" "$selection_tmp"
     warn "Could not fetch live models right now."
-    echo "Falling back to a few known free models."
-    cat <<'EOF'
-[1] openrouter/free
-[2] meta-llama/llama-3.3-8b-instruct:free
-[3] deepseek/deepseek-chat-v3-0324:free
-[4] mistralai/mistral-small-3.2-24b-instruct:free
-[5] google/gemma-3-27b-it:free
-EOF
+    muted "Falling back to a few known free models."
     echo
-    read -r -p "Model number or name (q to cancel): " query
+    printf "${C_MUTED}[1]${C_RESET} openrouter/free\n"
+    printf "${C_MUTED}[2]${C_RESET} meta-llama/llama-3.3-8b-instruct:free\n"
+    printf "${C_MUTED}[3]${C_RESET} deepseek/deepseek-chat-v3-0324:free\n"
+    printf "${C_MUTED}[4]${C_RESET} mistralai/mistral-small-3.2-24b-instruct:free\n"
+    printf "${C_MUTED}[5]${C_RESET} google/gemma-3-27b-it:free\n"
+    echo
+    read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Model number or name ${C_MUTED}(q to cancel)${C_RESET}: ")" query
     [[ "$query" == "q" ]] && return 0
 
     case "$query" in
@@ -368,7 +516,7 @@ EOF
     esac
 
     CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    say "✓ Switched to: $CURRENT_MODEL"
+    ok "Switched to: $CURRENT_MODEL"
     rm -f "$models_tmp" "$selection_tmp"
     return 0
   fi
@@ -384,18 +532,18 @@ EOF
 
   clear
   banner
-  echo "Free model picker"
-  echo "Current: $CURRENT_MODEL"
-  echo
-  echo "[0] openrouter/free (auto-router)"
+  printf "${C_ACCENT2}┌─ MODEL PICKER ────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} current: ${C_OK}%s${C_RESET}\n" "$CURRENT_MODEL"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
+  printf "${C_MUTED}[0]${C_RESET} openrouter/free ${C_DIM}(auto-router)${C_RESET}\n"
   for i in "${!MODELS[@]}"; do
-    printf "[%d] %s\n" "$((i + 1))" "${MODELS[$i]}"
+    printf "${C_MUTED}[%d]${C_RESET} %s\n" "$((i + 1))" "${MODELS[$i]}"
   done
   echo
-  echo "Type a number, part of a name, 'refresh', or 'q' to cancel."
+  muted "Type a number, part of a name, 'refresh', or 'q' to cancel."
 
   while true; do
-    read -r -p "Model> " query || query="q"
+    read -r -p "$(printf "${C_ACCENT2}model>${C_RESET} ")" query || query="q"
 
     case "$query" in
       q|Q)
@@ -410,7 +558,7 @@ EOF
       0)
         CURRENT_MODEL="openrouter/free"
         CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        say "✓ Switched to: $CURRENT_MODEL"
+        ok "Switched to: $CURRENT_MODEL"
         rm -f "$models_tmp" "$selection_tmp"
         return 0
         ;;
@@ -421,7 +569,7 @@ EOF
       if (( selected_idx >= 1 && selected_idx <= models_count )); then
         CURRENT_MODEL="${MODELS[$((selected_idx - 1))]}"
         CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        say "✓ Switched to: $CURRENT_MODEL"
+        ok "Switched to: $CURRENT_MODEL"
         rm -f "$models_tmp" "$selection_tmp"
         return 0
       fi
@@ -441,16 +589,18 @@ EOF
     if [[ "$matches_count" -eq 1 ]]; then
       CURRENT_MODEL="$(cat "$selection_tmp")"
       CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      say "✓ Switched to: $CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
       rm -f "$models_tmp" "$selection_tmp"
       return 0
     fi
 
     echo
-    echo "Matches:"
-    nl -ba "$selection_tmp" | sed 's/^\s*//'
+    printf "${C_MUTED}Matches:${C_RESET}\n"
+    nl -ba "$selection_tmp" | sed 's/^\s*//' | while IFS=$'\t' read -r n m; do
+      printf "${C_MUTED}[%s]${C_RESET} %s\n" "$n" "$m"
+    done
     echo
-    read -r -p "Choose number or q: " selected_idx || selected_idx="q"
+    read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Choose number or q: ")" selected_idx || selected_idx="q"
     [[ "$selected_idx" == "q" ]] && continue
 
     if [[ "$selected_idx" =~ ^[0-9]+$ ]]; then
@@ -458,7 +608,7 @@ EOF
       if [[ -n "$match_line" ]]; then
         CURRENT_MODEL="$match_line"
         CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        say "✓ Switched to: $CURRENT_MODEL"
+        ok "Switched to: $CURRENT_MODEL"
         rm -f "$models_tmp" "$selection_tmp"
         return 0
       fi
@@ -478,7 +628,7 @@ set_model_by_name() {
     if [[ "$input" == *":free" ]]; then
       CURRENT_MODEL="$input"
       CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      say "✓ Switched to: $CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
       return 0
     fi
     err "Could not fetch free models right now."
@@ -489,7 +639,7 @@ set_model_by_name() {
   if [[ -n "$exact_match" ]]; then
     CURRENT_MODEL="$input"
     CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    say "✓ Switched to: $CURRENT_MODEL"
+    ok "Switched to: $CURRENT_MODEL"
     rm -f "$models_tmp"
     return 0
   fi
@@ -504,7 +654,7 @@ set_model_by_name() {
   if [[ "$count" -eq 1 ]]; then
     CURRENT_MODEL="$(head -n 1 <<< "$fuzzy_match")"
     CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    say "✓ Switched to: $CURRENT_MODEL"
+    ok "Switched to: $CURRENT_MODEL"
     rm -f "$models_tmp"
     return 0
   fi
@@ -520,7 +670,7 @@ set_model_by_name() {
   if [[ "$input" == *":free" ]]; then
     CURRENT_MODEL="$input"
     CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    say "✓ Switched to: $CURRENT_MODEL"
+    ok "Switched to: $CURRENT_MODEL"
     rm -f "$models_tmp"
     return 0
   fi
@@ -543,21 +693,19 @@ handle_write_action() {
   fi
 
   lines="$(wc -l < "$content_file" | tr -d ' ')"
-  echo
-  say "Agent wants to write a file:"
-  echo "  $abs"
-  echo "  ($lines lines)"
+  box_top "WRITE FILE" "$ICON_WRITE" "$C_WARN"
+  box_line "$abs ${C_DIM}(${lines} lines)${C_RESET}"
   if [[ -n "$missing_dirs" ]]; then
-    echo "  This will also create folder(s): $missing_dirs"
+    box_line "${C_DIM}also creates folder(s): ${missing_dirs}${C_RESET}"
   fi
-  echo "--- preview (first 40 lines) ---"
-  sed -n '1,40p' "$content_file"
-  echo "--- end preview ---"
+  box_line "${C_DIM}preview (first 40 lines):${C_RESET}"
+  sed -n '1,40p' "$content_file" | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$C_WARN"
 
   if confirm_yes_no "Apply this write?"; then
     mkdir -p "$parent_dir" 2>/dev/null
     if cp "$content_file" "$abs"; then
-      say "✓ Wrote $abs"
+      ok "Wrote $abs"
     else
       err "Failed to write $abs"
     fi
@@ -580,13 +728,13 @@ handle_folder_create_action() {
     return
   fi
 
-  echo
-  say "Agent wants to create a folder:"
-  echo "  $abs"
+  box_top "CREATE FOLDER" "$ICON_FOLDER" "$C_WARN"
+  box_line "$abs"
+  box_bottom "$C_WARN"
 
   if confirm_yes_no "Create this folder?"; then
     if mkdir -p "$abs"; then
-      say "✓ Created $abs"
+      ok "Created $abs"
     else
       err "Failed to create $abs"
     fi
@@ -610,13 +758,13 @@ handle_delete_action() {
     return
   fi
 
-  echo
-  say "Agent wants to delete a file:"
-  echo "  $abs"
+  box_top "DELETE FILE" "$ICON_DELETE" "$C_ERR"
+  box_line "$abs"
+  box_bottom "$C_ERR"
 
   if confirm_yes_no "Delete this file?"; then
     if rm -f "$abs"; then
-      say "✓ Deleted $abs"
+      ok "Deleted $abs"
     else
       err "Failed to delete $abs"
     fi
@@ -625,14 +773,222 @@ handle_delete_action() {
   fi
 }
 
+# Caps applied when feeding file/command output back to the model, so a huge
+# file or noisy command can't blow up the conversation.
+MAX_PREVIEW_BYTES=8000
+MAX_PREVIEW_LINES=300
+SHELL_TIMEOUT_SECS=60
+
+# Truncates stdin to MAX_PREVIEW_BYTES/MAX_PREVIEW_LINES and notes if it did.
+cap_preview() {
+  local input="$1" out lines bytes
+  out="$(printf '%s' "$input" | head -c "$MAX_PREVIEW_BYTES")"
+  out="$(printf '%s' "$out" | head -n "$MAX_PREVIEW_LINES")"
+  bytes="${#input}"
+  lines="$(printf '%s' "$input" | wc -l | tr -d ' ')"
+  printf '%s' "$out"
+  if (( bytes > ${#out} )); then
+    printf '\n[...truncated, %s bytes / %s lines total...]' "$bytes" "$lines"
+  fi
+}
+
+# FILE_READ — read-only, no confirmation. Appends result to AGENT_TOOL_OUTPUT
+# (a global the caller resets each turn) and shows a short preview to the user.
+handle_file_read_action() {
+  local rel="$1" abs encoding preview
+  abs="$(resolve_safe_path "$rel")" || {
+    warn "Skipped unsafe read proposal: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[FILE_READ $rel]: rejected, path escapes the sandbox."
+    return
+  }
+
+  box_top "FILE READ" "$ICON_READ" "$C_ACCENT2"
+  box_line "$abs"
+
+  if [[ ! -e "$abs" ]]; then
+    box_bottom "$C_ACCENT2"
+    warn "File does not exist: $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[FILE_READ $rel]: does not exist."
+    return
+  fi
+  if [[ -d "$abs" ]]; then
+    box_bottom "$C_ACCENT2"
+    warn "That's a folder, not a file: $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[FILE_READ $rel]: that path is a folder — use DIR_LIST instead."
+    return
+  fi
+
+  if [[ "$HAVE_FILE" -eq 1 ]]; then
+    encoding="$(file -b --mime-encoding "$abs" 2>/dev/null || echo "unknown")"
+    if [[ "$encoding" == "binary" ]]; then
+      box_bottom "$C_ACCENT2"
+      warn "Binary file, skipping content preview."
+      AGENT_TOOL_OUTPUT+=$'\n\n'"[FILE_READ $rel]: binary file, content not shown ($(wc -c < "$abs" | tr -d ' ') bytes)."
+      return
+    fi
+  fi
+
+  preview="$(cap_preview "$(cat "$abs" 2>/dev/null)")"
+  printf '%s\n' "$preview" | sed -n '1,20p' | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$C_ACCENT2"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[FILE_READ $rel]:"$'\n'"$preview"
+}
+
+# DIR_LIST — read-only, no confirmation.
+handle_dir_list_action() {
+  local rel="$1" abs listing
+  abs="$(resolve_safe_path "$rel")" || {
+    warn "Skipped unsafe dir listing proposal: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[DIR_LIST $rel]: rejected, path escapes the sandbox."
+    return
+  }
+
+  box_top "DIR LIST" "$ICON_DIR" "$C_ACCENT2"
+  box_line "$abs"
+
+  if [[ ! -d "$abs" ]]; then
+    box_bottom "$C_ACCENT2"
+    warn "Not a folder: $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[DIR_LIST $rel]: not a folder."
+    return
+  fi
+
+  listing="$(ls -la "$abs" 2>&1)"
+  listing="$(cap_preview "$listing")"
+  printf '%s\n' "$listing" | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$C_ACCENT2"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[DIR_LIST $rel]:"$'\n'"$listing"
+}
+
+# ZIP_LIST — read-only, no confirmation.
+handle_zip_list_action() {
+  local rel="$1" abs listing
+  if [[ "$HAVE_UNZIP" -ne 1 ]]; then
+    warn "ZIP_LIST requested but 'unzip' isn't installed."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_LIST $rel]: 'unzip' is not installed on this system."
+    return
+  fi
+
+  abs="$(resolve_safe_path "$rel")" || {
+    warn "Skipped unsafe zip listing proposal: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_LIST $rel]: rejected, path escapes the sandbox."
+    return
+  }
+
+  box_top "ZIP LIST" "$ICON_ZIP" "$C_ACCENT2"
+  box_line "$abs"
+
+  if [[ ! -f "$abs" ]]; then
+    box_bottom "$C_ACCENT2"
+    warn "Not a file: $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_LIST $rel]: file does not exist."
+    return
+  fi
+
+  listing="$(unzip -l "$abs" 2>&1)"
+  listing="$(cap_preview "$listing")"
+  printf '%s\n' "$listing" | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$C_ACCENT2"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_LIST $rel]:"$'\n'"$listing"
+}
+
+# ZIP_READ — read-only, no confirmation. Extracts one entry to stdout only,
+# never writes anything to disk.
+handle_zip_read_action() {
+  local rel="$1" entry="$2" abs content
+  if [[ "$HAVE_UNZIP" -ne 1 ]]; then
+    warn "ZIP_READ requested but 'unzip' isn't installed."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]: 'unzip' is not installed on this system."
+    return
+  fi
+
+  abs="$(resolve_safe_path "$rel")" || {
+    warn "Skipped unsafe zip read proposal: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]: rejected, path escapes the sandbox."
+    return
+  }
+
+  case "$entry" in
+    /*|*..*)
+      warn "Rejected zip entry path: $entry"
+      AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]: rejected entry path."
+      return
+      ;;
+  esac
+
+  box_top "ZIP READ" "$ICON_ZIP" "$C_ACCENT2"
+  box_line "$abs ${C_DIM}::${C_RESET} $entry"
+
+  if [[ ! -f "$abs" ]]; then
+    box_bottom "$C_ACCENT2"
+    warn "Archive does not exist: $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]: archive does not exist."
+    return
+  fi
+
+  content="$(unzip -p "$abs" "$entry" 2>&1)"
+  if [[ $? -ne 0 ]]; then
+    box_bottom "$C_ACCENT2"
+    warn "Could not extract entry (check the exact path with ZIP_LIST first)."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]: extraction failed:"$'\n'"$(cap_preview "$content")"
+    return
+  fi
+
+  content="$(cap_preview "$content")"
+  printf '%s\n' "$content" | sed -n '1,20p' | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$C_ACCENT2"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]:"$'\n'"$content"
+}
+
+# SHELL_RUN — requires explicit confirmation. Runs with cwd = WORKSPACE_DIR
+# but is NOT path-sandboxed like the file actions: the command itself can
+# reference anything the user's shell can reach. The confirmation prompt says
+# so explicitly every time.
+handle_shell_run_action() {
+  local cmd_file="$1" cmd_text output exit_code exit_color
+
+  cmd_text="$(cat "$cmd_file")"
+
+  box_top "SHELL RUN" "$ICON_SHELL" "$C_ERR"
+  box_line "${C_DIM}cwd:${C_RESET} $WORKSPACE_DIR"
+  printf '%s\n' "$cmd_text" | while IFS= read -r pl; do box_line "${C_BOLD}${pl}${C_RESET}"; done
+  box_bottom "$C_ERR"
+  warn "This is NOT sandboxed to the workspace folder — it runs with your normal shell privileges."
+
+  if ! confirm_yes_no "Run this command?"; then
+    warn "Skipped shell command."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN]: user declined to run this command."
+    return
+  fi
+
+  if [[ "$HAVE_TIMEOUT" -eq 1 ]]; then
+    output="$(cd "$WORKSPACE_DIR" && timeout "$SHELL_TIMEOUT_SECS" bash -c "$cmd_text" 2>&1)"
+    exit_code=$?
+  else
+    output="$(cd "$WORKSPACE_DIR" && bash -c "$cmd_text" 2>&1)"
+    exit_code=$?
+  fi
+
+  exit_color="$C_OK"
+  [[ "$exit_code" -ne 0 ]] && exit_color="$C_ERR"
+  box_top "OUTPUT (exit $exit_code)" "" "$exit_color"
+  printf '%s\n' "$output" | sed -n '1,40p' | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$exit_color"
+
+  output="$(cap_preview "$output")"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN exit=$exit_code]:"$'\n'"$output"
+}
+
 # Scans an assistant reply for FILE_WRITE / FILE_DELETE / FOLDER_CREATE
 # markers, strips them out of what's shown as plain chat text, and runs each
 # proposed action through the sandboxed, confirmation-gated handlers above.
 process_agent_reply() {
   local reply="$1"
-  local mode="text" path="" write_file="" idx=0
+  local mode="text" path="" entry="" write_file="" shell_file="" idx=0 shell_idx=0
   local cleaned="" line
   local -a write_paths=() write_files=() delete_paths=() folder_paths=()
+  local -a read_paths=() dirlist_paths=() ziplist_paths=()
+  local -a zipread_paths=() zipread_entries=() shell_files=()
   local tmpdir
   tmpdir="$(mktemp -d)"
 
@@ -644,23 +1000,57 @@ process_agent_reply() {
         write_file="$tmpdir/block_$idx"
         : > "$write_file"
         mode="write"
-        cleaned+="[proposed file write: $path]"$'\n'
+        cleaned+="${C_WARN}${ICON_WRITE} write: $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<SHELL_RUN\>\>\>$ ]]; then
+        shell_idx=$((shell_idx + 1))
+        shell_file="$tmpdir/shell_$shell_idx"
+        : > "$shell_file"
+        mode="shell"
+        cleaned+="${C_ERR}${ICON_SHELL} shell command${C_RESET}"$'\n'
         continue
       fi
       if [[ "$line" =~ ^\<\<\<FILE_DELETE\ path=\"(.*)\"\>\>\>$ ]]; then
         path="${BASH_REMATCH[1]}"
         delete_paths+=("$path")
-        cleaned+="[proposed file delete: $path]"$'\n'
+        cleaned+="${C_ERR}${ICON_DELETE} delete: $path${C_RESET}"$'\n'
         continue
       fi
       if [[ "$line" =~ ^\<\<\<FOLDER_CREATE\ path=\"(.*)\"\>\>\>$ ]]; then
         path="${BASH_REMATCH[1]}"
         folder_paths+=("$path")
-        cleaned+="[proposed folder create: $path]"$'\n'
+        cleaned+="${C_WARN}${ICON_FOLDER} folder: $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<FILE_READ\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        read_paths+=("$path")
+        cleaned+="${C_ACCENT2}${ICON_READ} read: $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<DIR_LIST\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        dirlist_paths+=("$path")
+        cleaned+="${C_ACCENT2}${ICON_DIR} list: $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<ZIP_READ\ path=\"(.*)\"\ entry=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        entry="${BASH_REMATCH[2]}"
+        zipread_paths+=("$path")
+        zipread_entries+=("$entry")
+        cleaned+="${C_ACCENT2}${ICON_ZIP} zip read: $path :: $entry${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<ZIP_LIST\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        ziplist_paths+=("$path")
+        cleaned+="${C_ACCENT2}${ICON_ZIP} zip list: $path${C_RESET}"$'\n'
         continue
       fi
       cleaned+="$line"$'\n'
-    else
+    elif [[ "$mode" == "write" ]]; then
       if [[ "$line" == '<<<END_FILE_WRITE>>>' ]]; then
         write_paths+=("$path")
         write_files+=("$write_file")
@@ -668,12 +1058,20 @@ process_agent_reply() {
         continue
       fi
       printf '%s\n' "$line" >> "$write_file"
+    elif [[ "$mode" == "shell" ]]; then
+      if [[ "$line" == '<<<END_SHELL_RUN>>>' ]]; then
+        shell_files+=("$shell_file")
+        mode="text"
+        continue
+      fi
+      printf '%s\n' "$line" >> "$shell_file"
     fi
   done <<< "$reply"
 
-  printf '\n\033[1;36mTermix>\033[0m %s\n' "$cleaned"
+  printf "\n${C_ACCENT}${C_BOLD}Termix>${C_RESET} %s\n" "$cleaned"
 
   local i
+  # File-changing actions: always confirmation-gated, applied immediately.
   for i in "${!write_paths[@]}"; do
     handle_write_action "${write_paths[$i]}" "${write_files[$i]}"
   done
@@ -682,6 +1080,30 @@ process_agent_reply() {
   done
   for path in "${delete_paths[@]}"; do
     handle_delete_action "$path"
+  done
+
+  # Read-only inspection + shell execution: results are accumulated into
+  # AGENT_TOOL_OUTPUT (reset by the caller each turn) so the caller can send
+  # them back to the model as a follow-up message.
+  for path in "${read_paths[@]}"; do
+    handle_file_read_action "$path"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for path in "${dirlist_paths[@]}"; do
+    handle_dir_list_action "$path"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for path in "${ziplist_paths[@]}"; do
+    handle_zip_list_action "$path"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for i in "${!zipread_paths[@]}"; do
+    handle_zip_read_action "${zipread_paths[$i]}" "${zipread_entries[$i]}"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for shell_file in "${shell_files[@]}"; do
+    handle_shell_run_action "$shell_file"
+    AGENT_HAD_TOOL_CALLS=1
   done
 
   echo
@@ -753,12 +1175,12 @@ extract_reasoning_text() {
   ' <<< "$body" 2>/dev/null
 }
 
-send_chat() {
-  local user_text="$1"
+# Runs a single completion round against the current $messages_json, with the
+# existing empty-content retry and reasoning-trace fallback. Prints the reply
+# text to stdout (nothing on total failure, having already printed errors).
+get_completion() {
   local body http_code reply retry_messages reasoning code_tmp
   code_tmp="$(mktemp)"
-
-  append_message "user" "$user_text"
 
   body="$(call_openrouter "$messages_json" 2>"$code_tmp")"
   http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
@@ -782,7 +1204,7 @@ send_chat() {
     # before giving up.
     warn "Model returned no final answer. Retrying once..."
     retry_messages="$(jq -c \
-      '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any <<<FILE_WRITE>>> or <<<FILE_DELETE>>> blocks if applicable."}]' \
+      '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any action or tool blocks if applicable."}]' \
       <<< "$messages_json")"
     body="$(call_openrouter "$retry_messages" 2>"$code_tmp")"
     http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
@@ -795,8 +1217,7 @@ send_chat() {
   rm -f "$code_tmp"
 
   if [[ -n "$reply" ]]; then
-    append_message "assistant" "$reply"
-    process_agent_reply "$reply"
+    printf '%s' "$reply"
     return 0
   fi
 
@@ -806,15 +1227,54 @@ send_chat() {
   if [[ -n "$reasoning" ]]; then
     warn "This model didn't return a final answer, only its internal reasoning."
     echo "Showing that instead — treat it as a rough idea, not a finished answer:"
-    printf '\n\033[1;36mTermix (reasoning trace)>\033[0m %s\n\n' "$reasoning"
+    printf "\n${C_DIM}${C_ACCENT}Termix (reasoning trace)>${C_RESET} %s\n\n" "$reasoning"
     warn "Consider switching models with 't> model' — this one struggled with this request."
-    append_message "assistant" "$reasoning"
+    printf '%s' "$reasoning"
     return 0
   fi
 
   err "No reply content returned."
   echo "$body" | jq '.' 2>/dev/null || echo "$body"
   return 1
+}
+
+# Drives one user turn to completion. The model may issue read/shell tool
+# calls (FILE_READ, DIR_LIST, ZIP_LIST, ZIP_READ, SHELL_RUN); when it does,
+# process_agent_reply executes them and fills AGENT_TOOL_OUTPUT, which we feed
+# back in as a new message so the model can use the results, looping (bounded)
+# until it gives a reply with no more tool calls in it.
+MAX_AGENT_ROUNDS=6
+run_agent_turns() {
+  local rounds=0 reply
+
+  while (( rounds < MAX_AGENT_ROUNDS )); do
+    rounds=$((rounds + 1))
+
+    reply="$(get_completion)" || return 1
+    [[ -z "$reply" ]] && return 1
+
+    append_message "assistant" "$reply"
+
+    AGENT_TOOL_OUTPUT=""
+    AGENT_HAD_TOOL_CALLS=0
+    process_agent_reply "$reply"
+
+    if [[ "$AGENT_HAD_TOOL_CALLS" -eq 1 ]]; then
+      append_message "user" "Tool results from your requests:$AGENT_TOOL_OUTPUT"$'\n\n'"Continue: give your final answer now, or issue further requests if you still need more information."
+      continue
+    fi
+
+    return 0
+  done
+
+  warn "Reached the limit of $MAX_AGENT_ROUNDS tool-call rounds for this message — asking the model to wrap up."
+  return 0
+}
+
+send_chat() {
+  local user_text="$1"
+  append_message "user" "$user_text"
+  run_agent_turns
 }
 
 command_router() {
@@ -841,10 +1301,10 @@ command_router() {
       fi
       ;;
     current)
-      echo "Current model: $CURRENT_MODEL"
+      printf "${C_MUTED}model:${C_RESET} %s\n" "$CURRENT_MODEL"
       ;;
     workdir)
-      echo "Current sandbox folder: $WORKSPACE_DIR"
+      printf "${C_MUTED}sandbox:${C_RESET} %s\n" "$WORKSPACE_DIR"
       ;;
     workdir\ *)
       rest="${cmd#workdir }"
@@ -859,13 +1319,7 @@ command_router() {
     clear)
       clear
       banner
-      echo "Connected to OpenRouter"
-      echo "Current Model: $CURRENT_MODEL"
-      echo "Sandbox folder: $WORKSPACE_DIR"
-      echo
-      echo "Type 't> help' for commands."
-      echo "Press Ctrl+C to exit."
-      echo
+      status_panel
       ;;
     reset)
       init_history
@@ -895,18 +1349,11 @@ main() {
 
   init_history
 
-  echo "Connected to OpenRouter"
-  echo "Current Model: $CURRENT_MODEL"
-  echo "Sandbox folder: $WORKSPACE_DIR"
-  echo
-  echo "Type 't> help' for commands."
-  echo "Type messages at the chat> prompt."
-  echo "Press Ctrl+C to exit."
-  echo
+  status_panel
 
   while true; do
     local input=""
-    if ! read -r -p "chat> " input; then
+    if ! read -r -p "$(printf "${C_ACCENT}chat>${C_RESET} ")" input; then
       cleanup_exit
     fi
 
