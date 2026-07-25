@@ -18,7 +18,9 @@ DEFAULT_GOOGLE_MODEL="gemini-2.0-flash"
 # depends on this (API key, endpoint, request/response shape, model list)
 # is looked up through this single switch rather than duplicated per call
 # site, so 't> provider' only ever needs to flip this one variable.
-PROVIDER="openrouter"
+# Left empty on purpose — main() forces an explicit choice at startup via
+# pick_provider_startup rather than silently defaulting to one backend.
+PROVIDER=""
 
 # Kept separate (rather than one shared API_KEY) so switching providers
 # back and forth during a session never throws away a key you already
@@ -398,10 +400,14 @@ check_deps() {
   want_cmd timeout || HAVE_TIMEOUT=0
 
   # Web search parses DuckDuckGo's HTML with PCRE (grep -P, needed for \K
-  # and non-greedy matching). Most Termux/Linux grep builds have it; if not,
-  # web search still runs but falls back to a much cruder tag-stripped dump.
+  # and non-greedy matching) when available; otherwise it falls back to a
+  # plain POSIX-ERE parser (see web_search_query) that's a bit less precise
+  # but still functional.
   HAVE_GREP_PCRE=1
   printf 'x' | grep -Pzo 'x' >/dev/null 2>&1 || HAVE_GREP_PCRE=0
+  if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
+    warn "This system's grep lacks PCRE (-P) support — web search will use a simpler fallback parser."
+  fi
 }
 
 confirm_yes_no() {
@@ -569,6 +575,7 @@ show_help() {
   printf "${C_ACCENT2}┌─ COMMANDS ────────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> help" "show this menu"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> provider" "switch between OpenRouter and Google AI Studio"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> key" "change the API key for the current provider"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model" "open the model picker (choose Free or Paid first)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model <name>" "switch to a model by name (confirmation required)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> current" "show current provider and model"
@@ -742,6 +749,48 @@ confirm_model_switch() {
 # would just break the next request) and immediately prompts for that
 # provider's API key if it isn't already set, so the very next chat
 # message works without a confusing failure first.
+# Forces an explicit provider choice at launch — there is no default
+# backend, so this must succeed (or exit) before anything else runs.
+# Deliberately simpler than pick_provider_ui (no "already using X" /
+# confirm-switch dance, since nothing has been chosen yet).
+pick_provider_startup() {
+  local choice
+
+  echo
+  printf "${C_ACCENT2}┌─ CHOOSE PROVIDER ──────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} Pick which backend %s should use.\n" "$APP_NAME"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
+  printf "${C_MUTED}[1]${C_RESET} OpenRouter ${C_DIM}(many models, free + paid)${C_RESET}\n"
+  printf "${C_MUTED}[2]${C_RESET} Google AI Studio ${C_DIM}(Gemini models)${C_RESET}\n"
+  echo
+
+  while true; do
+    if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2]${C_RESET}: ")" choice; then
+      err "No provider selected. Exiting."
+      exit 1
+    fi
+    case "$choice" in
+      1|openrouter|OpenRouter|OPENROUTER)
+        PROVIDER="openrouter"
+        CURRENT_MODEL="$DEFAULT_MODEL"
+        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+        break
+        ;;
+      2|google|Google|GOOGLE)
+        PROVIDER="google"
+        CURRENT_MODEL="$DEFAULT_GOOGLE_MODEL"
+        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+        break
+        ;;
+      *)
+        warn "Please choose 1 (OpenRouter) or 2 (Google AI Studio)."
+        ;;
+    esac
+  done
+
+  ok "Using $(provider_label)."
+}
+
 pick_provider_ui() {
   local choice new_provider new_label
 
@@ -1569,16 +1618,18 @@ url_decode() {
 }
 
 # Free, no-API-key web search: scrapes DuckDuckGo's plain HTML results page
-# (no JS required, unlike duckduckgo.com itself) since it doesn't require
-# signing up for a key anywhere. This is inherently a best-effort scraper —
-# if DuckDuckGo changes their markup, parsing degrades to the crude fallback
-# below rather than crashing. Prints formatted results to stdout, or an
-# empty string if nothing could be retrieved (caller reports the failure).
+# (no JS required, unlike duckduckgo.com itself). This never talks to
+# OpenRouter/Google at all — it's a plain curl + local HTML parse, so it
+# costs nothing and works the same regardless of which provider is active.
+# Sets WEB_SEARCH_LAST_ERROR to a short reason on failure so the caller can
+# tell the user something more useful than "it didn't work".
 WEB_SEARCH_MAX_RESULTS=5
+WEB_SEARCH_LAST_ERROR=""
 web_search_query() {
   local query="$1" encoded_query html_tmp curl_args=() titles_raw urls_raw snippets_raw
   local -a titles=() urls=() snippets=()
   local i out n
+  WEB_SEARCH_LAST_ERROR=""
 
   encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
   [[ -z "$encoded_query" ]] && encoded_query="$query"
@@ -1590,11 +1641,13 @@ web_search_query() {
 
   if ! curl "${curl_args[@]}" -o "$html_tmp" 2>/dev/null; then
     rm -f "$html_tmp"
+    WEB_SEARCH_LAST_ERROR="couldn't reach duckduckgo.com (network/curl error)."
     return 1
   fi
 
   if [[ ! -s "$html_tmp" ]]; then
     rm -f "$html_tmp"
+    WEB_SEARCH_LAST_ERROR="got an empty response from duckduckgo.com."
     return 1
   fi
 
@@ -1636,11 +1689,52 @@ web_search_query() {
       s="$(printf '%s' "${snippets_raw[$i]:-}" | sed -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
       [[ -n "$t" ]] && titles+=("$t") && urls+=("$real_url") && snippets+=("$s")
     done
+  else
+    # No PCRE (-P) support in this system's grep (common on BSD/macOS grep,
+    # busybox/toybox grep on some Termux setups). Fall back to plain POSIX
+    # ERE: flatten the file to one line so -o can still return multiple
+    # matches, and match "up to the next <" instead of a lazy quantifier
+    # (DuckDuckGo's result titles are plain text with no nested tags, so
+    # this holds in practice; snippets occasionally have a <b> highlight,
+    # which this simpler pass just stops at — good enough for a fallback).
+    local flat
+    flat="$(tr '\n\r' '  ' < "$html_tmp")"
+    local -a title_tags=() snippet_tags=()
+    mapfile -t title_tags < <(
+      printf '%s' "$flat" | grep -oE '<a[^>]*class="result__a"[^>]*>[^<]*</a>' 2>/dev/null
+    )
+    mapfile -t snippet_tags < <(
+      printf '%s' "$flat" | grep -oE 'class="result__snippet"[^>]*>[^<]*' 2>/dev/null
+    )
+
+    n="${#title_tags[@]}"
+    for ((i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS; i++)); do
+      local tag="${title_tags[$i]}" t u s real_url snip
+      u=""
+      [[ "$tag" =~ href=\"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
+      t="$(printf '%s' "$tag" | sed -e 's/^<a[^>]*>//' -e 's/<\/a>$//' -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
+      if [[ "$u" == *"uddg="* ]]; then
+        real_url="${u#*uddg=}"
+        real_url="${real_url%%&*}"
+        real_url="$(url_decode "$real_url")"
+      else
+        real_url="$u"
+      fi
+      snip="${snippet_tags[$i]:-}"
+      snip="${snip#*>}"
+      s="$(printf '%s' "$snip" | sed -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
+      [[ -n "$t" ]] && titles+=("$t") && urls+=("$real_url") && snippets+=("$s")
+    done
   fi
 
   rm -f "$html_tmp"
 
   if [[ "${#titles[@]}" -eq 0 ]]; then
+    if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
+      WEB_SEARCH_LAST_ERROR="page fetched fine, but this system's grep lacks PCRE (-P) support and the plain-ERE fallback parser also found nothing — DuckDuckGo's markup may have changed. Consider installing GNU grep."
+    else
+      WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — DuckDuckGo's markup may have changed, or the query returned a no-results page."
+    fi
     return 1
   fi
 
@@ -1664,8 +1758,9 @@ handle_web_search_action() {
   results="$(web_search_query "$query")"
   if [[ -z "$results" ]]; then
     box_bottom "$C_ACCENT2"
-    warn "Web search failed or returned nothing for: $query"
-    AGENT_TOOL_OUTPUT+=$'\n\n'"[WEB_SEARCH \"$query\"]: no results — the search request failed or DuckDuckGo returned nothing usable. Tell the user real-time lookup didn't work rather than guessing an answer."
+    local reason="${WEB_SEARCH_LAST_ERROR:-unknown reason}"
+    warn "Web search failed for \"$query\": $reason"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[WEB_SEARCH \"$query\"]: no results ($reason). Tell the user real-time lookup didn't work rather than guessing an answer."
     return
   fi
 
@@ -1985,7 +2080,8 @@ process_agent_reply() {
 provider_label() {
   case "$PROVIDER" in
     google) printf 'Google AI Studio' ;;
-    *) printf 'OpenRouter' ;;
+    openrouter) printf 'OpenRouter' ;;
+    *) printf '(no provider selected)' ;;
   esac
 }
 
@@ -2007,7 +2103,7 @@ ensure_provider_key() {
       [[ -z "$entered" ]] && return 1
       GOOGLE_KEY="$entered"
       ;;
-    *)
+    openrouter)
       [[ -n "${OPENROUTER_KEY:-}" ]] && return 0
       prompt_text="$label API key: "
       echo
@@ -2016,8 +2112,41 @@ ensure_provider_key() {
       [[ -z "$entered" ]] && return 1
       OPENROUTER_KEY="$entered"
       ;;
+    *)
+      err "No provider selected yet — run 't> provider' first."
+      return 1
+      ;;
   esac
   return 0
+}
+
+# Forces re-entry of the CURRENT provider's key, even if one is already set
+# (env var or typed earlier) — used by 't> key'. Unlike ensure_provider_key
+# this never short-circuits on an existing value.
+change_api_key() {
+  local label prompt_text entered
+
+  if [[ -z "$PROVIDER" ]]; then
+    err "No provider selected yet — run 't> provider' first."
+    return 1
+  fi
+
+  label="$(provider_label)"
+  prompt_text="New $label API key: "
+  echo
+  read -r -s -p "$prompt_text" entered
+  echo
+
+  if [[ -z "$entered" ]]; then
+    warn "No key entered — keeping the existing $label key."
+    return 1
+  fi
+
+  case "$PROVIDER" in
+    google) GOOGLE_KEY="$entered" ;;
+    openrouter) OPENROUTER_KEY="$entered" ;;
+  esac
+  ok "$label API key updated."
 }
 
 ask_api_key() {
@@ -2273,7 +2402,7 @@ get_completion() {
   http_code="$(cat "$code_tmp" 2>/dev/null)"
 
   if [[ "$http_code" != "200" ]]; then
-    err "OpenRouter request failed (HTTP $http_code)."
+    err "$(provider_label) request failed (HTTP $http_code)."
     if [[ -n "$body" ]]; then
       echo "$body" | jq -r '.error.message // .message // .error // empty' 2>/dev/null || true
       echo "$body" | jq '.' 2>/dev/null || echo "$body"
@@ -2390,6 +2519,9 @@ command_router() {
     provider)
       pick_provider_ui
       ;;
+    key)
+      change_api_key
+      ;;
     current)
       printf "${C_MUTED}provider:${C_RESET} %s\n" "$(provider_label)"
       printf "${C_MUTED}model:${C_RESET} %s\n" "$CURRENT_MODEL"
@@ -2431,6 +2563,7 @@ command_router() {
 main() {
   check_deps
   banner
+  pick_provider_startup
   ask_api_key
 
   if ! init_workspace_auto; then
