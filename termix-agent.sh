@@ -1329,9 +1329,13 @@ ask_api_key() {
 }
 
 call_openrouter() {
-  # $1 = messages JSON array. Writes response body to stdout, http code to
-  # stderr on a line prefixed with "HTTP_CODE:" so both can be captured.
-  local messages="$1" payload tmp_body http_code body
+  # $1 = messages JSON array. $2 = path to a file to write the raw numeric
+  # HTTP status code into (nothing else — no prefix, no other output ever
+  # goes there). Response body is printed to stdout. Deliberately does NOT
+  # use stderr for this bookkeeping — stderr is shared with the spinner and
+  # warn/err logging, and mixing a single-line marker into that stream is
+  # fragile (their output has no reliable line breaks to split on).
+  local messages="$1" code_file="$2" payload tmp_body http_code body
 
   tmp_body="$(mktemp)"
   payload="$(jq -nc \
@@ -1357,35 +1361,33 @@ call_openrouter() {
       -H "X-Title: Termix Agent" \
       --data "$payload" 2>/dev/null || true
   )"
+  [[ -z "$http_code" ]] && http_code="000"
 
   body="$(cat "$tmp_body")"
   rm -f "$tmp_body"
 
+  printf '%s' "$http_code" > "$code_file"
   printf '%s' "$body"
-  printf 'HTTP_CODE:%s' "$http_code" >&2
 }
 
 # Wraps call_openrouter with automatic retry-with-backoff specifically for
 # HTTP 429 (rate limited) — common on OpenRouter's free-tier models under
-# any real load. Drop-in replacement for call_openrouter: same stdout/stderr
-# contract (body on stdout, "HTTP_CODE:<code>" on stderr), so callers don't
-# need to change. Manages its own spinner for both the request wait and the
-# backoff wait between attempts.
+# any real load. Same contract as call_openrouter: takes (messages, code_file),
+# prints body to stdout, writes the final numeric code to code_file. Manages
+# its own spinner for both the request wait and the backoff wait between
+# attempts.
 MAX_RATE_LIMIT_RETRIES=3
 call_openrouter_with_retry() {
-  local messages="$1" attempt=0 wait_secs=3 body http_code code_tmp
+  local messages="$1" code_file="$2" attempt=0 wait_secs=3 body http_code
 
   while true; do
-    code_tmp="$(mktemp)"
     start_spinner "thinking..."
-    body="$(call_openrouter "$messages" 2>"$code_tmp")"
+    body="$(call_openrouter "$messages" "$code_file")"
     stop_spinner
-    http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
-    rm -f "$code_tmp"
+    http_code="$(cat "$code_file" 2>/dev/null)"
 
     if [[ "$http_code" != "429" ]] || (( attempt >= MAX_RATE_LIMIT_RETRIES )); then
       printf '%s' "$body"
-      printf 'HTTP_CODE:%s' "$http_code" >&2
       return 0
     fi
 
@@ -1418,8 +1420,8 @@ get_completion() {
   local body http_code reply retry_messages reasoning code_tmp
   code_tmp="$(mktemp)"
 
-  body="$(call_openrouter_with_retry "$messages_json" 2>"$code_tmp")"
-  http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
+  body="$(call_openrouter_with_retry "$messages_json" "$code_tmp")"
+  http_code="$(cat "$code_tmp" 2>/dev/null)"
 
   if [[ "$http_code" != "200" ]]; then
     err "OpenRouter request failed (HTTP $http_code)."
@@ -1442,8 +1444,8 @@ get_completion() {
     retry_messages="$(jq -c \
       '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any action or tool blocks if applicable."}]' \
       <<< "$messages_json")"
-    body="$(call_openrouter_with_retry "$retry_messages" 2>"$code_tmp")"
-    http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
+    body="$(call_openrouter_with_retry "$retry_messages" "$code_tmp")"
+    http_code="$(cat "$code_tmp" 2>/dev/null)"
 
     if [[ "$http_code" == "200" ]]; then
       reply="$(jq -r '.choices[0].message.content // empty' <<< "$body" 2>/dev/null)"
