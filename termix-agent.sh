@@ -1331,13 +1331,16 @@ ask_api_key() {
 call_openrouter() {
   # $1 = messages JSON array. $2 = path to a file to write the raw numeric
   # HTTP status code into (nothing else — no prefix, no other output ever
-  # goes there). Response body is printed to stdout. Deliberately does NOT
-  # use stderr for this bookkeeping — stderr is shared with the spinner and
-  # warn/err logging, and mixing a single-line marker into that stream is
-  # fragile (their output has no reliable line breaks to split on).
-  local messages="$1" code_file="$2" payload tmp_body http_code body
+  # goes there). $3 = optional path to a file to write raw response headers
+  # into (used by the retry wrapper to read Retry-After on 429s). Response
+  # body is printed to stdout. Deliberately does NOT use stderr for this
+  # bookkeeping — stderr is shared with the spinner and warn/err logging,
+  # and mixing a single-line marker into that stream is fragile (their
+  # output has no reliable line breaks to split on).
+  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers http_code body
 
   tmp_body="$(mktemp)"
+  tmp_headers="$(mktemp)"
   payload="$(jq -nc \
     --arg model "$CURRENT_MODEL" \
     --argjson messages "$messages" \
@@ -1353,6 +1356,7 @@ call_openrouter() {
   http_code="$(
     curl -sS \
       -o "$tmp_body" \
+      -D "$tmp_headers" \
       -w '%{http_code}' \
       -X POST "$OPENROUTER_URL" \
       -H "Authorization: Bearer $API_KEY" \
@@ -1366,6 +1370,11 @@ call_openrouter() {
   body="$(cat "$tmp_body")"
   rm -f "$tmp_body"
 
+  if [[ -n "$header_file" ]]; then
+    cp "$tmp_headers" "$header_file" 2>/dev/null || true
+  fi
+  rm -f "$tmp_headers"
+
   printf '%s' "$http_code" > "$code_file"
   printf '%s' "$body"
 }
@@ -1376,26 +1385,68 @@ call_openrouter() {
 # prints body to stdout, writes the final numeric code to code_file. Manages
 # its own spinner for both the request wait and the backoff wait between
 # attempts.
-MAX_RATE_LIMIT_RETRIES=3
+#
+# Two 429 sub-cases are handled differently:
+#   - Temporary (per-minute/per-second) throttling: worth retrying. We honor
+#     the server's Retry-After header when present instead of guessing, and
+#     otherwise fall back to exponential backoff with jitter, capped at
+#     MAX_RATE_LIMIT_WAIT seconds.
+#   - Exhausted daily/monthly free-tier quota: retrying within the same
+#     session cannot help (the error body says so explicitly, e.g.
+#     "free-models-per-day"), so we fail fast with a clear message instead
+#     of burning through retries and making the user wait for nothing.
+MAX_RATE_LIMIT_RETRIES=6
+MAX_RATE_LIMIT_WAIT=60
 call_openrouter_with_retry() {
-  local messages="$1" code_file="$2" attempt=0 wait_secs=3 body http_code
+  local messages="$1" code_file="$2" attempt=0 wait_secs=2 body http_code
+  local header_file retry_after err_msg jitter
+
+  header_file="$(mktemp)"
 
   while true; do
     start_spinner "thinking..."
-    body="$(call_openrouter "$messages" "$code_file")"
+    body="$(call_openrouter "$messages" "$code_file" "$header_file")"
     stop_spinner
     http_code="$(cat "$code_file" 2>/dev/null)"
 
-    if [[ "$http_code" != "429" ]] || (( attempt >= MAX_RATE_LIMIT_RETRIES )); then
+    if [[ "$http_code" != "429" ]]; then
+      rm -f "$header_file"
+      printf '%s' "$body"
+      return 0
+    fi
+
+    err_msg="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)"
+    if [[ "$err_msg" =~ per-day|per-month|daily|quota|free-models-per ]]; then
+      warn "OpenRouter free-tier quota exhausted: ${err_msg:-rate limit exceeded}"
+      warn "Retrying won't help until the quota resets. Switch models (/model), add OpenRouter credits, or wait for the reset."
+      rm -f "$header_file"
+      printf '%s' "$body"
+      return 0
+    fi
+
+    if (( attempt >= MAX_RATE_LIMIT_RETRIES )); then
+      rm -f "$header_file"
       printf '%s' "$body"
       return 0
     fi
 
     attempt=$((attempt + 1))
+
+    retry_after="$(grep -i '^retry-after:' "$header_file" 2>/dev/null | tail -1 | tr -dc '0-9')"
+    if [[ -n "$retry_after" ]]; then
+      wait_secs="$retry_after"
+    fi
+    (( wait_secs > MAX_RATE_LIMIT_WAIT )) && wait_secs=$MAX_RATE_LIMIT_WAIT
+    (( wait_secs < 1 )) && wait_secs=1
+
+    jitter=$(( (RANDOM % 3) + 1 ))
+    wait_secs=$(( wait_secs + jitter ))
+
     warn "Rate limited by OpenRouter (HTTP 429). Retrying in ${wait_secs}s... ($attempt/$MAX_RATE_LIMIT_RETRIES)"
     start_spinner "rate limited, retrying in ${wait_secs}s..."
     sleep "$wait_secs"
     stop_spinner
+
     wait_secs=$(( wait_secs * 2 ))
   done
 }
