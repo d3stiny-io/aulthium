@@ -3,16 +3,29 @@ set -u
 
 # TERMIX AGENT
 # Single-file Bash terminal AI client for Termux / Linux
-# Uses OpenRouter for free-model chat.
+# Talks to either OpenRouter or Google AI Studio, chosen via 't> provider'.
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="TERMIX AGENT"
-APP_VERSION="v1.1"
+APP_VERSION="v1.2"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
+GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL="openrouter/free"
+DEFAULT_GOOGLE_MODEL="gemini-2.0-flash"
 
-API_KEY="${OPENROUTER_API_KEY:-}"
+# Which backend we're talking to: "openrouter" or "google". Everything that
+# depends on this (API key, endpoint, request/response shape, model list)
+# is looked up through this single switch rather than duplicated per call
+# site, so 't> provider' only ever needs to flip this one variable.
+PROVIDER="openrouter"
+
+# Kept separate (rather than one shared API_KEY) so switching providers
+# back and forth during a session never throws away a key you already
+# entered for the other one.
+OPENROUTER_KEY="${OPENROUTER_API_KEY:-}"
+GOOGLE_KEY="${GOOGLE_API_KEY:-}"
+
 CURRENT_MODEL="$DEFAULT_MODEL"
 CURRENT_MODEL_LABEL="$DEFAULT_MODEL"
 
@@ -46,6 +59,9 @@ don't need one. Always follow it with your real final answer or your action mark
 
 To read a text file's contents, output a line EXACTLY like this:
 <<<FILE_READ path="relative/path.txt">>>
+The content comes back numbered as "N: text" (one line per source line). Those numbers are ONLY for you to
+target lines with FILE_EDIT below — never show them to the user unless they specifically asked to see raw
+line numbers.
 
 To list the contents of a folder, output a line EXACTLY like this:
 <<<DIR_LIST path="relative/folder">>>
@@ -56,6 +72,13 @@ To list the entries inside a zip archive without extracting it, output a line EX
 
 To read one specific entry's contents from inside a zip archive, output a line EXACTLY like this:
 <<<ZIP_READ path="relative/archive.zip" entry="path/inside/zip.txt">>>
+
+To search the live web for current information you don't already know (news, prices, facts that may have
+changed, anything time-sensitive), output a line EXACTLY like this:
+<<<WEB_SEARCH query="your search terms">>>
+This has nothing to do with the sandbox folder — it's a real, free web search, and results are a snapshot
+from the moment you asked, not guaranteed up to the second. If it returns nothing useful, say so plainly
+instead of guessing an answer.
 
 You can issue several of the above in one reply. Their results are appended to the conversation as a
 follow-up message and you will automatically be prompted again with that information, so you can request
@@ -68,6 +91,32 @@ To create or overwrite a file, output a block EXACTLY like this (nothing else on
 <<<FILE_WRITE path="relative/path.txt">>>
 the full file content goes here
 <<<END_FILE_WRITE>>>
+
+To change only SOME lines of an existing file (instead of retyping the whole file), output one of these
+three block forms:
+
+Replace a line range with new content:
+<<<FILE_EDIT path="relative/path.txt" op="replace" start="5" end="8">>>
+the lines that will replace old lines 5-8, one per line
+<<<END_FILE_EDIT>>>
+
+Insert new lines after a given line (use after="0" to insert at the very top):
+<<<FILE_EDIT path="relative/path.txt" op="insert" after="12">>>
+the new lines to insert, one per line
+<<<END_FILE_EDIT>>>
+
+Delete a line range (no body needed, leave it empty):
+<<<FILE_EDIT path="relative/path.txt" op="delete" start="5" end="8">>>
+<<<END_FILE_EDIT>>>
+
+Line numbers refer to the file's CURRENT state as of your last FILE_READ of it — always FILE_READ the file
+(or use a fresh result already in this conversation) before an edit if you're not certain line numbers still
+match, since a prior edit in the same turn shifts every line after it. Only issue one FILE_EDIT per file per
+round so the numbers stay valid; if you need several edits to the same file, do them one at a time, letting
+each edit's confirmation apply before you reference line numbers again. Prefer FILE_EDIT over FILE_WRITE for
+any change to an EXISTING file — it keeps your output small (less to type, less chance of hitting the round
+limit or getting cut off mid-file) and the user sees exactly what changed. Reach for full FILE_WRITE only when
+creating a brand-new file or when you genuinely mean to replace the entire contents.
 
 To delete a single file, output a line EXACTLY like this:
 <<<FILE_DELETE path="relative/path.txt">>>
@@ -103,10 +152,11 @@ command (stdout/stderr, possibly truncated) is sent back to you the same way as 
 
 You get a limited number of action rounds per user message ($MAX_AGENT_ROUNDS) before you're cut off and
 asked to wrap up, so spend them deliberately:
-- Never call a read/inspect marker (FILE_READ, DIR_LIST, ZIP_LIST, ZIP_READ) for something already shown
-  earlier in this same conversation — check what you already know before asking again.
+- Never call a read/inspect marker (FILE_READ, DIR_LIST, ZIP_LIST, ZIP_READ, WEB_SEARCH) for something already
+  shown earlier in this same conversation — check what you already know before asking again.
 - Only inspect something when the answer or action genuinely depends on it. Don't DIR_LIST or FILE_READ
-  "just to be safe" when the user's request doesn't hinge on the current state of that path.
+  "just to be safe" when the user's request doesn't hinge on the current state of that path. Only WEB_SEARCH
+  when the answer genuinely depends on current/real-time information — not for things you already know.
 - If you already know you'll need several independent reads, issue them together in one reply instead of
   one per round.
 - Never repeat the exact same marker with the exact same arguments — if it already ran once this
@@ -115,6 +165,9 @@ asked to wrap up, so spend them deliberately:
   about the current state (e.g. you don't know whether a target already exists). The user still confirms the
   exact path before anything happens, so a reflexive check-first-every-time habit is usually wasted.
 - If the user's request is simple enough to answer or act on directly, skip tools altogether and just answer.
+- For edits to an existing file, use FILE_EDIT for the specific lines that change rather than FILE_WRITE-ing
+  the whole file — it uses far fewer of your output tokens per round, which is what actually causes the round
+  limit or a mid-file cutoff, not the number of actions you take.
 
 === OUTPUT STYLE ===
 
@@ -150,6 +203,13 @@ Your entire reply should be just:
 <<<FILE_WRITE path="hello.txt">>>
 hi there
 <<<END_FILE_WRITE>>>
+
+User: "what's the current price of bitcoin?"
+Your entire reply should be just:
+<<<WEB_SEARCH query="bitcoin price today">>>
+
+(Same rule as FILE_READ above — just that one line, nothing else. You'll get search results back in a
+follow-up message, then answer using them, noting they're a snapshot from just now.)
 EOF
 }
 
@@ -183,9 +243,11 @@ ICON_READ="▸"     # inspecting a file
 ICON_DIR="▤"      # listing a folder
 ICON_ZIP="▥"      # zip archive activity
 ICON_WRITE="✎"    # writing/overwriting a file
+ICON_EDIT="✐"     # editing specific lines of a file
 ICON_DELETE="✕"   # deleting a file
 ICON_FOLDER="+"   # creating a folder
 ICON_SHELL="❯"    # running a shell command
+ICON_SEARCH="⌕"   # web search
 ICON_OK="✓"
 ICON_WARN="⚠"
 ICON_ERR="✗"
@@ -261,7 +323,7 @@ EOF
 # and after 't> clear'. Centralized so both call sites always match.
 status_panel() {
   printf "${C_ACCENT2}┌─ SESSION ─────────────────────────────────────${C_RESET}\n"
-  printf "${C_MUTED}│${C_RESET} %-10s ${C_OK}%s${C_RESET}\n" "provider" "OpenRouter — connected"
+  printf "${C_MUTED}│${C_RESET} %-10s ${C_OK}%s${C_RESET}\n" "provider" "$(provider_label) — connected"
   printf "${C_MUTED}│${C_RESET} %-10s %s\n" "model" "$CURRENT_MODEL"
   printf "${C_MUTED}│${C_RESET} %-10s %s\n" "sandbox" "$WORKSPACE_DIR"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
@@ -334,6 +396,12 @@ check_deps() {
   want_cmd file || HAVE_FILE=0
   HAVE_TIMEOUT=1
   want_cmd timeout || HAVE_TIMEOUT=0
+
+  # Web search parses DuckDuckGo's HTML with PCRE (grep -P, needed for \K
+  # and non-greedy matching). Most Termux/Linux grep builds have it; if not,
+  # web search still runs but falls back to a much cruder tag-stripped dump.
+  HAVE_GREP_PCRE=1
+  printf 'x' | grep -Pzo 'x' >/dev/null 2>&1 || HAVE_GREP_PCRE=0
 }
 
 confirm_yes_no() {
@@ -500,9 +568,10 @@ show_help() {
   echo
   printf "${C_ACCENT2}┌─ COMMANDS ────────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> help" "show this menu"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> provider" "switch between OpenRouter and Google AI Studio"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model" "open the model picker (choose Free or Paid first)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model <name>" "switch to a model by name (confirmation required)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> current" "show current model"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> current" "show current provider and model"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir" "show the current sandbox folder"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir <path>" "change the sandbox folder"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> clear" "clear the terminal"
@@ -517,6 +586,10 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_READ} ${ICON_DIR} ${ICON_ZIP}${C_RESET}  read files, list folders, inspect zips —\n"
   printf "${C_MUTED}│${C_RESET}       runs automatically, no confirmation (read-only),\n"
   printf "${C_MUTED}│${C_RESET}       results are fed back to the agent for its next turn.\n"
+  printf "${C_MUTED}│${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_SEARCH}${C_RESET}      the agent can also search the live web (free, no\n"
+  printf "${C_MUTED}│${C_RESET}       API key) for current info it doesn't already know —\n"
+  printf "${C_MUTED}│${C_RESET}       also automatic, read-only, no confirmation needed.\n"
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_WARN}${ICON_WRITE} ${ICON_DELETE} ${ICON_FOLDER}${C_RESET}  write/overwrite a file, delete a single file,\n"
   printf "${C_MUTED}│${C_RESET}       delete a folder (and everything inside it), or create\n"
@@ -593,6 +666,29 @@ fetch_paid_models() {
   rm -f "$tmp"
 }
 
+fetch_google_models() {
+  # Returns a sorted list of Google AI Studio model IDs (generateContent-
+  # capable only, e.g. "gemini-2.0-flash"), one per line. Google's free tier
+  # is a per-model rate limit rather than a separate set of model IDs, so
+  # unlike OpenRouter there's no free/paid split in the model list itself.
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! curl -fsSL "${GOOGLE_API_BASE}/models?key=${GOOGLE_KEY}" -o "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  jq -r '
+    .models[]?
+    | select((.supportedGenerationMethods // []) | index("generateContent"))
+    | .name
+    | sub("^models/"; "")
+  ' "$tmp" 2>/dev/null | sort -u
+
+  rm -f "$tmp"
+}
+
 # Asks the user to pick a tier (free vs paid) before any model list is shown.
 # Prints "free" or "paid" to stdout and returns 0, or returns 1 if cancelled.
 # Callers capture this with $(...), so every line of on-screen chrome below
@@ -638,6 +734,71 @@ confirm_model_switch() {
   [[ "$ans" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
 }
 
+# Entry point for "t> provider". Always shows both options and always
+# blocks on an explicit confirmation before actually switching — same
+# pattern as the model picker. Switching providers also resets the current
+# model to a sensible default for the new backend (OpenRouter and Google
+# model IDs are completely different namespaces, so keeping the old one
+# would just break the next request) and immediately prompts for that
+# provider's API key if it isn't already set, so the very next chat
+# message works without a confusing failure first.
+pick_provider_ui() {
+  local choice new_provider new_label
+
+  echo
+  printf "${C_ACCENT2}┌─ PROVIDER ─────────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} current: ${C_OK}%s${C_RESET}\n" "$(provider_label)"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
+  printf "${C_MUTED}[1]${C_RESET} OpenRouter ${C_DIM}(many models, free + paid)${C_RESET}\n"
+  printf "${C_MUTED}[2]${C_RESET} Google AI Studio ${C_DIM}(Gemini models)${C_RESET}\n"
+  echo
+  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2, q to cancel]${C_RESET}: ")" choice || choice="q"
+
+  case "$choice" in
+    1|openrouter|OpenRouter|OPENROUTER)
+      new_provider="openrouter"
+      new_label="OpenRouter"
+      ;;
+    2|google|Google|GOOGLE)
+      new_provider="google"
+      new_label="Google AI Studio"
+      ;;
+    q|Q)
+      muted "Cancelled."
+      return 0
+      ;;
+    *)
+      warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), or q to cancel."
+      return 1
+      ;;
+  esac
+
+  if [[ "$new_provider" == "$PROVIDER" ]]; then
+    muted "Already using $new_label."
+    return 0
+  fi
+
+  if ! confirm_model_switch "$new_label"; then
+    muted "Cancelled."
+    return 0
+  fi
+
+  PROVIDER="$new_provider"
+  if [[ "$PROVIDER" == "google" ]]; then
+    CURRENT_MODEL="$DEFAULT_GOOGLE_MODEL"
+  else
+    CURRENT_MODEL="$DEFAULT_MODEL"
+  fi
+  CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+  ok "Switched provider to: $new_label"
+  muted "Model reset to $CURRENT_MODEL — use 't> model' to pick a different one."
+
+  if ! ensure_provider_key; then
+    warn "No $new_label API key provided — chats will fail until you set one."
+    muted "Run 't> provider' again, or 't> model', to be prompted for it."
+  fi
+}
+
 match_model_list() {
   # Prints models that match the search string, one per line.
   local query="$1"
@@ -660,7 +821,10 @@ pick_model_from_tier() {
   selection_tmp="$(mktemp)"
 
   local fetch_fn="fetch_free_models"
-  [[ "$tier" == "paid" ]] && fetch_fn="fetch_paid_models"
+  case "$tier" in
+    paid) fetch_fn="fetch_paid_models" ;;
+    google) fetch_fn="fetch_google_models" ;;
+  esac
 
   if ! "$fetch_fn" > "$models_tmp"; then
     warn "Could not fetch live models right now."
@@ -673,6 +837,12 @@ pick_model_from_tier() {
       printf "${C_MUTED}[4]${C_RESET} mistralai/mistral-small-3.2-24b-instruct:free\n"
       printf "${C_MUTED}[5]${C_RESET} google/gemma-3-27b-it:free\n"
       printf 'openrouter/free\nmeta-llama/llama-3.3-8b-instruct:free\ndeepseek/deepseek-chat-v3-0324:free\nmistralai/mistral-small-3.2-24b-instruct:free\ngoogle/gemma-3-27b-it:free\n' > "$models_tmp"
+    elif [[ "$tier" == "google" ]]; then
+      printf "${C_MUTED}[1]${C_RESET} gemini-2.0-flash\n"
+      printf "${C_MUTED}[2]${C_RESET} gemini-2.0-flash-lite\n"
+      printf "${C_MUTED}[3]${C_RESET} gemini-1.5-flash\n"
+      printf "${C_MUTED}[4]${C_RESET} gemini-1.5-pro\n"
+      printf 'gemini-2.0-flash\ngemini-2.0-flash-lite\ngemini-1.5-flash\ngemini-1.5-pro\n' > "$models_tmp"
     else
       printf "${C_MUTED}[1]${C_RESET} openai/gpt-4o-mini\n"
       printf "${C_MUTED}[2]${C_RESET} openai/gpt-4o\n"
@@ -808,12 +978,27 @@ pick_model_from_tier() {
   done
 }
 
-# Entry point for the "t> model" command. Always asks Free-or-Paid first,
-# then hands off to pick_model_from_tier, which itself always confirms
-# before committing a switch. 'back' from the tier list returns here so the
-# user can pick a different tier without leaving the picker entirely.
+# Entry point for the "t> model" command.
+# - OpenRouter: always asks Free-or-Paid first, then hands off to
+#   pick_model_from_tier, which itself always confirms before committing a
+#   switch. 'back' from the tier list returns here so the user can pick a
+#   different tier without leaving the picker entirely.
+# - Google AI Studio: there's no free/paid split in the model list (the
+#   free tier is a rate limit on the same models, not separate IDs), so
+#   this skips straight to the Google model list — still gated by the same
+#   confirm_model_switch blocker on every pick.
 pick_model_ui() {
   local tier
+
+  if [[ "$PROVIDER" == "google" ]]; then
+    if ! ensure_provider_key; then
+      warn "No Google AI Studio API key provided."
+      return 1
+    fi
+    pick_model_from_tier "google"
+    return 0
+  fi
+
   while true; do
     tier="$(prompt_model_tier)" || return 0
     pick_model_from_tier "$tier"
@@ -827,6 +1012,12 @@ pick_model_ui() {
 
 set_model_by_name() {
   local input="$1"
+
+  if [[ "$PROVIDER" == "google" ]]; then
+    set_model_by_name_google "$input"
+    return $?
+  fi
+
   local free_tmp paid_tmp exact_match fuzzy_match count candidate
 
   free_tmp="$(mktemp)"
@@ -914,6 +1105,73 @@ set_model_by_name() {
   return 1
 }
 
+# Google-specific counterpart to the OpenRouter name-matching logic above —
+# separate because Google has one flat model list rather than a free/paid
+# split, and requires an API key just to list models at all.
+set_model_by_name_google() {
+  local input="$1"
+  local models_tmp exact_match fuzzy_match count candidate
+
+  if ! ensure_provider_key; then
+    warn "No Google AI Studio API key provided."
+    return 1
+  fi
+
+  models_tmp="$(mktemp)"
+  if ! fetch_google_models > "$models_tmp"; then
+    rm -f "$models_tmp"
+    err "Could not fetch Google AI Studio models right now."
+    return 1
+  fi
+
+  exact_match="$(grep -Fx "$input" "$models_tmp" || true)"
+  if [[ -n "$exact_match" ]]; then
+    if confirm_model_switch "$input"; then
+      CURRENT_MODEL="$input"
+      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
+      rm -f "$models_tmp"
+      return 0
+    fi
+    muted "Cancelled."
+    rm -f "$models_tmp"
+    return 1
+  fi
+
+  fuzzy_match="$(grep -iF "$input" "$models_tmp" || true)"
+  if [[ -z "$fuzzy_match" ]]; then
+    count=0
+  else
+    count="$(wc -l <<< "$fuzzy_match" | tr -d ' ')"
+  fi
+
+  if [[ "$count" -eq 1 ]]; then
+    candidate="$(head -n 1 <<< "$fuzzy_match")"
+    if confirm_model_switch "$candidate"; then
+      CURRENT_MODEL="$candidate"
+      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
+      rm -f "$models_tmp"
+      return 0
+    fi
+    muted "Cancelled."
+    rm -f "$models_tmp"
+    return 1
+  fi
+
+  if [[ "$count" -gt 1 ]]; then
+    echo "$fuzzy_match"
+    echo
+    warn "More than one match. Use 't> model' to pick one."
+    rm -f "$models_tmp"
+    return 1
+  fi
+
+  warn "Model not found."
+  rm -f "$models_tmp"
+  return 1
+}
+
 handle_write_action() {
   local rel="$1" content_file="$2" abs lines parent_dir missing_dirs
 
@@ -946,6 +1204,92 @@ handle_write_action() {
   else
     warn "Skipped write: $rel"
   fi
+}
+
+# FILE_EDIT — requires confirmation. Applies a single line-range change
+# (replace/insert/delete) instead of rewriting the whole file. content_file
+# holds the new lines (empty for a delete). start/end are 1-based and
+# inclusive; for op="insert" the "start" argument doubles as the after-line
+# (0 = insert at the top of the file).
+handle_edit_action() {
+  local rel="$1" op="$2" start="$3" end="$4" content_file="$5"
+  local abs total new_lines old_lines tmpfile
+
+  abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe edit proposal: $rel"; return; }
+
+  if [[ ! -e "$abs" ]]; then
+    err "Cannot edit, file does not exist (use FILE_WRITE to create it first): $abs"
+    return
+  fi
+  if [[ -d "$abs" ]]; then
+    err "That's a folder, not a file: $abs"
+    return
+  fi
+
+  total="$(wc -l < "$abs" | tr -d ' ')"
+
+  if [[ "$op" == "insert" ]]; then
+    if ! [[ "$start" =~ ^[0-9]+$ ]] || (( start < 0 || start > total )); then
+      err "Invalid insert position 'after=$start' — file has $total line(s)."
+      return
+    fi
+  else
+    if ! [[ "$start" =~ ^[0-9]+$ ]] || ! [[ "$end" =~ ^[0-9]+$ ]] || (( start < 1 || end < start || end > total )); then
+      err "Invalid line range start=$start end=$end — file has $total line(s)."
+      return
+    fi
+  fi
+
+  new_lines="$(wc -l < "$content_file" | tr -d ' ')"
+  tmpfile="$(mktemp)"
+
+  case "$op" in
+    replace)
+      head -n "$((start - 1))" "$abs" > "$tmpfile"
+      cat "$content_file" >> "$tmpfile"
+      tail -n "+$((end + 1))" "$abs" >> "$tmpfile"
+      box_top "EDIT FILE (replace lines $start-$end)" "$ICON_EDIT" "$C_WARN"
+      box_line "$abs"
+      old_lines="$(sed -n "${start},${end}p" "$abs")"
+      printf '%s\n' "$old_lines" | while IFS= read -r pl; do box_line "${C_ERR}- ${pl}${C_RESET}"; done
+      printf '%s\n' "$(cat "$content_file")" | while IFS= read -r pl; do box_line "${C_OK}+ ${pl}${C_RESET}"; done
+      box_bottom "$C_WARN"
+      ;;
+    insert)
+      head -n "$start" "$abs" > "$tmpfile"
+      cat "$content_file" >> "$tmpfile"
+      tail -n "+$((start + 1))" "$abs" >> "$tmpfile"
+      box_top "EDIT FILE (insert after line $start)" "$ICON_EDIT" "$C_WARN"
+      box_line "$abs"
+      printf '%s\n' "$(cat "$content_file")" | while IFS= read -r pl; do box_line "${C_OK}+ ${pl}${C_RESET}"; done
+      box_bottom "$C_WARN"
+      ;;
+    delete)
+      head -n "$((start - 1))" "$abs" > "$tmpfile"
+      tail -n "+$((end + 1))" "$abs" >> "$tmpfile"
+      box_top "EDIT FILE (delete lines $start-$end)" "$ICON_EDIT" "$C_ERR"
+      box_line "$abs"
+      old_lines="$(sed -n "${start},${end}p" "$abs")"
+      printf '%s\n' "$old_lines" | while IFS= read -r pl; do box_line "${C_ERR}- ${pl}${C_RESET}"; done
+      box_bottom "$C_ERR"
+      ;;
+    *)
+      err "Unknown FILE_EDIT op: $op"
+      rm -f "$tmpfile"
+      return
+      ;;
+  esac
+
+  if confirm_yes_no "Apply this edit?"; then
+    if cp "$tmpfile" "$abs"; then
+      ok "Edited $abs"
+    else
+      err "Failed to edit $abs"
+    fi
+  else
+    warn "Skipped edit: $rel"
+  fi
+  rm -f "$tmpfile"
 }
 
 handle_folder_create_action() {
@@ -1103,7 +1447,7 @@ handle_file_read_action() {
     fi
   fi
 
-  preview="$(cap_preview "$(cat "$abs" 2>/dev/null)")"
+  preview="$(cap_preview "$(nl -ba -w1 -s': ' "$abs" 2>/dev/null)")"
   printf '%s\n' "$preview" | sed -n '1,20p' | while IFS= read -r pl; do box_line "$pl"; done
   box_bottom "$C_ACCENT2"
   AGENT_TOOL_OUTPUT+=$'\n\n'"[FILE_READ $rel]:"$'\n'"$preview"
@@ -1215,6 +1559,121 @@ handle_zip_read_action() {
   AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]:"$'\n'"$content"
 }
 
+# Percent-decodes a URL-encoded string using only bash/printf built-ins (no
+# python/perl dependency). "+' is treated as a literal space per the
+# application/x-www-form-urlencoded convention DuckDuckGo's redirect links
+# use for their uddg= parameter.
+url_decode() {
+  local encoded="${1//+/ }"
+  printf '%b' "${encoded//%/\\x}"
+}
+
+# Free, no-API-key web search: scrapes DuckDuckGo's plain HTML results page
+# (no JS required, unlike duckduckgo.com itself) since it doesn't require
+# signing up for a key anywhere. This is inherently a best-effort scraper —
+# if DuckDuckGo changes their markup, parsing degrades to the crude fallback
+# below rather than crashing. Prints formatted results to stdout, or an
+# empty string if nothing could be retrieved (caller reports the failure).
+WEB_SEARCH_MAX_RESULTS=5
+web_search_query() {
+  local query="$1" encoded_query html_tmp curl_args=() titles_raw urls_raw snippets_raw
+  local -a titles=() urls=() snippets=()
+  local i out n
+
+  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
+  [[ -z "$encoded_query" ]] && encoded_query="$query"
+
+  html_tmp="$(mktemp)"
+  curl_args=(-sS -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+             --max-time 20
+             "https://html.duckduckgo.com/html/?q=${encoded_query}")
+
+  if ! curl "${curl_args[@]}" -o "$html_tmp" 2>/dev/null; then
+    rm -f "$html_tmp"
+    return 1
+  fi
+
+  if [[ ! -s "$html_tmp" ]]; then
+    rm -f "$html_tmp"
+    return 1
+  fi
+
+  if [[ "$HAVE_GREP_PCRE" -eq 1 ]]; then
+    # DuckDuckGo's HTML endpoint marks each result's title link with
+    # class="result__a" and its snippet with class="result__snippet". -z
+    # treats the whole file as one match space so \K + non-greedy .*? can
+    # span the (irrelevant) newlines in the markup. href and class can
+    # appear in either order inside the tag, so grab the whole opening tag
+    # first and pull href out of that with a plain bash regex rather than
+    # assuming an order.
+    local -a title_tags=()
+    mapfile -d '' -t title_tags < <(
+      grep -Pzo '<a[^>]*class="result__a"[^>]*>' "$html_tmp" 2>/dev/null
+    )
+    mapfile -d '' -t titles_raw < <(
+      grep -Pzo 'class="result__a"[^>]*>\K.*?(?=</a>)' "$html_tmp" 2>/dev/null
+    )
+    mapfile -d '' -t snippets_raw < <(
+      grep -Pzo 'class="result__snippet"[^>]*>\K.*?(?=</a>)' "$html_tmp" 2>/dev/null
+    )
+
+    n="${#titles_raw[@]}"
+    for ((i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS; i++)); do
+      local t u s real_url tag_text
+      t="$(printf '%s' "${titles_raw[$i]}" | sed -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
+      tag_text="${title_tags[$i]:-}"
+      u=""
+      [[ "$tag_text" =~ href=\"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
+      # DuckDuckGo wraps outbound links as //duckduckgo.com/l/?uddg=<real
+      # URL, percent-encoded>&rut=... — pull the real URL back out.
+      if [[ "$u" == *"uddg="* ]]; then
+        real_url="${u#*uddg=}"
+        real_url="${real_url%%&*}"
+        real_url="$(url_decode "$real_url")"
+      else
+        real_url="$u"
+      fi
+      s="$(printf '%s' "${snippets_raw[$i]:-}" | sed -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
+      [[ -n "$t" ]] && titles+=("$t") && urls+=("$real_url") && snippets+=("$s")
+    done
+  fi
+
+  rm -f "$html_tmp"
+
+  if [[ "${#titles[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  out=""
+  for i in "${!titles[@]}"; do
+    out+="$((i + 1)). ${titles[$i]}"$'\n'
+    [[ -n "${urls[$i]:-}" ]] && out+="   ${urls[$i]}"$'\n'
+    [[ -n "${snippets[$i]:-}" ]] && out+="   ${snippets[$i]}"$'\n'
+  done
+  printf '%s' "$out"
+  return 0
+}
+
+# WEB_SEARCH — read-only, no confirmation, same as FILE_READ/DIR_LIST.
+handle_web_search_action() {
+  local query="$1" results
+
+  box_top "WEB SEARCH" "$ICON_SEARCH" "$C_ACCENT2"
+  box_line "$query"
+
+  results="$(web_search_query "$query")"
+  if [[ -z "$results" ]]; then
+    box_bottom "$C_ACCENT2"
+    warn "Web search failed or returned nothing for: $query"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[WEB_SEARCH \"$query\"]: no results — the search request failed or DuckDuckGo returned nothing usable. Tell the user real-time lookup didn't work rather than guessing an answer."
+    return
+  fi
+
+  printf '%s\n' "$results" | sed -n '1,15p' | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$C_ACCENT2"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[WEB_SEARCH \"$query\"] (results may be out of date the instant they're fetched — treat as a snapshot, not ground truth):"$'\n'"$results"
+}
+
 # SHELL_RUN — requires explicit confirmation. Runs with cwd = WORKSPACE_DIR
 # but is NOT path-sandboxed like the file actions: the command itself can
 # reference anything the user's shell can reach. The confirmation prompt says
@@ -1254,16 +1713,19 @@ handle_shell_run_action() {
   AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN exit=$exit_code]:"$'\n'"$output"
 }
 
-# Scans an assistant reply for FILE_WRITE / FILE_DELETE / FOLDER_CREATE
-# markers, strips them out of what's shown as plain chat text, and runs each
-# proposed action through the sandboxed, confirmation-gated handlers above.
+# Scans an assistant reply for FILE_WRITE / FILE_EDIT / FILE_DELETE /
+# FOLDER_CREATE markers, strips them out of what's shown as plain chat text,
+# and runs each proposed action through the sandboxed, confirmation-gated
+# handlers above.
 process_agent_reply() {
   local reply="$1"
-  local mode="text" path="" entry="" write_file="" shell_file="" idx=0 shell_idx=0
+  local mode="text" path="" entry="" write_file="" shell_file="" idx=0 shell_idx=0 search_q=""
   local cleaned="" line
   local -a write_paths=() write_files=() delete_paths=() folder_paths=() folder_delete_paths=()
-  local -a read_paths=() dirlist_paths=() ziplist_paths=()
+  local -a read_paths=() dirlist_paths=() ziplist_paths=() search_queries=()
   local -a zipread_paths=() zipread_entries=() shell_files=()
+  local -a edit_paths=() edit_ops=() edit_starts=() edit_ends=() edit_files=()
+  local edit_file="" edit_idx=0
   local tmpdir
   tmpdir="$(mktemp -d)"
 
@@ -1280,6 +1742,28 @@ process_agent_reply() {
         : > "$write_file"
         mode="write"
         cleaned+="${C_WARN}${ICON_WRITE} write: $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<FILE_EDIT\ path=\"(.*)\"\ op=\"(replace|delete)\"\ start=\"([0-9]+)\"\ end=\"([0-9]+)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        local edit_op="${BASH_REMATCH[2]}" edit_start="${BASH_REMATCH[3]}" edit_end="${BASH_REMATCH[4]}"
+        edit_idx=$((edit_idx + 1))
+        edit_file="$tmpdir/edit_$edit_idx"
+        : > "$edit_file"
+        mode="editbody"
+        edit_paths+=("$path"); edit_ops+=("$edit_op"); edit_starts+=("$edit_start"); edit_ends+=("$edit_end")
+        cleaned+="${C_WARN}${ICON_EDIT} edit ($edit_op lines $edit_start-$edit_end): $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<FILE_EDIT\ path=\"(.*)\"\ op=\"insert\"\ after=\"([0-9]+)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        local edit_after="${BASH_REMATCH[2]}"
+        edit_idx=$((edit_idx + 1))
+        edit_file="$tmpdir/edit_$edit_idx"
+        : > "$edit_file"
+        mode="editbody"
+        edit_paths+=("$path"); edit_ops+=("insert"); edit_starts+=("$edit_after"); edit_ends+=("$edit_after")
+        cleaned+="${C_WARN}${ICON_EDIT} edit (insert after line $edit_after): $path${C_RESET}"$'\n'
         continue
       fi
       if [[ "$line" =~ ^\<\<\<SHELL_RUN\>\>\>$ ]]; then
@@ -1334,6 +1818,12 @@ process_agent_reply() {
         cleaned+="${C_ACCENT2}${ICON_ZIP} zip list: $path${C_RESET}"$'\n'
         continue
       fi
+      if [[ "$line" =~ ^\<\<\<WEB_SEARCH\ query=\"(.*)\"\>\>\>$ ]]; then
+        local search_q="${BASH_REMATCH[1]}"
+        search_queries+=("$search_q")
+        cleaned+="${C_ACCENT2}${ICON_SEARCH} search: $search_q${C_RESET}"$'\n'
+        continue
+      fi
       # Tolerance shim: some (usually smaller/free) models fall back on
       # near-miss shapes instead of the exact <<<...>>> marker, and keep
       # repeating the same wrong shape even after being told to fix it.
@@ -1386,12 +1876,21 @@ process_agent_reply() {
         esac
         continue
       fi
+      # Same tolerance idea as above, but for WEB_SEARCH specifically since
+      # it takes a query= attribute rather than path=.
+      if [[ "$shim_line" =~ ^\<+(tool_call\>[[:space:]]*)?WEB_SEARCH[[:space:]]+query=[\"\']([^\"\']*)[\"\'].*\>+.*$ ]]; then
+        local alt_query="${BASH_REMATCH[2]}"
+        warn "Accepted non-standard marker as: WEB_SEARCH query=\"$alt_query\""
+        search_queries+=("$alt_query")
+        cleaned+="${C_ACCENT2}${ICON_SEARCH} search: $alt_query${C_RESET}"$'\n'
+        continue
+      fi
       # Fallback: the line looks like an attempted action marker (mentions
       # one of the known action names) but didn't match any exact pattern
       # above — most likely a malformed/near-miss syntax (e.g. <tool_call>
       # instead of <<<...>>>). Don't just silently drop it: surface it to
       # the user and tell the model to retry with the exact marker syntax.
-      if [[ "$line" =~ (FILE_READ|FILE_WRITE|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ|SHELL_RUN) ]] \
+      if [[ "$line" =~ (FILE_READ|FILE_WRITE|FILE_EDIT|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ|SHELL_RUN|WEB_SEARCH) ]] \
         && [[ ! "$line" =~ ^\<\<\< ]]; then
         warn "Model attempted a malformed action marker: $line"
         AGENT_TOOL_OUTPUT+=$'\n\n'"[MARKER ERROR]: The line below was not recognized as a valid action — the ONLY valid syntax is the exact <<<...>>> markers described in your instructions (e.g. <<<DIR_LIST path=\".\">>>). Reissue it using that exact syntax:"$'\n'"$line"
@@ -1408,6 +1907,13 @@ process_agent_reply() {
         continue
       fi
       printf '%s\n' "$line" >> "$write_file"
+    elif [[ "$mode" == "editbody" ]]; then
+      if [[ "$line" == '<<<END_FILE_EDIT>>>' ]]; then
+        edit_files+=("$edit_file")
+        mode="text"
+        continue
+      fi
+      printf '%s\n' "$line" >> "$edit_file"
     elif [[ "$mode" == "shell" ]]; then
       if [[ "$line" == '<<<END_SHELL_RUN>>>' ]]; then
         shell_files+=("$shell_file")
@@ -1430,6 +1936,9 @@ process_agent_reply() {
   # File-changing actions: always confirmation-gated, applied immediately.
   for i in "${!write_paths[@]}"; do
     handle_write_action "${write_paths[$i]}" "${write_files[$i]}"
+  done
+  for i in "${!edit_paths[@]}"; do
+    handle_edit_action "${edit_paths[$i]}" "${edit_ops[$i]}" "${edit_starts[$i]}" "${edit_ends[$i]}" "${edit_files[$i]}"
   done
   for path in "${folder_paths[@]}"; do
     handle_folder_create_action "$path"
@@ -1460,6 +1969,10 @@ process_agent_reply() {
     handle_zip_read_action "${zipread_paths[$i]}" "${zipread_entries[$i]}"
     AGENT_HAD_TOOL_CALLS=1
   done
+  for search_q in "${search_queries[@]}"; do
+    handle_web_search_action "$search_q"
+    AGENT_HAD_TOOL_CALLS=1
+  done
   for shell_file in "${shell_files[@]}"; do
     handle_shell_run_action "$shell_file"
     AGENT_HAD_TOOL_CALLS=1
@@ -1469,16 +1982,46 @@ process_agent_reply() {
   rm -rf "$tmpdir"
 }
 
+provider_label() {
+  case "$PROVIDER" in
+    google) printf 'Google AI Studio' ;;
+    *) printf 'OpenRouter' ;;
+  esac
+}
+
+# Non-fatal: prompts for the active provider's key if missing, returns 1 if
+# the user leaves it blank. Used both at startup and after 't> provider'
+# switches the backend mid-session (where exiting the whole app would be
+# the wrong move).
+ensure_provider_key() {
+  local label prompt_text entered
+  label="$(provider_label)"
+
+  case "$PROVIDER" in
+    google)
+      [[ -n "${GOOGLE_KEY:-}" ]] && return 0
+      prompt_text="$label API key: "
+      echo
+      read -r -s -p "$prompt_text" entered
+      echo
+      [[ -z "$entered" ]] && return 1
+      GOOGLE_KEY="$entered"
+      ;;
+    *)
+      [[ -n "${OPENROUTER_KEY:-}" ]] && return 0
+      prompt_text="$label API key: "
+      echo
+      read -r -s -p "$prompt_text" entered
+      echo
+      [[ -z "$entered" ]] && return 1
+      OPENROUTER_KEY="$entered"
+      ;;
+  esac
+  return 0
+}
+
 ask_api_key() {
-  if [[ -n "${API_KEY:-}" ]]; then
-    return 0
-  fi
-
-  echo
-  read -r -s -p "OpenRouter API key: " API_KEY
-  echo
-
-  if [[ -z "${API_KEY:-}" ]]; then
+  if ! ensure_provider_key; then
     err "No API key provided."
     exit 1
   fi
@@ -1515,7 +2058,7 @@ call_openrouter() {
       -D "$tmp_headers" \
       -w '%{http_code}' \
       -X POST "$OPENROUTER_URL" \
-      -H "Authorization: Bearer $API_KEY" \
+      -H "Authorization: Bearer $OPENROUTER_KEY" \
       -H "Content-Type: application/json" \
       -H "HTTP-Referer: http://localhost" \
       -H "X-Title: Termix Agent" \
@@ -1535,12 +2078,97 @@ call_openrouter() {
   printf '%s' "$body"
 }
 
-# Wraps call_openrouter with automatic retry-with-backoff specifically for
-# HTTP 429 (rate limited) — common on OpenRouter's free-tier models under
-# any real load. Same contract as call_openrouter: takes (messages, code_file),
-# prints body to stdout, writes the final numeric code to code_file. Manages
-# its own spinner for both the request wait and the backoff wait between
-# attempts.
+# Converts the OpenAI-style messages array (role: system/user/assistant)
+# that the rest of this script builds and stores into the shape Google's
+# Generative Language API expects: a top-level systemInstruction plus a
+# contents[] array using role "user"/"model" instead of "user"/"assistant".
+build_google_payload() {
+  local messages="$1"
+  jq -c '
+    {
+      systemInstruction: (
+        (map(select(.role == "system")) | first) as $sys
+        | if $sys then {parts: [{text: $sys.content}]} else null end
+      ),
+      contents: (
+        map(select(.role != "system"))
+        | map({
+            role: (if .role == "assistant" then "model" else "user" end),
+            parts: [{text: .content}]
+          })
+      ),
+      generationConfig: {temperature: 0.7}
+    }
+    | with_entries(select(.value != null))
+  ' <<< "$messages"
+}
+
+# Same contract as call_openrouter: (messages, code_file, header_file) in,
+# raw response body on stdout, numeric HTTP status written to code_file.
+# The response body is Google's native shape (candidates[].content...); it
+# gets normalized to the OpenAI-style shape by normalize_google_response
+# right before get_completion touches it, so nothing downstream needs to
+# know which provider actually answered.
+call_google() {
+  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers http_code body url
+
+  tmp_body="$(mktemp)"
+  tmp_headers="$(mktemp)"
+  payload="$(build_google_payload "$messages")"
+  url="${GOOGLE_API_BASE}/models/${CURRENT_MODEL}:generateContent?key=${GOOGLE_KEY}"
+
+  http_code="$(
+    curl -sS \
+      -o "$tmp_body" \
+      -D "$tmp_headers" \
+      -w '%{http_code}' \
+      -X POST "$url" \
+      -H "Content-Type: application/json" \
+      --data "$payload" 2>/dev/null || true
+  )"
+  [[ -z "$http_code" ]] && http_code="000"
+
+  body="$(cat "$tmp_body")"
+  rm -f "$tmp_body"
+
+  if [[ -n "$header_file" ]]; then
+    cp "$tmp_headers" "$header_file" 2>/dev/null || true
+  fi
+  rm -f "$tmp_headers"
+
+  printf '%s' "$http_code" > "$code_file"
+  printf '%s' "$body"
+}
+
+# Reshapes a successful Google generateContent response into the same
+# {choices:[{message:{content:...}}]} shape OpenRouter/OpenAI use, so
+# get_completion's parsing stays provider-agnostic. Left untouched (passed
+# through as-is) on non-200 bodies — Google's error shape is already
+# {"error":{"message":...}}, which the existing error-message lookup reads
+# natively.
+normalize_google_response() {
+  local body="$1"
+  jq -c '
+    {
+      choices: [{
+        message: {
+          content: ([.candidates[0].content.parts[]?.text] | join(""))
+        },
+        finish_reason: (.candidates[0].finishReason // null)
+      }]
+    }
+  ' <<< "$body" 2>/dev/null || printf '%s' "$body"
+}
+
+# Wraps call_openrouter/call_google with automatic retry-with-backoff
+# specifically for HTTP 429 (rate limited) — common on OpenRouter's
+# free-tier models under any real load, and on Google AI Studio's free
+# quota. Dispatches to the right provider based on $PROVIDER so
+# get_completion never needs to know which backend is active. Same
+# contract either way: takes (messages, code_file), prints an
+# OpenAI-shape body to stdout, writes the final numeric code to code_file.
+# Manages its own spinner for both the request wait and the backoff wait
+# between attempts.
 #
 # Two 429 sub-cases are handled differently:
 #   - Temporary (per-minute/per-second) throttling: worth retrying. We honor
@@ -1549,32 +2177,46 @@ call_openrouter() {
 #     MAX_RATE_LIMIT_WAIT seconds.
 #   - Exhausted daily/monthly free-tier quota: retrying within the same
 #     session cannot help (the error body says so explicitly, e.g.
-#     "free-models-per-day"), so we fail fast with a clear message instead
-#     of burning through retries and making the user wait for nothing.
+#     "free-models-per-day" on OpenRouter or "quota" on Google), so we fail
+#     fast with a clear message instead of burning through retries and
+#     making the user wait for nothing.
 MAX_RATE_LIMIT_RETRIES=6
 MAX_RATE_LIMIT_WAIT=60
-call_openrouter_with_retry() {
+call_provider_with_retry() {
   local messages="$1" code_file="$2" attempt=0 wait_secs=2 body http_code
-  local header_file retry_after err_msg jitter
+  local header_file retry_after err_msg jitter provider_name
 
   header_file="$(mktemp)"
 
   while true; do
     start_spinner "thinking..."
-    body="$(call_openrouter "$messages" "$code_file" "$header_file")"
+    case "$PROVIDER" in
+      google)
+        body="$(call_google "$messages" "$code_file" "$header_file")"
+        provider_name="Google AI Studio"
+        ;;
+      *)
+        body="$(call_openrouter "$messages" "$code_file" "$header_file")"
+        provider_name="OpenRouter"
+        ;;
+    esac
     stop_spinner
     http_code="$(cat "$code_file" 2>/dev/null)"
 
     if [[ "$http_code" != "429" ]]; then
       rm -f "$header_file"
-      printf '%s' "$body"
+      if [[ "$PROVIDER" == "google" && "$http_code" == "200" ]]; then
+        normalize_google_response "$body"
+      else
+        printf '%s' "$body"
+      fi
       return 0
     fi
 
     err_msg="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)"
-    if [[ "$err_msg" =~ per-day|per-month|daily|quota|free-models-per ]]; then
-      warn "OpenRouter free-tier quota exhausted: ${err_msg:-rate limit exceeded}"
-      warn "Retrying won't help until the quota resets. Switch models (/model), add OpenRouter credits, or wait for the reset."
+    if [[ "$err_msg" =~ per-day|per-month|daily|quota|free-models-per|RESOURCE_EXHAUSTED ]]; then
+      warn "$provider_name free-tier quota exhausted: ${err_msg:-rate limit exceeded}"
+      warn "Retrying won't help until the quota resets. Switch models (t> model), check billing, or wait for the reset."
       rm -f "$header_file"
       printf '%s' "$body"
       return 0
@@ -1598,7 +2240,7 @@ call_openrouter_with_retry() {
     jitter=$(( (RANDOM % 3) + 1 ))
     wait_secs=$(( wait_secs + jitter ))
 
-    warn "Rate limited by OpenRouter (HTTP 429). Retrying in ${wait_secs}s... ($attempt/$MAX_RATE_LIMIT_RETRIES)"
+    warn "Rate limited by $provider_name (HTTP 429). Retrying in ${wait_secs}s... ($attempt/$MAX_RATE_LIMIT_RETRIES)"
     start_spinner "rate limited, retrying in ${wait_secs}s..."
     sleep "$wait_secs"
     stop_spinner
@@ -1627,7 +2269,7 @@ get_completion() {
   local body http_code reply retry_messages reasoning code_tmp
   code_tmp="$(mktemp)"
 
-  body="$(call_openrouter_with_retry "$messages_json" "$code_tmp")"
+  body="$(call_provider_with_retry "$messages_json" "$code_tmp")"
   http_code="$(cat "$code_tmp" 2>/dev/null)"
 
   if [[ "$http_code" != "200" ]]; then
@@ -1651,7 +2293,7 @@ get_completion() {
     retry_messages="$(jq -c \
       '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any action or tool blocks if applicable."}]' \
       <<< "$messages_json")"
-    body="$(call_openrouter_with_retry "$retry_messages" "$code_tmp")"
+    body="$(call_provider_with_retry "$retry_messages" "$code_tmp")"
     http_code="$(cat "$code_tmp" 2>/dev/null)"
 
     if [[ "$http_code" == "200" ]]; then
@@ -1745,7 +2387,11 @@ command_router() {
         set_model_by_name "$rest"
       fi
       ;;
+    provider)
+      pick_provider_ui
+      ;;
     current)
+      printf "${C_MUTED}provider:${C_RESET} %s\n" "$(provider_label)"
       printf "${C_MUTED}model:${C_RESET} %s\n" "$CURRENT_MODEL"
       ;;
     workdir)
