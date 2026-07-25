@@ -59,12 +59,17 @@ the full file content goes here
 To delete a single file, output a line EXACTLY like this:
 <<<FILE_DELETE path="relative/path.txt">>>
 
+To delete a folder and everything inside it, output a line EXACTLY like this:
+<<<FOLDER_DELETE path="relative/folder">>>
+
 To create an empty folder on its own (not just as a side effect of writing a file into it), output a line EXACTLY like this:
 <<<FOLDER_CREATE path="relative/folder">>>
 
 FILE_WRITE will also create any missing parent folders for that file as part of the same confirmation, so you
 don't need a separate FOLDER_CREATE before writing a file into a new folder — only use FOLDER_CREATE when you
-want an empty folder with no file in it yet. You cannot delete folders, only single files.
+want an empty folder with no file in it yet. FOLDER_DELETE removes the folder and all of its contents
+recursively — only propose it when you actually mean to delete everything inside that folder, and the user
+must explicitly confirm it just like every other file-changing action.
 
 === RUNNING SHELL COMMANDS (shown to the user, requires explicit yes/no confirmation) ===
 
@@ -409,7 +414,7 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> exit" "exit Termix Agent"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
-  printf "\n${C_MUTED}Chat: type any normal message at the ${C_RESET}chat>${C_MUTED} prompt.${C_RESET}\n"
+  printf "\n${C_MUTED}Chat: type any normal message at the ${C_RESET}User>${C_MUTED} prompt.${C_RESET}\n"
 
   printf "\n${C_ACCENT2}┌─ FILE AGENT ──────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_READ} ${ICON_DIR} ${ICON_ZIP}${C_RESET}  read files, list folders, inspect zips —\n"
@@ -417,10 +422,10 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       results are fed back to the agent for its next turn.\n"
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_WARN}${ICON_WRITE} ${ICON_DELETE} ${ICON_FOLDER}${C_RESET}  write/overwrite a file, delete a single file,\n"
-  printf "${C_MUTED}│${C_RESET}       or create an empty folder — every one of these is\n"
-  printf "${C_MUTED}│${C_RESET}       shown to you and needs a yes/no confirmation first.\n"
-  printf "${C_MUTED}│${C_RESET}       Folders can't be deleted; nothing ever reaches\n"
-  printf "${C_MUTED}│${C_RESET}       outside the sandbox folder.\n"
+  printf "${C_MUTED}│${C_RESET}       delete a folder (and everything inside it), or create\n"
+  printf "${C_MUTED}│${C_RESET}       an empty folder — every one of these is shown to you\n"
+  printf "${C_MUTED}│${C_RESET}       and needs a yes/no confirmation first. Nothing ever\n"
+  printf "${C_MUTED}│${C_RESET}       reaches outside the sandbox folder.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
   printf "\n${C_ACCENT2}┌─ SHELL AGENT ─────────────────────────────────${C_RESET}\n"
@@ -773,6 +778,47 @@ handle_delete_action() {
   fi
 }
 
+handle_folder_delete_action() {
+  local rel="$1" abs entry_count
+
+  abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe folder delete proposal: $rel"; return; }
+
+  # Extra guard on top of resolve_safe_path/is_dangerous_root: never allow
+  # this to resolve to the workspace root itself — only real subfolders.
+  if [[ "$abs" == "$WORKSPACE_DIR" ]]; then
+    err "Refusing to delete the sandbox root itself: $abs"
+    return
+  fi
+
+  if [[ ! -e "$abs" ]]; then
+    warn "Nothing to delete, folder does not exist: $abs"
+    return
+  fi
+
+  if [[ ! -d "$abs" ]]; then
+    err "That's a file, not a folder (use FILE_DELETE instead): $abs"
+    return
+  fi
+
+  entry_count="$(find "$abs" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+
+  box_top "DELETE FOLDER" "$ICON_DELETE" "$C_ERR"
+  box_line "$abs"
+  box_line "${C_DIM}contains $entry_count item(s), all of which will be removed${C_RESET}"
+  box_bottom "$C_ERR"
+  warn "This deletes the folder AND everything inside it — this cannot be undone."
+
+  if confirm_yes_no "Delete this folder and everything inside it?"; then
+    if rm -rf "$abs"; then
+      ok "Deleted $abs"
+    else
+      err "Failed to delete $abs"
+    fi
+  else
+    warn "Skipped folder delete: $rel"
+  fi
+}
+
 # Caps applied when feeding file/command output back to the model, so a huge
 # file or noisy command can't blow up the conversation.
 MAX_PREVIEW_BYTES=8000
@@ -986,7 +1032,7 @@ process_agent_reply() {
   local reply="$1"
   local mode="text" path="" entry="" write_file="" shell_file="" idx=0 shell_idx=0
   local cleaned="" line
-  local -a write_paths=() write_files=() delete_paths=() folder_paths=()
+  local -a write_paths=() write_files=() delete_paths=() folder_paths=() folder_delete_paths=()
   local -a read_paths=() dirlist_paths=() ziplist_paths=()
   local -a zipread_paths=() zipread_entries=() shell_files=()
   local tmpdir
@@ -1021,6 +1067,12 @@ process_agent_reply() {
         path="${BASH_REMATCH[1]}"
         folder_paths+=("$path")
         cleaned+="${C_WARN}${ICON_FOLDER} folder: $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<FOLDER_DELETE\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        folder_delete_paths+=("$path")
+        cleaned+="${C_ERR}${ICON_DELETE} delete folder: $path${C_RESET}"$'\n'
         continue
       fi
       if [[ "$line" =~ ^\<\<\<FILE_READ\ path=\"(.*)\"\>\>\>$ ]]; then
@@ -1080,6 +1132,9 @@ process_agent_reply() {
   done
   for path in "${delete_paths[@]}"; do
     handle_delete_action "$path"
+  done
+  for path in "${folder_delete_paths[@]}"; do
+    handle_folder_delete_action "$path"
   done
 
   # Read-only inspection + shell execution: results are accumulated into
@@ -1353,7 +1408,7 @@ main() {
 
   while true; do
     local input=""
-    if ! read -r -p "$(printf "${C_ACCENT}chat>${C_RESET} ")" input; then
+    if ! read -r -p "$(printf "${C_ACCENT}User>${C_RESET} ")" input; then
       cleanup_exit
     fi
 
