@@ -175,23 +175,23 @@ ICON_WARN="⚠"
 ICON_ERR="✗"
 
 say() {
-  printf "${C_ACCENT}%s${C_RESET}\n" "$*"
+  printf "${C_ACCENT}%s${C_RESET}\n" "$*" >&2
 }
 
 warn() {
-  printf "${C_WARN}${ICON_WARN} %s${C_RESET}\n" "$*"
+  printf "${C_WARN}${ICON_WARN} %s${C_RESET}\n" "$*" >&2
 }
 
 err() {
-  printf "${C_ERR}${ICON_ERR} %s${C_RESET}\n" "$*"
+  printf "${C_ERR}${ICON_ERR} %s${C_RESET}\n" "$*" >&2
 }
 
 ok() {
-  printf "${C_OK}${ICON_OK} %s${C_RESET}\n" "$*"
+  printf "${C_OK}${ICON_OK} %s${C_RESET}\n" "$*" >&2
 }
 
 muted() {
-  printf "${C_MUTED}%s${C_RESET}\n" "$*"
+  printf "${C_MUTED}%s${C_RESET}\n" "$*" >&2
 }
 
 # A single 48-char rule used to build boxed section headers/footers of a
@@ -255,7 +255,7 @@ status_panel() {
 cleanup_exit() {
   stop_spinner
   printf '\n'
-  say "Goodbye."
+  say "Termix Agent has been closed."
   exit 0
 }
 
@@ -274,9 +274,9 @@ start_spinner() {
   local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   (
     local i=0
-    printf '\033[?25l'
+    printf '\033[?25l' >&2
     while true; do
-      printf "\r${C_DIM}${C_ACCENT}%s %s${C_RESET}\033[K" "${frames[$i]}" "$msg"
+      printf "\r${C_DIM}${C_ACCENT}%s %s${C_RESET}\033[K" "${frames[$i]}" "$msg" >&2
       i=$(( (i + 1) % ${#frames[@]} ))
       sleep 0.08
     done
@@ -291,7 +291,7 @@ stop_spinner() {
     wait "$SPINNER_PID" 2>/dev/null
   fi
   SPINNER_PID=""
-  printf '\r\033[K\033[?25h'
+  printf '\r\033[K\033[?25h' >&2
 }
 
 want_cmd() {
