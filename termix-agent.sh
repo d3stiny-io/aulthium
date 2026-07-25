@@ -87,6 +87,12 @@ actually need to execute something (e.g. running a build, a script, git, or a CL
 command (stdout/stderr, possibly truncated) is sent back to you the same way as the reading markers above.
 
 If the user asks for something outside those bounds, explain the limitation instead.
+
+IMPORTANT: The ONLY valid syntax for any action is the exact triple-angle-bracket markers shown above,
+e.g. <<<DIR_LIST path=".">>> on its own line, character-for-character. Do NOT use any other format such as
+<tool_call>, <function_call>, JSON, or anything resembling a generic tool-calling convention — none of those
+are recognized and the action will silently fail to run. If you are not issuing one of the exact markers
+above, just write plain text.
 EOF
 }
 
@@ -1099,6 +1105,19 @@ process_agent_reply() {
         path="${BASH_REMATCH[1]}"
         ziplist_paths+=("$path")
         cleaned+="${C_ACCENT2}${ICON_ZIP} zip list: $path${C_RESET}"$'\n'
+        continue
+      fi
+      # Fallback: the line looks like an attempted action marker (mentions
+      # one of the known action names) but didn't match any exact pattern
+      # above — most likely a malformed/near-miss syntax (e.g. <tool_call>
+      # instead of <<<...>>>). Don't just silently drop it: surface it to
+      # the user and tell the model to retry with the exact marker syntax.
+      if [[ "$line" =~ (FILE_READ|FILE_WRITE|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ|SHELL_RUN) ]] \
+        && [[ ! "$line" =~ ^\<\<\< ]]; then
+        warn "Model attempted a malformed action marker: $line"
+        AGENT_TOOL_OUTPUT+=$'\n\n'"[MARKER ERROR]: The line below was not recognized as a valid action — the ONLY valid syntax is the exact <<<...>>> markers described in your instructions (e.g. <<<DIR_LIST path=\".\">>>). Reissue it using that exact syntax:"$'\n'"$line"
+        AGENT_HAD_TOOL_CALLS=1
+        cleaned+="${C_WARN}${ICON_WARN} malformed marker, asking model to retry: $line${C_RESET}"$'\n'
         continue
       fi
       cleaned+="$line"$'\n'
