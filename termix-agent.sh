@@ -29,6 +29,19 @@ You are Termix Agent, a helpful terminal-based AI assistant. Answer clearly and 
 You operate on a single sandbox folder: $WORKSPACE_DIR
 Every path you reference in a marker below MUST be a relative path inside that folder. Never use absolute paths, and never use ".." to escape it.
 
+=== THINKING (optional, private — never shown to the user as text) ===
+
+If a request needs real reasoning first — picking between actions, working out which path is right, planning
+a multi-step change — you may open your reply with a block EXACTLY like this:
+<<<THINKING>>>
+your private reasoning goes here, kept short
+<<<END_THINKING>>>
+
+While you're generating a reply, the user only ever sees a generic loading spinner; this block is stripped
+out and never displayed, so don't write anything in it you expect the user to read, and never leave it as
+your only content. Keep it a few lines, not an essay, and skip it entirely for simple replies — most turns
+don't need one. Always follow it with your real final answer or your action marker(s).
+
 === READING / INSPECTING (no confirmation needed, results are sent back to you) ===
 
 To read a text file's contents, output a line EXACTLY like this:
@@ -85,6 +98,34 @@ outside the workspace. The user always sees the exact command text and must appr
 Prefer FILE_READ / FILE_WRITE / DIR_LIST for simple file inspection or edits; reach for SHELL_RUN when you
 actually need to execute something (e.g. running a build, a script, git, or a CLI tool). Output from the
 command (stdout/stderr, possibly truncated) is sent back to you the same way as the reading markers above.
+
+=== TOOL USE POLICY (avoid wasting actions) ===
+
+You get a limited number of action rounds per user message ($MAX_AGENT_ROUNDS) before you're cut off and
+asked to wrap up, so spend them deliberately:
+- Never call a read/inspect marker (FILE_READ, DIR_LIST, ZIP_LIST, ZIP_READ) for something already shown
+  earlier in this same conversation — check what you already know before asking again.
+- Only inspect something when the answer or action genuinely depends on it. Don't DIR_LIST or FILE_READ
+  "just to be safe" when the user's request doesn't hinge on the current state of that path.
+- If you already know you'll need several independent reads, issue them together in one reply instead of
+  one per round.
+- Never repeat the exact same marker with the exact same arguments — if it already ran once this
+  conversation, reuse that result instead of asking again.
+- For a file-changing or shell action, only precede it with a read/list check when there's real uncertainty
+  about the current state (e.g. you don't know whether a target already exists). The user still confirms the
+  exact path before anything happens, so a reflexive check-first-every-time habit is usually wasted.
+- If the user's request is simple enough to answer or act on directly, skip tools altogether and just answer.
+
+=== OUTPUT STYLE ===
+
+Write your final answer as plain, direct terminal text a person can read at a glance:
+- Lead with the actual answer, not a restatement of the question or a wall of setup.
+- Keep it to short paragraphs or a plain hyphen list for multiple points — no heavy markdown headers or
+  tables, this renders in a terminal.
+- Don't paste back large tool output verbatim; the user already saw it above in its own box. Summarize or
+  reference it instead.
+- Be concise by default; go longer only when the task genuinely needs it (e.g. showing real file contents or
+  command output the user asked to see).
 
 If the user asks for something outside those bounds, explain the limitation instead.
 
@@ -212,12 +253,46 @@ status_panel() {
 }
 
 cleanup_exit() {
+  stop_spinner
   printf '\n'
   say "Goodbye."
   exit 0
 }
 
 trap cleanup_exit INT
+
+# ── Thinking spinner ─────────────────────────────────────────────────────
+# The OpenRouter call is a single blocking, non-streaming request, so we
+# can't show tokens as they're generated. Instead we show a small animated
+# "thinking..." line for the duration of that blocking wait, then clear it
+# in place the moment the response comes back — visually the same effect
+# as the model "thinking" and then deleting that line once it's done.
+SPINNER_PID=""
+
+start_spinner() {
+  local msg="${1:-thinking...}"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  (
+    local i=0
+    printf '\033[?25l'
+    while true; do
+      printf "\r${C_DIM}${C_ACCENT}%s %s${C_RESET}\033[K" "${frames[$i]}" "$msg"
+      i=$(( (i + 1) % ${#frames[@]} ))
+      sleep 0.08
+    done
+  ) &
+  SPINNER_PID=$!
+  disown "$SPINNER_PID" 2>/dev/null
+}
+
+stop_spinner() {
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
+  fi
+  SPINNER_PID=""
+  printf '\r\033[K\033[?25h'
+}
 
 want_cmd() {
   # Like need_cmd but non-fatal: just remembers that a feature is unavailable
@@ -1046,6 +1121,10 @@ process_agent_reply() {
 
   while IFS= read -r line; do
     if [[ "$mode" == "text" ]]; then
+      if [[ "$line" =~ ^\<\<\<THINKING\>\>\>$ ]]; then
+        mode="thinking"
+        continue
+      fi
       if [[ "$line" =~ ^\<\<\<FILE_WRITE\ path=\"(.*)\"\>\>\>$ ]]; then
         path="${BASH_REMATCH[1]}"
         idx=$((idx + 1))
@@ -1180,6 +1259,12 @@ process_agent_reply() {
         continue
       fi
       printf '%s\n' "$line" >> "$shell_file"
+    elif [[ "$mode" == "thinking" ]]; then
+      if [[ "$line" == '<<<END_THINKING>>>' ]]; then
+        mode="text"
+      fi
+      # Every other line while in "thinking" mode is discarded — it's the
+      # model's private reasoning and is never shown to the user.
     fi
   done <<< "$reply"
 
@@ -1300,7 +1385,9 @@ get_completion() {
   local body http_code reply retry_messages reasoning code_tmp
   code_tmp="$(mktemp)"
 
+  start_spinner "thinking..."
   body="$(call_openrouter "$messages_json" 2>"$code_tmp")"
+  stop_spinner
   http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
 
   if [[ "$http_code" != "200" ]]; then
@@ -1324,7 +1411,9 @@ get_completion() {
     retry_messages="$(jq -c \
       '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any action or tool blocks if applicable."}]' \
       <<< "$messages_json")"
+    start_spinner "thinking..."
     body="$(call_openrouter "$retry_messages" 2>"$code_tmp")"
+    stop_spinner
     http_code="$(sed -n 's/^HTTP_CODE://p' "$code_tmp")"
 
     if [[ "$http_code" == "200" ]]; then
