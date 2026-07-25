@@ -16,9 +16,27 @@ API_KEY="${OPENROUTER_API_KEY:-}"
 CURRENT_MODEL="$DEFAULT_MODEL"
 CURRENT_MODEL_LABEL="$DEFAULT_MODEL"
 
+# Sandbox directory the agent is allowed to create/edit/delete files in.
+# Every file action is confined to this folder — nothing outside it is ever touched.
+WORKSPACE_DIR=""
+
 # In-memory conversation history only.
 # We keep the system prompt in the history from the start.
-SYSTEM_PROMPT='You are Termix Agent, a helpful terminal-based AI assistant. Answer clearly and concisely. Be practical, friendly, and accurate. If the user asks for a command, script, or code, provide a ready-to-run answer.'
+build_system_prompt() {
+  printf '%s\n\n%s%s\n%s\n\n%s\n%s\n%s\n%s\n\n%s\n%s\n\n%s %s %s' \
+    "You are Termix Agent, a helpful terminal-based AI assistant. Answer clearly and concisely. Be practical, friendly, and accurate." \
+    "You can propose file changes inside a single sandbox folder: " "$WORKSPACE_DIR" \
+    'You may ONLY use relative paths inside that folder. Never use absolute paths, never use ".." to escape it, and never ask the user to run destructive shell commands.' \
+    'To create or overwrite a file, output a block EXACTLY like this (nothing else on those marker lines):' \
+    '<<<FILE_WRITE path="relative/path.txt">>>
+the full file content goes here
+<<<END_FILE_WRITE>>>' \
+    'To delete a single file, output a line EXACTLY like this:' \
+    '<<<FILE_DELETE path="relative/path.txt">>>' \
+    'Every file action you propose will be shown to the user and requires their explicit yes/no confirmation before anything happens.' \
+    'You cannot delete folders, cannot run shell commands, and cannot touch anything outside the sandbox folder.' \
+    'If the user asks for something outside those bounds, explain the limitation instead.'
+}
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -70,10 +88,161 @@ check_deps() {
   need_cmd mktemp
   need_cmd sort
   need_cmd grep
+  need_cmd realpath
+}
+
+confirm_yes_no() {
+  local prompt="$1" ans
+  read -r -p "$prompt [y/N]: " ans || ans="n"
+  [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# Refuses any workspace directory that IS or lives inside a critical system path.
+# This is a hard block regardless of user confirmation — the point is that no
+# path arithmetic inside the sandbox can ever reach these locations.
+is_dangerous_root() {
+  local abs="$1"
+  case "$abs" in
+    "/"|"/etc"|"/etc/"*|"/usr"|"/usr/"*|"/bin"|"/bin/"*|"/sbin"|"/sbin/"*| \
+    "/boot"|"/boot/"*|"/lib"|"/lib/"*|"/lib64"|"/lib64/"*|"/proc"|"/proc/"*| \
+    "/dev"|"/dev/"*|"/sys"|"/sys/"*|"/System"|"/System/"*|"/Windows"|"/Windows/"* | \
+    "/root")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# Validates and normalizes a candidate workspace directory.
+# Prints the resolved absolute path on success, returns 1 on rejection.
+validate_workspace_dir() {
+  local dir="$1" abs
+  abs="$(realpath -m "$dir" 2>/dev/null)" || return 1
+
+  if is_dangerous_root "$abs"; then
+    err "Refusing to use '$abs' as the workspace — it is (or is inside) a critical system directory."
+    return 1
+  fi
+
+  printf '%s' "$abs"
+  return 0
+}
+
+# Sets up the workspace at startup with no confirmation prompt (the point is
+# it's fully automatic). Still runs through the same safety validation as
+# every other path in this script — it just skips the "create it?" prompt.
+init_workspace_auto() {
+  local candidate abs
+  candidate="$(default_workspace_dir)"
+  abs="$(validate_workspace_dir "$candidate")" || return 1
+
+  if [[ ! -e "$abs" ]]; then
+    mkdir -p "$abs" || { err "Could not create '$abs'."; return 1; }
+  elif [[ ! -d "$abs" ]]; then
+    err "'$abs' exists and is not a directory."
+    return 1
+  fi
+
+  WORKSPACE_DIR="$abs"
+  return 0
+}
+
+set_workspace_dir() {
+  local candidate="$1" abs
+  abs="$(validate_workspace_dir "$candidate")" || return 1
+
+  if [[ ! -e "$abs" ]]; then
+    if ! confirm_yes_no "Directory '$abs' doesn't exist yet. Create it?"; then
+      warn "Workspace not changed."
+      return 1
+    fi
+    mkdir -p "$abs" || { err "Could not create '$abs'."; return 1; }
+  elif [[ ! -d "$abs" ]]; then
+    err "'$abs' exists and is not a directory."
+    return 1
+  fi
+
+  WORKSPACE_DIR="$abs"
+  say "✓ Workspace set to: $WORKSPACE_DIR"
+  return 0
+}
+
+# Picks the default workspace location: a "termixai-workspace" folder inside
+# the device's real Downloads folder, so files are immediately visible in
+# the normal file manager / Gallery-adjacent apps with no extra copy step.
+# Falls back to the current directory only if no Downloads folder is found.
+default_workspace_dir() {
+  local name="termixai-workspace"
+
+  if [[ -n "${TERMIX_WORKDIR:-}" ]]; then
+    printf '%s' "$TERMIX_WORKDIR"
+    return 0
+  fi
+
+  # Termux: shared storage is exposed under ~/storage/downloads after
+  # `termux-setup-storage` has been run once.
+  if [[ -d "$HOME/storage/downloads" ]]; then
+    printf '%s/%s' "$HOME/storage/downloads" "$name"
+    return 0
+  fi
+
+  # Regular Linux / macOS.
+  if [[ -d "$HOME/Downloads" ]]; then
+    printf '%s/%s' "$HOME/Downloads" "$name"
+    return 0
+  fi
+
+  warn "No Downloads folder found (on Termux, run 'termux-setup-storage' once)."
+  printf './%s' "$name"
+  return 0
+}
+
+# Resolves a model-proposed relative path against the workspace and guarantees
+# the result stays inside it. This is the single choke point that keeps every
+# file action confined to the sandbox — absolute paths, "..", and symlink
+# escapes are all rejected here.
+resolve_safe_path() {
+  local rel="$1" abs
+
+  if [[ -z "$rel" ]]; then
+    err "Empty path rejected."
+    return 1
+  fi
+
+  case "$rel" in
+    /*)
+      err "Absolute path rejected: $rel"
+      return 1
+      ;;
+  esac
+
+  abs="$(realpath -m "$WORKSPACE_DIR/$rel" 2>/dev/null)" || {
+    err "Could not resolve path: $rel"
+    return 1
+  }
+
+  case "$abs" in
+    "$WORKSPACE_DIR"|"$WORKSPACE_DIR"/*)
+      : ;;
+    *)
+      err "Path escapes the workspace sandbox, blocked: $rel"
+      return 1
+      ;;
+  esac
+
+  if is_dangerous_root "$abs"; then
+    err "Path resolves to a critical system location, blocked: $abs"
+    return 1
+  fi
+
+  printf '%s' "$abs"
+  return 0
 }
 
 init_history() {
-  messages_json="$(jq -nc --arg content "$SYSTEM_PROMPT" '[{role:"system", content:$content}]')"
+  local system_prompt
+  system_prompt="$(build_system_prompt)"
+  messages_json="$(jq -nc --arg content "$system_prompt" '[{role:"system", content:$content}]')"
 }
 
 append_message() {
@@ -90,6 +259,8 @@ Commands:
   t> model                Open the free-model picker
   t> model <name>         Switch to a model by name
   t> current              Show current model
+  t> workdir              Show the current sandbox folder
+  t> workdir <path>       Change the sandbox folder
   t> clear                Clear the terminal
   t> reset                Start a new conversation
   t> history              Show chat history
@@ -97,6 +268,13 @@ Commands:
 
 Chat:
   Type any normal message at the chat> prompt.
+
+File agent:
+  The agent can propose creating, overwriting, or deleting a single file
+  inside the sandbox folder (see 't> workdir'). Every proposed change is
+  shown to you and requires a yes/no confirmation before anything touches
+  disk. It cannot delete folders, run shell commands, or reach outside the
+  sandbox folder under any circumstance.
 
 EOF
 }
@@ -306,7 +484,11 @@ set_model_by_name() {
   fi
 
   fuzzy_match="$(grep -iF "$input" "$models_tmp" || true)"
-  count="$(wc -l <<< "$fuzzy_match" | tr -d ' ')"
+  if [[ -z "$fuzzy_match" ]]; then
+    count=0
+  else
+    count="$(wc -l <<< "$fuzzy_match" | tr -d ' ')"
+  fi
 
   if [[ "$count" -eq 1 ]]; then
     CURRENT_MODEL="$(head -n 1 <<< "$fuzzy_match")"
@@ -335,6 +517,116 @@ set_model_by_name() {
   warn "Model not found."
   rm -f "$models_tmp"
   return 1
+}
+
+handle_write_action() {
+  local rel="$1" content_file="$2" abs lines
+
+  abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe write proposal: $rel"; return; }
+
+  lines="$(wc -l < "$content_file" | tr -d ' ')"
+  echo
+  say "Agent wants to write a file:"
+  echo "  $abs"
+  echo "  ($lines lines)"
+  echo "--- preview (first 40 lines) ---"
+  sed -n '1,40p' "$content_file"
+  echo "--- end preview ---"
+
+  if confirm_yes_no "Apply this write?"; then
+    mkdir -p "$(dirname "$abs")" 2>/dev/null
+    if cp "$content_file" "$abs"; then
+      say "✓ Wrote $abs"
+    else
+      err "Failed to write $abs"
+    fi
+  else
+    warn "Skipped write: $rel"
+  fi
+}
+
+handle_delete_action() {
+  local rel="$1" abs
+
+  abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe delete proposal: $rel"; return; }
+
+  if [[ -d "$abs" ]]; then
+    err "Refusing to delete a directory (only single files are allowed): $abs"
+    return
+  fi
+
+  if [[ ! -e "$abs" ]]; then
+    warn "Nothing to delete, file does not exist: $abs"
+    return
+  fi
+
+  echo
+  say "Agent wants to delete a file:"
+  echo "  $abs"
+
+  if confirm_yes_no "Delete this file?"; then
+    if rm -f "$abs"; then
+      say "✓ Deleted $abs"
+    else
+      err "Failed to delete $abs"
+    fi
+  else
+    warn "Skipped delete: $rel"
+  fi
+}
+
+# Scans an assistant reply for FILE_WRITE / FILE_DELETE markers, strips them
+# out of what's shown as plain chat text, and runs each proposed action
+# through the sandboxed, confirmation-gated handlers above.
+process_agent_reply() {
+  local reply="$1"
+  local mode="text" path="" write_file="" idx=0
+  local cleaned="" line
+  local -a write_paths=() write_files=() delete_paths=()
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+
+  while IFS= read -r line; do
+    if [[ "$mode" == "text" ]]; then
+      if [[ "$line" =~ ^\<\<\<FILE_WRITE\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        idx=$((idx + 1))
+        write_file="$tmpdir/block_$idx"
+        : > "$write_file"
+        mode="write"
+        cleaned+="[proposed file write: $path]"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<FILE_DELETE\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        delete_paths+=("$path")
+        cleaned+="[proposed file delete: $path]"$'\n'
+        continue
+      fi
+      cleaned+="$line"$'\n'
+    else
+      if [[ "$line" == '<<<END_FILE_WRITE>>>' ]]; then
+        write_paths+=("$path")
+        write_files+=("$write_file")
+        mode="text"
+        continue
+      fi
+      printf '%s\n' "$line" >> "$write_file"
+    fi
+  done <<< "$reply"
+
+  printf '\n\033[1;36mTermix>\033[0m %s\n' "$cleaned"
+
+  local i
+  for i in "${!write_paths[@]}"; do
+    handle_write_action "${write_paths[$i]}" "${write_files[$i]}"
+  done
+  for path in "${delete_paths[@]}"; do
+    handle_delete_action "$path"
+  done
+
+  echo
+  rm -rf "$tmpdir"
 }
 
 ask_api_key() {
@@ -376,7 +668,7 @@ send_chat() {
       -o "$tmp_body" \
       -w '%{http_code}' \
       -X POST "$OPENROUTER_URL" \
-      -H "Authorization: Bearer '"$API_KEY"'" \
+      -H "Authorization: Bearer $API_KEY" \
       -H "Content-Type: application/json" \
       -H "HTTP-Referer: http://localhost" \
       -H "X-Title: Termix Agent" \
@@ -403,7 +695,7 @@ send_chat() {
   fi
 
   append_message "assistant" "$reply"
-  printf '\n\033[1;36mTermix>\033[0m %s\n\n' "$reply"
+  process_agent_reply "$reply"
 }
 
 command_router() {
@@ -432,11 +724,25 @@ command_router() {
     current)
       echo "Current model: $CURRENT_MODEL"
       ;;
+    workdir)
+      echo "Current sandbox folder: $WORKSPACE_DIR"
+      ;;
+    workdir\ *)
+      rest="${cmd#workdir }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> workdir <path>"
+      elif set_workspace_dir "$rest"; then
+        init_history
+        say "Conversation reset so the agent knows the new sandbox path."
+      fi
+      ;;
     clear)
       clear
       banner
       echo "Connected to OpenRouter"
       echo "Current Model: $CURRENT_MODEL"
+      echo "Sandbox folder: $WORKSPACE_DIR"
       echo
       echo "Type 't> help' for commands."
       echo "Press Ctrl+C to exit."
@@ -462,10 +768,17 @@ main() {
   check_deps
   banner
   ask_api_key
+
+  if ! init_workspace_auto; then
+    err "Could not set up a sandbox workspace. Exiting."
+    exit 1
+  fi
+
   init_history
 
   echo "Connected to OpenRouter"
   echo "Current Model: $CURRENT_MODEL"
+  echo "Sandbox folder: $WORKSPACE_DIR"
   echo
   echo "Type 't> help' for commands."
   echo "Type messages at the chat> prompt."
