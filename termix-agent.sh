@@ -38,6 +38,28 @@ CUSTOM_URL="${CUSTOM_API_URL:-}"
 CUSTOM_KEY="${CUSTOM_API_KEY:-}"
 CUSTOM_REQUIRES_KEY=1
 
+# Built-in OpenAI-compatible providers beyond OpenRouter/Google. Each has a
+# fixed, known endpoint (unlike "Other Providers" above, which asks the user
+# to type one), so picking one of these only ever prompts for an API key.
+MISTRAL_URL="https://api.mistral.ai/v1/chat/completions"
+MISTRAL_KEY="${MISTRAL_API_KEY:-}"
+DEFAULT_MISTRAL_MODEL="mistral-large-latest"
+
+# Hugging Face Inference Providers router — one OpenAI-compatible endpoint
+# in front of many hosted backends (Together, Groq, Cerebras, etc). Model
+# IDs take the form "<repo>:<provider>", e.g. "moonshotai/Kimi-K2-Instruct-0905:groq";
+# ":auto" lets HF pick a provider for you.
+HF_URL="https://router.huggingface.co/v1/chat/completions"
+HF_KEY="${HF_API_KEY:-${HUGGINGFACE_API_KEY:-}}"
+DEFAULT_HF_MODEL="meta-llama/Llama-3.3-70B-Instruct:auto"
+
+# NVIDIA NIM (build.nvidia.com) — OpenAI-compatible endpoint fronting 100+
+# hosted open-weight models on NVIDIA infra, free tier via a developer key
+# (starts with "nvapi-"). Defaults to Kimi K2.6.
+NVIDIA_URL="https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_KEY="${NVIDIA_API_KEY:-}"
+DEFAULT_NVIDIA_MODEL="moonshotai/kimi-k2.6"
+
 CURRENT_MODEL="$DEFAULT_MODEL"
 CURRENT_MODEL_LABEL="$DEFAULT_MODEL"
 
@@ -962,11 +984,14 @@ pick_provider_startup() {
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
   printf "${C_MUTED}[1]${C_RESET} OpenRouter ${C_DIM}(many models, free + paid)${C_RESET}\n"
   printf "${C_MUTED}[2]${C_RESET} Google AI Studio ${C_DIM}(Gemini models)${C_RESET}\n"
-  printf "${C_MUTED}[3]${C_RESET} Other Providers ${C_DIM}(self-hosted or any OpenAI-compatible API)${C_RESET}\n"
+  printf "${C_MUTED}[3]${C_RESET} Mistral ${C_DIM}(api.mistral.ai)${C_RESET}\n"
+  printf "${C_MUTED}[4]${C_RESET} Hugging Face ${C_DIM}(Inference Providers router)${C_RESET}\n"
+  printf "${C_MUTED}[5]${C_RESET} NVIDIA NIM ${C_DIM}(build.nvidia.com, e.g. Kimi K2.6)${C_RESET}\n"
+  printf "${C_MUTED}[6]${C_RESET} Other Providers ${C_DIM}(self-hosted or any OpenAI-compatible API)${C_RESET}\n"
   echo
 
   while true; do
-    if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2/3]${C_RESET}: ")" choice; then
+    if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1-6]${C_RESET}: ")" choice; then
       err "No provider selected. Exiting."
       exit 1
     fi
@@ -983,14 +1008,32 @@ pick_provider_startup() {
         CURRENT_MODEL_LABEL="$CURRENT_MODEL"
         break
         ;;
-      3|other|Other|OTHER)
+      3|mistral|Mistral|MISTRAL)
+        PROVIDER="mistral"
+        CURRENT_MODEL="$DEFAULT_MISTRAL_MODEL"
+        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+        break
+        ;;
+      4|huggingface|"hugging face"|HuggingFace|HUGGINGFACE|hf|HF)
+        PROVIDER="huggingface"
+        CURRENT_MODEL="$DEFAULT_HF_MODEL"
+        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+        break
+        ;;
+      5|nvidia|nvidia_nim|NVIDIA|nim|NIM)
+        PROVIDER="nvidia_nim"
+        CURRENT_MODEL="$DEFAULT_NVIDIA_MODEL"
+        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+        break
+        ;;
+      6|other|Other|OTHER)
         if configure_custom_provider; then
           break
         fi
         # cancelled — fall through and show the provider menu again
         ;;
       *)
-        warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), or 3 (Other Providers)."
+        warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), 3 (Mistral), 4 (Hugging Face), 5 (NVIDIA NIM), or 6 (Other Providers)."
         ;;
     esac
   done
@@ -1007,9 +1050,12 @@ pick_provider_ui() {
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
   printf "${C_MUTED}[1]${C_RESET} OpenRouter ${C_DIM}(many models, free + paid)${C_RESET}\n"
   printf "${C_MUTED}[2]${C_RESET} Google AI Studio ${C_DIM}(Gemini models)${C_RESET}\n"
-  printf "${C_MUTED}[3]${C_RESET} Other Providers ${C_DIM}(self-hosted or any OpenAI-compatible API)${C_RESET}\n"
+  printf "${C_MUTED}[3]${C_RESET} Mistral ${C_DIM}(api.mistral.ai)${C_RESET}\n"
+  printf "${C_MUTED}[4]${C_RESET} Hugging Face ${C_DIM}(Inference Providers router)${C_RESET}\n"
+  printf "${C_MUTED}[5]${C_RESET} NVIDIA NIM ${C_DIM}(build.nvidia.com, e.g. Kimi K2.6)${C_RESET}\n"
+  printf "${C_MUTED}[6]${C_RESET} Other Providers ${C_DIM}(self-hosted or any OpenAI-compatible API)${C_RESET}\n"
   echo
-  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2/3, q to cancel]${C_RESET}: ")" choice || choice="q"
+  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1-6, q to cancel]${C_RESET}: ")" choice || choice="q"
 
   case "$choice" in
     1|openrouter|OpenRouter|OPENROUTER)
@@ -1020,7 +1066,19 @@ pick_provider_ui() {
       new_provider="google"
       new_label="Google AI Studio"
       ;;
-    3|other|Other|OTHER)
+    3|mistral|Mistral|MISTRAL)
+      new_provider="mistral"
+      new_label="Mistral"
+      ;;
+    4|huggingface|"hugging face"|HuggingFace|HUGGINGFACE|hf|HF)
+      new_provider="huggingface"
+      new_label="Hugging Face"
+      ;;
+    5|nvidia|nvidia_nim|NVIDIA|nim|NIM)
+      new_provider="nvidia_nim"
+      new_label="NVIDIA NIM"
+      ;;
+    6|other|Other|OTHER)
       # Custom setup collects its own confirmation as it goes (URL, key
       # requirement, model), so it doesn't need the generic
       # confirm_model_switch step the other two branches use below.
@@ -1046,7 +1104,7 @@ pick_provider_ui() {
       return 0
       ;;
     *)
-      warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), 3 (Other Providers), or q to cancel."
+      warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), 3 (Mistral), 4 (Hugging Face), 5 (NVIDIA NIM), 6 (Other Providers), or q to cancel."
       return 1
       ;;
   esac
@@ -1062,11 +1120,13 @@ pick_provider_ui() {
   fi
 
   PROVIDER="$new_provider"
-  if [[ "$PROVIDER" == "google" ]]; then
-    CURRENT_MODEL="$DEFAULT_GOOGLE_MODEL"
-  else
-    CURRENT_MODEL="$DEFAULT_MODEL"
-  fi
+  case "$PROVIDER" in
+    google) CURRENT_MODEL="$DEFAULT_GOOGLE_MODEL" ;;
+    mistral) CURRENT_MODEL="$DEFAULT_MISTRAL_MODEL" ;;
+    huggingface) CURRENT_MODEL="$DEFAULT_HF_MODEL" ;;
+    nvidia_nim) CURRENT_MODEL="$DEFAULT_NVIDIA_MODEL" ;;
+    *) CURRENT_MODEL="$DEFAULT_MODEL" ;;
+  esac
   CURRENT_MODEL_LABEL="$CURRENT_MODEL"
   ok "Switched provider to: $new_label"
   muted "Model reset to $CURRENT_MODEL — use 't> model' to pick a different one."
@@ -1269,7 +1329,9 @@ pick_model_ui() {
     return 0
   fi
 
-  if [[ "$PROVIDER" == "custom" ]]; then
+  if [[ "$PROVIDER" == "custom" || "$PROVIDER" == "mistral" || "$PROVIDER" == "huggingface" || "$PROVIDER" == "nvidia_nim" ]]; then
+    # None of these expose a model-list API we hook into (yet), so — same
+    # as "Other Providers" — just take the model id as free text.
     prompt_custom_model_name
     return 0
   fi
@@ -1314,7 +1376,7 @@ set_model_by_name() {
     return $?
   fi
 
-  if [[ "$PROVIDER" == "custom" ]]; then
+  if [[ "$PROVIDER" == "custom" || "$PROVIDER" == "mistral" || "$PROVIDER" == "huggingface" || "$PROVIDER" == "nvidia_nim" ]]; then
     if confirm_model_switch "$input"; then
       apply_model_switch "$input"
       return 0
@@ -1887,6 +1949,10 @@ url_decode() {
 #   $8  unwrap_ddg_redirect — "1" if hrefs are wrapped DuckDuckGo-style as
 #                            //duckduckgo.com/l/?uddg=<encoded real URL> and
 #                            need unwrapping; empty/omitted otherwise
+#   $9  post_data           — optional. If set (even to ""), the request is
+#                            sent as POST with this as the URL-encoded body
+#                            (e.g. "q=search+terms") instead of a GET. Omit
+#                            this arg entirely to keep the old GET behavior.
 WEB_SEARCH_MAX_RESULTS=5
 WEB_SEARCH_LAST_ERROR=""
 web_search_scrape_generic() {
@@ -1894,15 +1960,37 @@ web_search_scrape_generic() {
   local pcre_tag_re="$3" pcre_title_re="$4" pcre_snippet_re="$5"
   local ere_title_tag_re="$6" ere_snippet_tag_re="$7"
   local unwrap_ddg_redirect="${8:-}"
+  local have_post_data=$(( $# >= 9 ? 1 : 0 ))
+  local post_data="${9:-}"
   local html_tmp curl_args=() titles_raw urls_raw snippets_raw
   local -a titles=() urls=() snippets=()
   local i out n
   WEB_SEARCH_LAST_ERROR=""
 
   html_tmp="$(mktemp)"
-  curl_args=(-sS -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-             --max-time 20
-             "$url")
+  # Modern, realistic browser headers — a bare curl UA/Accept set gets a
+  # flat 403 or a JS challenge page from several search front-ends now
+  # (DuckDuckGo's html.duckduckgo.com in particular). These mimic a current
+  # desktop Chrome/Windows request closely enough to pass basic bot checks
+  # without needing a real browser/JS engine.
+  curl_args=(-sSL
+             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+             -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+             -H "Accept-Language: en-US,en;q=0.9"
+             -H "Sec-Fetch-Mode: navigate"
+             -H "Sec-Fetch-Site: none"
+             -H "Sec-Fetch-User: ?1"
+             -H "Sec-Fetch-Dest: document"
+             -H "Upgrade-Insecure-Requests: 1"
+             --max-time 20)
+
+  if [[ "$have_post_data" -eq 1 ]]; then
+    curl_args+=(-X POST
+                -H "Content-Type: application/x-www-form-urlencoded"
+                -H "Origin: https://$(printf '%s' "$url" | sed -E 's#^https?://##; s#/.*##')"
+                --data "$post_data")
+  fi
+  curl_args+=("$url")
 
   if ! curl "${curl_args[@]}" -o "$html_tmp" 2>/dev/null; then
     rm -f "$html_tmp"
@@ -2008,15 +2096,23 @@ web_search_query_scrape_ddg() {
   local query="$1" encoded_query
   encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
   [[ -z "$encoded_query" ]] && encoded_query="$query"
+  # html.duckduckgo.com now sits behind stepped-up bot detection (403s / JS
+  # challenges), so we use the officially supported lite endpoint instead.
+  # It only accepts POST with the query as URL-encoded form data, and its
+  # markup uses "result-link" / "result-snippet" classes (a plain table
+  # layout) rather than the old "result__a" / "result__snippet" divs. The
+  # snippet class lives directly on a <td>, so its closing tag is </td>,
+  # not </a> as with the old endpoint.
   web_search_scrape_generic \
     "duckduckgo.com" \
-    "https://html.duckduckgo.com/html/?q=${encoded_query}" \
-    '<a[^>]*class="result__a"[^>]*>' \
-    'class="result__a"[^>]*>\K.*?(?=</a>)' \
-    'class="result__snippet"[^>]*>\K.*?(?=</a>)' \
-    '<a[^>]*class="result__a"[^>]*>[^<]*</a>' \
-    'class="result__snippet"[^>]*>[^<]*' \
-    "1"
+    "https://lite.duckduckgo.com/lite/" \
+    '<a[^>]*class="result-link"[^>]*>' \
+    'class="result-link"[^>]*>\K.*?(?=</a>)' \
+    'class="result-snippet"[^>]*>\K.*?(?=</td>)' \
+    '<a[^>]*class="result-link"[^>]*>[^<]*</a>' \
+    'class="result-snippet"[^>]*>[^<]*' \
+    "1" \
+    "q=${encoded_query}"
 }
 
 web_search_query_scrape_bing() {
@@ -2502,6 +2598,9 @@ provider_label() {
   case "$PROVIDER" in
     google) printf 'Google AI Studio' ;;
     openrouter) printf 'OpenRouter' ;;
+    mistral) printf 'Mistral' ;;
+    huggingface) printf 'Hugging Face' ;;
+    nvidia_nim) printf 'NVIDIA NIM' ;;
     custom) printf 'Other (%s)' "${CUSTOM_URL:-custom endpoint}" ;;
     *) printf '(no provider selected)' ;;
   esac
@@ -2533,6 +2632,33 @@ ensure_provider_key() {
       echo
       [[ -z "$entered" ]] && return 1
       OPENROUTER_KEY="$entered"
+      ;;
+    mistral)
+      [[ -n "${MISTRAL_KEY:-}" ]] && return 0
+      prompt_text="$label API key: "
+      echo
+      read -r -s -p "$prompt_text" entered
+      echo
+      [[ -z "$entered" ]] && return 1
+      MISTRAL_KEY="$entered"
+      ;;
+    huggingface)
+      [[ -n "${HF_KEY:-}" ]] && return 0
+      prompt_text="$label API key (HF access token): "
+      echo
+      read -r -s -p "$prompt_text" entered
+      echo
+      [[ -z "$entered" ]] && return 1
+      HF_KEY="$entered"
+      ;;
+    nvidia_nim)
+      [[ -n "${NVIDIA_KEY:-}" ]] && return 0
+      prompt_text="$label API key (starts with nvapi-): "
+      echo
+      read -r -s -p "$prompt_text" entered
+      echo
+      [[ -z "$entered" ]] && return 1
+      NVIDIA_KEY="$entered"
       ;;
     custom)
       [[ "$CUSTOM_REQUIRES_KEY" -eq 0 ]] && return 0
@@ -2582,6 +2708,9 @@ change_api_key() {
   case "$PROVIDER" in
     google) GOOGLE_KEY="$entered" ;;
     openrouter) OPENROUTER_KEY="$entered" ;;
+    mistral) MISTRAL_KEY="$entered" ;;
+    huggingface) HF_KEY="$entered" ;;
+    nvidia_nim) NVIDIA_KEY="$entered" ;;
     custom) CUSTOM_KEY="$entered" ;;
   esac
   ok "$label API key updated."
@@ -2814,24 +2943,34 @@ normalize_google_response() {
 #     making the user wait for nothing.
 MAX_RATE_LIMIT_RETRIES=6
 MAX_RATE_LIMIT_WAIT=60
-# Same contract as call_openrouter: (messages, code_file, header_file) in,
-# raw OpenAI-shape body on stdout, numeric HTTP status written to code_file.
-# Talks to whatever URL the user configured in configure_custom_provider —
-# only sends an Authorization header if they said a key is required, so
-# purely local/self-hosted endpoints (no auth at all) work unmodified.
-call_custom() {
-  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers tmp_code http_code body
+# Generic OpenAI-compatible /chat/completions caller, shared by every
+# provider that speaks that exact request/response shape (Other/custom
+# providers, Mistral, Hugging Face, NVIDIA NIM). Same contract as
+# call_openrouter: raw OpenAI-shape body on stdout, numeric HTTP status (or
+# "CANCELLED:...") written to code_file, response headers copied to
+# header_file if given.
+#
+# Args:
+#   $1  target_url    — full /chat/completions endpoint
+#   $2  auth_header    — full "Authorization: ..." header value, or "" to
+#                        send no auth header at all (self-hosted/no-key)
+#   $3  model          — model id to send
+#   $4  messages       — JSON array (already-encoded conversation)
+#   $5  code_file
+#   $6  header_file    — optional
+call_openai_compatible() {
+  local target_url="$1" auth_header="$2" model="$3" messages="$4"
+  local code_file="$5" header_file="${6:-}"
+  local payload tmp_body tmp_headers tmp_code http_code body
   local -a curl_hdrs=(-H "Content-Type: application/json")
 
-  if [[ "$CUSTOM_REQUIRES_KEY" -eq 1 && -n "${CUSTOM_KEY:-}" ]]; then
-    curl_hdrs+=(-H "Authorization: Bearer $CUSTOM_KEY")
-  fi
+  [[ -n "$auth_header" ]] && curl_hdrs+=(-H "$auth_header")
 
   tmp_body="$(mktemp)"
   tmp_headers="$(mktemp)"
   tmp_code="$(mktemp)"
   payload="$(jq -nc \
-    --arg model "$CURRENT_MODEL" \
+    --arg model "$model" \
     --argjson messages "$messages" \
     '{
       model: $model,
@@ -2848,7 +2987,7 @@ call_custom() {
       -o "$tmp_body" \
       -D "$tmp_headers" \
       -w '%{http_code}' \
-      -X POST "$CUSTOM_URL" \
+      -X POST "$target_url" \
       "${curl_hdrs[@]}" \
       --data "$payload"
   then
@@ -2874,6 +3013,32 @@ call_custom() {
   printf '%s' "$body"
 }
 
+# Talks to whatever URL the user configured in configure_custom_provider —
+# only sends an Authorization header if they said a key is required, so
+# purely local/self-hosted endpoints (no auth at all) work unmodified.
+call_custom() {
+  local messages="$1" code_file="$2" header_file="${3:-}" auth_header=""
+  if [[ "$CUSTOM_REQUIRES_KEY" -eq 1 && -n "${CUSTOM_KEY:-}" ]]; then
+    auth_header="Authorization: Bearer $CUSTOM_KEY"
+  fi
+  call_openai_compatible "$CUSTOM_URL" "$auth_header" "$CURRENT_MODEL" "$messages" "$code_file" "$header_file"
+}
+
+call_mistral() {
+  local messages="$1" code_file="$2" header_file="${3:-}"
+  call_openai_compatible "$MISTRAL_URL" "Authorization: Bearer $MISTRAL_KEY" "$CURRENT_MODEL" "$messages" "$code_file" "$header_file"
+}
+
+call_huggingface() {
+  local messages="$1" code_file="$2" header_file="${3:-}"
+  call_openai_compatible "$HF_URL" "Authorization: Bearer $HF_KEY" "$CURRENT_MODEL" "$messages" "$code_file" "$header_file"
+}
+
+call_nvidia() {
+  local messages="$1" code_file="$2" header_file="${3:-}"
+  call_openai_compatible "$NVIDIA_URL" "Authorization: Bearer $NVIDIA_KEY" "$CURRENT_MODEL" "$messages" "$code_file" "$header_file"
+}
+
 call_provider_with_retry() {
   local messages="$1" code_file="$2" attempt=0 wait_secs=2 body http_code
   local header_file retry_after err_msg jitter provider_name
@@ -2890,6 +3055,18 @@ call_provider_with_retry() {
       custom)
         body="$(call_custom "$messages" "$code_file" "$header_file")"
         provider_name="$(provider_label)"
+        ;;
+      mistral)
+        body="$(call_mistral "$messages" "$code_file" "$header_file")"
+        provider_name="Mistral"
+        ;;
+      huggingface)
+        body="$(call_huggingface "$messages" "$code_file" "$header_file")"
+        provider_name="Hugging Face"
+        ;;
+      nvidia_nim)
+        body="$(call_nvidia "$messages" "$code_file" "$header_file")"
+        provider_name="NVIDIA NIM"
         ;;
       *)
         body="$(call_openrouter "$messages" "$code_file" "$header_file")"
