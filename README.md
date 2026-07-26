@@ -1,12 +1,19 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/assets/src/public/logo.png" alt="Termix Agent" width="120">
+  <span style="display:inline-block; width:120px; height:120px; overflow:hidden; border-radius:50%;">
+    <img
+      src="https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/assets/src/public/icon.png"
+      alt="Termix Agent"
+      width="120"
+      style="width:120px; height:120px; object-fit:cover; transform:scale(1.20);"
+    >
+  </span>
 </p>
 
 <h1 align="center">Termix Agent</h1>
 
 <p align="center">
   A free, open-source AI coding assistant that lives in your terminal.<br>
-  Inspired by Claude Code — powered by your own API keys.
+  Inspired by Claude Code - powered by your own API keys.
 </p>
 
 <p align="center">
@@ -27,7 +34,7 @@ No bloated IDEs. No subscriptions. Just you, your terminal, and an AI that under
 
 ## ✨ Features
 
-| | |
+| Features | Description |
 |:---|:---|
 | 🤖 **Natural Language Coding** | Describe what you want. Termix writes the code. |
 | 📝 **Read & Edit Files** | Create, modify, and refactor files across your project. |
