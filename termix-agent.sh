@@ -28,6 +28,16 @@ PROVIDER=""
 OPENROUTER_KEY="${OPENROUTER_API_KEY:-}"
 GOOGLE_KEY="${GOOGLE_API_KEY:-}"
 
+# "Other Providers" — any OpenAI-compatible /chat/completions endpoint the
+# user points at directly (self-hosted: Ollama, LM Studio, llama.cpp, vLLM,
+# text-generation-webui, or a third-party host using the same shape).
+# CUSTOM_REQUIRES_KEY is set by the user at setup time ('Is an API key
+# required?') — many self-hosted setups have no key at all, so this is
+# never assumed to be 1 by default.
+CUSTOM_URL="${CUSTOM_API_URL:-}"
+CUSTOM_KEY="${CUSTOM_API_KEY:-}"
+CUSTOM_REQUIRES_KEY=1
+
 CURRENT_MODEL="$DEFAULT_MODEL"
 CURRENT_MODEL_LABEL="$DEFAULT_MODEL"
 
@@ -574,7 +584,7 @@ show_help() {
   echo
   printf "${C_ACCENT2}┌─ COMMANDS ────────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> help" "show this menu"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> provider" "switch between OpenRouter and Google AI Studio"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> provider" "switch between OpenRouter, Google AI Studio, or Other"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> key" "change the API key for the current provider"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model" "open the model picker (choose Free or Paid first)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model <name>" "switch to a model by name (confirmation required)"
@@ -749,10 +759,59 @@ confirm_model_switch() {
 # would just break the next request) and immediately prompts for that
 # provider's API key if it isn't already set, so the very next chat
 # message works without a confusing failure first.
-# Forces an explicit provider choice at launch — there is no default
-# backend, so this must succeed (or exit) before anything else runs.
-# Deliberately simpler than pick_provider_ui (no "already using X" /
-# confirm-switch dance, since nothing has been chosen yet).
+# Shared setup flow for the "Other Providers" option — used by both
+# pick_provider_startup (first launch) and pick_provider_ui (mid-session
+# switch). Asks for the endpoint, whether it needs a key, and a model name,
+# then sets PROVIDER/CUSTOM_URL/CUSTOM_REQUIRES_KEY/CURRENT_MODEL directly.
+# Returns 1 (leaving everything untouched) if the user backs out.
+configure_custom_provider() {
+  local url model
+
+  echo
+  printf "${C_ACCENT2}┌─ OTHER PROVIDER ───────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} Any OpenAI-compatible ${C_DIM}/chat/completions${C_RESET} endpoint works\n"
+  printf "${C_MUTED}│${C_RESET} here — self-hosted (Ollama, LM Studio, llama.cpp,\n"
+  printf "${C_MUTED}│${C_RESET} vLLM, text-generation-webui) or any hosted API\n"
+  printf "${C_MUTED}│${C_RESET} using the same request/response shape.\n"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
+
+  if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} API base URL ${C_MUTED}(full endpoint, q to cancel)${C_RESET}: ")" url; then
+    muted "Cancelled."
+    return 1
+  fi
+  [[ "$url" == "q" || "$url" == "Q" ]] && { muted "Cancelled."; return 1; }
+  if [[ -z "$url" ]]; then
+    warn "URL can't be empty. Cancelled."
+    return 1
+  fi
+
+  local requires_key=1
+  if ! confirm_yes_no "Is an API key required?"; then
+    requires_key=0
+  fi
+
+  if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Model name to use: ")" model; then
+    muted "Cancelled."
+    return 1
+  fi
+  if [[ -z "$model" ]]; then
+    warn "Model name can't be empty. Cancelled."
+    return 1
+  fi
+
+  PROVIDER="custom"
+  CUSTOM_URL="$url"
+  CUSTOM_REQUIRES_KEY="$requires_key"
+  CURRENT_MODEL="$model"
+  CURRENT_MODEL_LABEL="$model"
+
+  if [[ "$requires_key" -eq 0 ]]; then
+    CUSTOM_KEY=""
+    muted "No API key needed — assuming you're running this yourself."
+  fi
+  return 0
+}
+
 pick_provider_startup() {
   local choice
 
@@ -762,10 +821,11 @@ pick_provider_startup() {
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
   printf "${C_MUTED}[1]${C_RESET} OpenRouter ${C_DIM}(many models, free + paid)${C_RESET}\n"
   printf "${C_MUTED}[2]${C_RESET} Google AI Studio ${C_DIM}(Gemini models)${C_RESET}\n"
+  printf "${C_MUTED}[3]${C_RESET} Other Providers ${C_DIM}(self-hosted or any OpenAI-compatible API)${C_RESET}\n"
   echo
 
   while true; do
-    if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2]${C_RESET}: ")" choice; then
+    if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2/3]${C_RESET}: ")" choice; then
       err "No provider selected. Exiting."
       exit 1
     fi
@@ -782,8 +842,14 @@ pick_provider_startup() {
         CURRENT_MODEL_LABEL="$CURRENT_MODEL"
         break
         ;;
+      3|other|Other|OTHER)
+        if configure_custom_provider; then
+          break
+        fi
+        # cancelled — fall through and show the provider menu again
+        ;;
       *)
-        warn "Please choose 1 (OpenRouter) or 2 (Google AI Studio)."
+        warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), or 3 (Other Providers)."
         ;;
     esac
   done
@@ -800,8 +866,9 @@ pick_provider_ui() {
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
   printf "${C_MUTED}[1]${C_RESET} OpenRouter ${C_DIM}(many models, free + paid)${C_RESET}\n"
   printf "${C_MUTED}[2]${C_RESET} Google AI Studio ${C_DIM}(Gemini models)${C_RESET}\n"
+  printf "${C_MUTED}[3]${C_RESET} Other Providers ${C_DIM}(self-hosted or any OpenAI-compatible API)${C_RESET}\n"
   echo
-  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2, q to cancel]${C_RESET}: ")" choice || choice="q"
+  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Provider? ${C_MUTED}[1/2/3, q to cancel]${C_RESET}: ")" choice || choice="q"
 
   case "$choice" in
     1|openrouter|OpenRouter|OPENROUTER)
@@ -812,12 +879,33 @@ pick_provider_ui() {
       new_provider="google"
       new_label="Google AI Studio"
       ;;
+    3|other|Other|OTHER)
+      # Custom setup collects its own confirmation as it goes (URL, key
+      # requirement, model), so it doesn't need the generic
+      # confirm_model_switch step the other two branches use below.
+      if [[ "$PROVIDER" == "custom" ]]; then
+        if ! confirm_yes_no "Already on a custom provider — reconfigure it?"; then
+          muted "Cancelled."
+          return 0
+        fi
+      fi
+      if configure_custom_provider; then
+        ok "Switched provider to: $(provider_label)"
+        if ! ensure_provider_key; then
+          warn "No API key provided — chats will fail until you set one."
+          muted "Run 't> key' to set it."
+        fi
+      else
+        muted "Cancelled."
+      fi
+      return 0
+      ;;
     q|Q)
       muted "Cancelled."
       return 0
       ;;
     *)
-      warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), or q to cancel."
+      warn "Please choose 1 (OpenRouter), 2 (Google AI Studio), 3 (Other Providers), or q to cancel."
       return 1
       ;;
   esac
@@ -1048,6 +1136,11 @@ pick_model_ui() {
     return 0
   fi
 
+  if [[ "$PROVIDER" == "custom" ]]; then
+    prompt_custom_model_name
+    return 0
+  fi
+
   while true; do
     tier="$(prompt_model_tier)" || return 0
     pick_model_from_tier "$tier"
@@ -1059,12 +1152,46 @@ pick_model_ui() {
   done
 }
 
+# There's no model-list API for an arbitrary "Other Provider" endpoint, so
+# this just takes free-text input directly instead of the free/paid tier
+# picker the other providers use.
+prompt_custom_model_name() {
+  local model
+
+  printf "${C_MUTED}current model:${C_RESET} %s\n" "$CURRENT_MODEL"
+  if ! read -r -p "$(printf "${C_ACCENT2}?${C_RESET} New model name ${C_MUTED}(q to cancel)${C_RESET}: ")" model; then
+    muted "Cancelled."
+    return 1
+  fi
+  [[ "$model" == "q" || "$model" == "Q" || -z "$model" ]] && { muted "Cancelled."; return 1; }
+
+  if confirm_model_switch "$model"; then
+    CURRENT_MODEL="$model"
+    CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+    ok "Switched to: $CURRENT_MODEL"
+    return 0
+  fi
+  muted "Cancelled."
+  return 1
+}
+
 set_model_by_name() {
   local input="$1"
 
   if [[ "$PROVIDER" == "google" ]]; then
     set_model_by_name_google "$input"
     return $?
+  fi
+
+  if [[ "$PROVIDER" == "custom" ]]; then
+    if confirm_model_switch "$input"; then
+      CURRENT_MODEL="$input"
+      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+      ok "Switched to: $CURRENT_MODEL"
+      return 0
+    fi
+    muted "Cancelled."
+    return 1
   fi
 
   local free_tmp paid_tmp exact_match fuzzy_match count candidate
@@ -2081,6 +2208,7 @@ provider_label() {
   case "$PROVIDER" in
     google) printf 'Google AI Studio' ;;
     openrouter) printf 'OpenRouter' ;;
+    custom) printf 'Other (%s)' "${CUSTOM_URL:-custom endpoint}" ;;
     *) printf '(no provider selected)' ;;
   esac
 }
@@ -2112,6 +2240,16 @@ ensure_provider_key() {
       [[ -z "$entered" ]] && return 1
       OPENROUTER_KEY="$entered"
       ;;
+    custom)
+      [[ "$CUSTOM_REQUIRES_KEY" -eq 0 ]] && return 0
+      [[ -n "${CUSTOM_KEY:-}" ]] && return 0
+      prompt_text="$label API key: "
+      echo
+      read -r -s -p "$prompt_text" entered
+      echo
+      [[ -z "$entered" ]] && return 1
+      CUSTOM_KEY="$entered"
+      ;;
     *)
       err "No provider selected yet — run 't> provider' first."
       return 1
@@ -2131,6 +2269,11 @@ change_api_key() {
     return 1
   fi
 
+  if [[ "$PROVIDER" == "custom" && "$CUSTOM_REQUIRES_KEY" -eq 0 ]]; then
+    muted "This provider is set to not require an API key — nothing to change."
+    return 0
+  fi
+
   label="$(provider_label)"
   prompt_text="New $label API key: "
   echo
@@ -2145,6 +2288,7 @@ change_api_key() {
   case "$PROVIDER" in
     google) GOOGLE_KEY="$entered" ;;
     openrouter) OPENROUTER_KEY="$entered" ;;
+    custom) CUSTOM_KEY="$entered" ;;
   esac
   ok "$label API key updated."
 }
@@ -2311,6 +2455,56 @@ normalize_google_response() {
 #     making the user wait for nothing.
 MAX_RATE_LIMIT_RETRIES=6
 MAX_RATE_LIMIT_WAIT=60
+# Same contract as call_openrouter: (messages, code_file, header_file) in,
+# raw OpenAI-shape body on stdout, numeric HTTP status written to code_file.
+# Talks to whatever URL the user configured in configure_custom_provider —
+# only sends an Authorization header if they said a key is required, so
+# purely local/self-hosted endpoints (no auth at all) work unmodified.
+call_custom() {
+  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers http_code body
+  local -a curl_hdrs=(-H "Content-Type: application/json")
+
+  if [[ "$CUSTOM_REQUIRES_KEY" -eq 1 && -n "${CUSTOM_KEY:-}" ]]; then
+    curl_hdrs+=(-H "Authorization: Bearer $CUSTOM_KEY")
+  fi
+
+  tmp_body="$(mktemp)"
+  tmp_headers="$(mktemp)"
+  payload="$(jq -nc \
+    --arg model "$CURRENT_MODEL" \
+    --argjson messages "$messages" \
+    '{
+      model: $model,
+      messages: $messages,
+      temperature: 0.7,
+      top_p: 1,
+      stream: false
+    }'
+  )"
+
+  http_code="$(
+    curl -sS \
+      -o "$tmp_body" \
+      -D "$tmp_headers" \
+      -w '%{http_code}' \
+      -X POST "$CUSTOM_URL" \
+      "${curl_hdrs[@]}" \
+      --data "$payload" 2>/dev/null || true
+  )"
+  [[ -z "$http_code" ]] && http_code="000"
+
+  body="$(cat "$tmp_body")"
+  rm -f "$tmp_body"
+
+  if [[ -n "$header_file" ]]; then
+    cp "$tmp_headers" "$header_file" 2>/dev/null || true
+  fi
+  rm -f "$tmp_headers"
+
+  printf '%s' "$http_code" > "$code_file"
+  printf '%s' "$body"
+}
+
 call_provider_with_retry() {
   local messages="$1" code_file="$2" attempt=0 wait_secs=2 body http_code
   local header_file retry_after err_msg jitter provider_name
@@ -2323,6 +2517,10 @@ call_provider_with_retry() {
       google)
         body="$(call_google "$messages" "$code_file" "$header_file")"
         provider_name="Google AI Studio"
+        ;;
+      custom)
+        body="$(call_custom "$messages" "$code_file" "$header_file")"
+        provider_name="$(provider_label)"
         ;;
       *)
         body="$(call_openrouter "$messages" "$code_file" "$header_file")"
