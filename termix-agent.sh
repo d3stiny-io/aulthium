@@ -1923,48 +1923,170 @@ url_decode() {
   printf '%b' "${encoded//%/\\x}"
 }
 
+# Decodes the handful of HTML entities that actually show up in search
+# result markup. Reads from stdin, writes to stdout, so it chains with
+# other sed/tr filters in a pipeline.
+html_decode() {
+  sed -e 's/&amp;/\&/g' \
+      -e 's/&quot;/"/g' \
+      -e "s/&#x27;/'/g" \
+      -e "s/&#39;/'/g" \
+      -e 's/&lt;/</g' \
+      -e 's/&gt;/>/g'
+}
+
+# Percent-encodes a string for a URL query using only bash/printf builtins
+# — no python/perl. Used as a fallback when `jq` isn't installed; jq's
+# `@uri` is tried first in each provider wrapper below since it's already
+# a dependency of this script, but this keeps web search fully working
+# even on a minimal box without it.
+url_encode_fallback() {
+  local s="$1" out="" c i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      ' ') out+='+' ;;
+      *) out+="$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Splits flattened, single-line HTML ($1) into one chunk per search result
+# on every occurrence of a literal marker string ($2) — e.g. Bing's
+# `<li class="b_algo"` or DuckDuckGo's title-anchor prefix. Each result
+# ends up isolated in its own array element (global RESULT_BLOCKS), which
+# is what makes field extraction below safe: title/URL/snippet for a given
+# result are always pulled from the SAME block, instead of three separate
+# whole-page regex passes whose match counts could silently drift out of
+# sync the moment a provider's markup gains or drops an element anywhere
+# on the page — a real correctness risk in a flat parallel-array design,
+# and the main thing this rewrite fixes.
+#
+# $3 (optional): require_substring — if given, a block is only kept when
+# it also contains this literal substring. Used to reject false-positive
+# blocks that share the split marker but aren't actually a search result
+# (e.g. DuckDuckGo's marker alone would also catch "next page" links).
+split_into_blocks() {
+  local flat="$1" marker="$2" require_substring="${3:-}"
+  local escaped marked sep=$'\x01'
+  local -a raw=()
+  RESULT_BLOCKS=()
+
+  # Escape BRE/sed metacharacters so the marker is matched literally
+  # regardless of what characters happen to be in it.
+  escaped="$(printf '%s' "$marker" | sed -e 's/[][\\/.*^$]/\\&/g')"
+  marked="$(printf '%s' "$flat" | sed "s/${escaped}/${sep}&/g")"
+  IFS="$sep" read -r -a raw <<< "$marked"
+
+  local b
+  for b in "${raw[@]}"; do
+    [[ "$b" != *"$marker"* ]] && continue
+    [[ -n "$require_substring" && "$b" != *"$require_substring"* ]] && continue
+    RESULT_BLOCKS+=("$b")
+  done
+}
+
+# Pulls title/href/snippet out of one already-isolated result block ($1).
+# Only ever needs plain POSIX ERE (grep -oE) + sed — no PCRE lookahead or
+# lazy-match required, because block isolation already scopes every regex
+# to a single result. This is why the old dual PCRE-vs-ERE code path is
+# gone: both cases now run through this exact same logic, so whether this
+# system's grep has -P support no longer affects parsing correctness at
+# all (HAVE_GREP_PCRE is still detected in check_deps and still surfaces
+# in the diagnostic message if a page fails to parse — see below — it's
+# just no longer load-bearing for the parser itself).
+#
+# Sets: EXTRACT_TITLE, EXTRACT_URL, EXTRACT_SNIPPET
+extract_result_from_block() {
+  local block="$1" unwrap_ddg="$2" snippet_class="$3"
+  local href="" title="" snippet="" anchor_start title_chunk after cut
+
+  # Title + URL: the first <a ...href="...">, then everything up to that
+  # tag's matching </a>. Matched greedily to the end of the block (POSIX
+  # ERE has no lazy quantifier) and then trimmed back to the first </a>
+  # with a bash suffix-strip — that two-step is what lets this handle a
+  # title wrapped in a nested tag (e.g. Startpage's <a...><h3>Title</h3>
+  # </a>) instead of assuming plain text right after the anchor's '>',
+  # which silently produced an empty title whenever a provider nests one.
+  anchor_start="$(printf '%s' "$block" | grep -oE '<a[^>]*href="[^"]*"[^>]*>.*' | head -n1)"
+  [[ "$anchor_start" =~ href=\"([^\"]*)\" ]] && href="${BASH_REMATCH[1]}"
+  title_chunk="${anchor_start%%</a>*}"
+  title="$(printf '%s' "$title_chunk" | sed -e 's/<[^>]*>//g' | html_decode)"
+
+  if [[ "$unwrap_ddg" == "1" && "$href" == *"uddg="* ]]; then
+    href="${href#*uddg=}"
+    href="${href%%&*}"
+    href="$(url_decode "$href")"
+  fi
+
+  # Snippet: jump past the snippet-class marker (only if the caller gave
+  # one and it's actually present in this block), then cut at the first
+  # closing tag of a handful of common container elements — td/p/div/li/
+  # span — before stripping remaining tags and collapsing whitespace.
+  # That boundary is deliberately loose (any of five tag names, not one
+  # exact tag) so a provider swapping e.g. <p> for <div> around the
+  # snippet doesn't break it, while still stopping the capture from
+  # bleeding into whatever sibling element follows in the same block
+  # (a real bug without any boundary at all — a DDG snippet's <td> is
+  # immediately followed by the domain-text row in the same block).
+  if [[ -n "$snippet_class" && "$block" == *"$snippet_class"* ]]; then
+    after="${block#*$snippet_class}"
+    after="${after#*>}"
+    cut="$(printf '%s' "$after" | grep -oE '</(td|p|div|li|span)>' | head -n1)"
+    [[ -n "$cut" ]] && after="${after%%$cut*}"
+    snippet="$(printf '%s' "$after" | sed -e 's/<[^>]*>//g' | html_decode)"
+    snippet="$(printf '%s' "$snippet" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    snippet="${snippet:0:300}"
+  fi
+
+  EXTRACT_TITLE="$title"
+  EXTRACT_URL="$href"
+  EXTRACT_SNIPPET="$snippet"
+}
+
 # Generic HTML-scrape web search backend, parameterized per provider so
-# DuckDuckGo, Bing, and Startpage can all reuse the same fetch/parse/decode
-# logic (see the three thin wrappers below this function). Used whenever the
-# LangChain backend isn't available, or a given provider is unreachable —
-# see web_search_query for the fallback chain. This never talks to
-# OpenRouter/Google at all — it's a plain curl + local HTML parse, so it
-# costs nothing either way. Sets WEB_SEARCH_LAST_ERROR to a short reason on
-# failure so the caller can tell the user something more useful than "it
-# didn't work".
+# DuckDuckGo, Bing, and Startpage can all reuse the same fetch/split/
+# extract/decode logic (see the three thin wrappers below). Used whenever
+# the LangChain backend isn't available, or a given provider is
+# unreachable — see web_search_query for the fallback chain. This never
+# talks to OpenRouter/Google at all — it's a plain curl + local HTML
+# parse, so it costs nothing either way. Sets WEB_SEARCH_LAST_ERROR to a
+# short reason on failure so the caller can tell the user something more
+# useful than "it didn't work".
 #
 # Args:
-#   $1  provider_label   — short name for error messages (e.g. "bing.com")
-#   $2  url               — full request URL, query already percent-encoded
-#   $3  pcre_tag_re        — PCRE: the whole opening <a ...> tag of a result
-#                            title (used to pull href out of via bash regex)
-#   $4  pcre_title_re      — PCRE: the title link's inner text (\K...(?=</a>))
-#   $5  pcre_snippet_re    — PCRE: the snippet text (\K...(?=</...>))
-#   $6  ere_title_tag_re   — POSIX ERE fallback: whole "<a ...>text</a>" tag
-#                            (no PCRE -P support on this system's grep)
-#   $7  ere_snippet_tag_re — POSIX ERE fallback: snippet's opening tag plus
-#                            its text up to the next "<" (opening tag itself
-#                            is stripped off after the match, up to the
-#                            first ">")
-#   $8  unwrap_ddg_redirect — "1" if hrefs are wrapped DuckDuckGo-style as
-#                            //duckduckgo.com/l/?uddg=<encoded real URL> and
-#                            need unwrapping; empty/omitted otherwise
-#   $9  post_data           — optional. If set (even to ""), the request is
-#                            sent as POST with this as the URL-encoded body
-#                            (e.g. "q=search+terms") instead of a GET. Omit
-#                            this arg entirely to keep the old GET behavior.
+#   $1  provider_label      — short name for error messages (e.g. "bing.com")
+#   $2  url                 — full request URL, query already percent-encoded
+#   $3  block_marker        — literal substring marking the start of each
+#                             result in the page's HTML (e.g. Bing's
+#                             `<li class="b_algo"`, or an `<a ...>` prefix
+#                             that's unique to result-title links). See
+#                             split_into_blocks.
+#   $4  require_substring   — literal substring a block must also contain
+#                             to count as a real result (rejects false
+#                             positives sharing the same marker); "" to
+#                             skip this check.
+#   $5  snippet_class       — literal class-name substring used to find the
+#                             snippet text inside a block; "" to skip
+#                             snippet extraction entirely.
+#   $6  unwrap_ddg_redirect — "1" if hrefs are wrapped DuckDuckGo-style as
+#                             //duckduckgo.com/l/?uddg=<encoded real URL>
+#                             and need unwrapping; empty/omitted otherwise.
+#   $7  post_data           — optional. If given (even as ""), the request
+#                             is sent as POST with this as the URL-encoded
+#                             body (e.g. "q=search+terms") instead of GET.
+#                             Omit this arg entirely to keep GET behavior.
 WEB_SEARCH_MAX_RESULTS=5
 WEB_SEARCH_LAST_ERROR=""
 web_search_scrape_generic() {
-  local provider_label="$1" url="$2"
-  local pcre_tag_re="$3" pcre_title_re="$4" pcre_snippet_re="$5"
-  local ere_title_tag_re="$6" ere_snippet_tag_re="$7"
-  local unwrap_ddg_redirect="${8:-}"
-  local have_post_data=$(( $# >= 9 ? 1 : 0 ))
-  local post_data="${9:-}"
-  local html_tmp curl_args=() titles_raw urls_raw snippets_raw
+  local provider_label="$1" url="$2" block_marker="$3" require_substring="$4"
+  local snippet_class="$5" unwrap_ddg_redirect="${6:-}"
+  local have_post_data=$(( $# >= 7 ? 1 : 0 ))
+  local post_data="${7:-}"
+  local html_tmp curl_args=() flat out i n
   local -a titles=() urls=() snippets=()
-  local i out n
   WEB_SEARCH_LAST_ERROR=""
 
   html_tmp="$(mktemp)"
@@ -2004,144 +2126,121 @@ web_search_scrape_generic() {
     return 1
   fi
 
-  if [[ "$HAVE_GREP_PCRE" -eq 1 ]]; then
-    # -z treats the whole file as one match space so \K + non-greedy .*? can
-    # span the (irrelevant) newlines in the markup. href and class can
-    # appear in either order inside the tag, so grab the whole opening tag
-    # first and pull href out of that with a plain bash regex rather than
-    # assuming an order.
-    local -a title_tags=()
-    mapfile -d '' -t title_tags < <(grep -Pzo "$pcre_tag_re" "$html_tmp" 2>/dev/null)
-    mapfile -d '' -t titles_raw < <(grep -Pzo "$pcre_title_re" "$html_tmp" 2>/dev/null)
-    mapfile -d '' -t snippets_raw < <(grep -Pzo "$pcre_snippet_re" "$html_tmp" 2>/dev/null)
-
-    n="${#titles_raw[@]}"
-    for ((i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS; i++)); do
-      local t u s real_url tag_text
-      t="$(printf '%s' "${titles_raw[$i]}" | sed -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
-      tag_text="${title_tags[$i]:-}"
-      u=""
-      [[ "$tag_text" =~ href=\"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
-      if [[ "$unwrap_ddg_redirect" == "1" && "$u" == *"uddg="* ]]; then
-        real_url="${u#*uddg=}"
-        real_url="${real_url%%&*}"
-        real_url="$(url_decode "$real_url")"
-      else
-        real_url="$u"
-      fi
-      s="$(printf '%s' "${snippets_raw[$i]:-}" | sed -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
-      [[ -n "$t" ]] && titles+=("$t") && urls+=("$real_url") && snippets+=("$s")
-    done
-  else
-    # No PCRE (-P) support in this system's grep (common on BSD/macOS grep,
-    # busybox/toybox grep on some Termux setups). Fall back to plain POSIX
-    # ERE: flatten the file to one line so -o can still return multiple
-    # matches, and match "up to the next <" instead of a lazy quantifier
-    # (result titles are plain text with no nested tags, so this holds in
-    # practice; snippets occasionally have a <b> highlight, which this
-    # simpler pass just stops at — good enough for a fallback).
-    local flat
-    flat="$(tr '\n\r' '  ' < "$html_tmp")"
-    local -a title_tags=() snippet_tags=()
-    mapfile -t title_tags < <(printf '%s' "$flat" | grep -oE "$ere_title_tag_re" 2>/dev/null)
-    mapfile -t snippet_tags < <(printf '%s' "$flat" | grep -oE "$ere_snippet_tag_re" 2>/dev/null)
-
-    n="${#title_tags[@]}"
-    for ((i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS; i++)); do
-      local tag="${title_tags[$i]}" t u s real_url snip
-      u=""
-      [[ "$tag" =~ href=\"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
-      t="$(printf '%s' "$tag" | sed -e 's/^<a[^>]*>//' -e 's/<\/a>$//' -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
-      if [[ "$unwrap_ddg_redirect" == "1" && "$u" == *"uddg="* ]]; then
-        real_url="${u#*uddg=}"
-        real_url="${real_url%%&*}"
-        real_url="$(url_decode "$real_url")"
-      else
-        real_url="$u"
-      fi
-      snip="${snippet_tags[$i]:-}"
-      snip="${snip#*>}"
-      s="$(printf '%s' "$snip" | sed -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
-      [[ -n "$t" ]] && titles+=("$t") && urls+=("$real_url") && snippets+=("$s")
-    done
-  fi
-
+  # Flatten to one line so a result's tags are never split across
+  # newlines out from under the block splitter — also what makes parsing
+  # work identically regardless of HAVE_GREP_PCRE (see
+  # extract_result_from_block above).
+  flat="$(tr '\n\r' '  ' < "$html_tmp")"
   rm -f "$html_tmp"
 
+  split_into_blocks "$flat" "$block_marker" "$require_substring"
+
+  n="${#RESULT_BLOCKS[@]}"
+  for (( i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS; i++ )); do
+    extract_result_from_block "${RESULT_BLOCKS[$i]}" "$unwrap_ddg_redirect" "$snippet_class"
+    if [[ -n "$EXTRACT_TITLE" ]]; then
+      titles+=("$EXTRACT_TITLE")
+      urls+=("$EXTRACT_URL")
+      snippets+=("$EXTRACT_SNIPPET")
+    fi
+  done
+
   if [[ "${#titles[@]}" -eq 0 ]]; then
-    if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
-      WEB_SEARCH_LAST_ERROR="page fetched fine, but this system's grep lacks PCRE (-P) support and the plain-ERE fallback parser also found nothing — $provider_label's markup may have changed. Consider installing GNU grep."
+    if [[ "${HAVE_GREP_PCRE:-1}" -eq 0 ]]; then
+      WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — $provider_label's markup may have changed. (This system's grep also lacks PCRE (-P) support, though this parser no longer depends on it.)"
     else
       WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — $provider_label's markup may have changed, or the query returned a no-results page."
     fi
     return 1
   fi
 
+  # Standardized, provider-agnostic output format — easy for a downstream
+  # consumer (or a human) to parse reliably regardless of which provider
+  # actually answered.
   out=""
   for i in "${!titles[@]}"; do
-    out+="$((i + 1)). ${titles[$i]}"$'\n'
-    [[ -n "${urls[$i]:-}" ]] && out+="   ${urls[$i]}"$'\n'
-    [[ -n "${snippets[$i]:-}" ]] && out+="   ${snippets[$i]}"$'\n'
+    out+="Title: ${titles[$i]}"$'\n'
+    out+="URL: ${urls[$i]:-N/A}"$'\n'
+    out+="Snippet: ${snippets[$i]:-N/A}"$'\n'
+    out+="---"$'\n'
   done
   printf '%s' "$out"
   return 0
 }
 
 # The three scrape providers, in the order web_search_query tries them.
-# Each is a thin wrapper around web_search_scrape_generic supplying just the
-# URL and that site's current markup patterns. All are free and require no
-# API key. If one provider is blocked, rate-limited, or unreachable on a
-# given network, the others still have a shot — see web_search_query.
+# Each is a thin wrapper around web_search_scrape_generic supplying just
+# the URL and that site's current block/snippet markers. All are free and
+# require no API key. If one provider is blocked, rate-limited, or
+# unreachable on a given network, the others still have a shot — see
+# web_search_query.
 web_search_query_scrape_ddg() {
   local query="$1" encoded_query
   encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$query"
-  # html.duckduckgo.com now sits behind stepped-up bot detection (403s / JS
-  # challenges), so we use the officially supported lite endpoint instead.
-  # It only accepts POST with the query as URL-encoded form data, and its
-  # markup uses "result-link" / "result-snippet" classes (a plain table
-  # layout) rather than the old "result__a" / "result__snippet" divs. The
-  # snippet class lives directly on a <td>, so its closing tag is </td>,
-  # not </a> as with the old endpoint.
+  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
+  # DEFAULT: lite.duckduckgo.com. html.duckduckgo.com/html/ — the endpoint
+  # named in the original spec for this function — now sits behind
+  # stepped-up bot detection and frequently 403s or serves a JS challenge
+  # (that's the exact failure this whole rewrite exists to fix), so the
+  # officially supported lite endpoint is used instead. It only accepts
+  # POST with the query as URL-encoded form data.
+  #
+  # Every result's title anchor starts with `<a rel="nofollow" href="`
+  # (a plain server-rendered template, so this prefix is stable) and also
+  # carries class="result-link"; requiring both means nav links (next
+  # page, etc.) that happen to share the same href prefix get filtered
+  # out. The snippet sits in the very next table row's
+  # <td class="result-snippet">, which is why "result-snippet" alone is
+  # enough as the snippet marker — it's unique enough within a result's
+  # block not to need a class= match.
   web_search_scrape_generic \
     "duckduckgo.com" \
     "https://lite.duckduckgo.com/lite/" \
-    '<a[^>]*class="result-link"[^>]*>' \
-    'class="result-link"[^>]*>\K.*?(?=</a>)' \
-    'class="result-snippet"[^>]*>\K.*?(?=</td>)' \
-    '<a[^>]*class="result-link"[^>]*>[^<]*</a>' \
-    'class="result-snippet"[^>]*>[^<]*' \
+    '<a rel="nofollow" href="' \
+    'class="result-link"' \
+    "result-snippet" \
     "1" \
     "q=${encoded_query}"
 }
 
+# To use html.duckduckgo.com/html/ instead (e.g. on a network where lite.
+# duckduckgo.com happens to be the one that's blocked), swap the call
+# above for this — GET request, no post_data arg, block marker on the
+# old result__a anchor class:
+#   web_search_scrape_generic "duckduckgo.com" \
+#     "https://html.duckduckgo.com/html/?q=${encoded_query}" \
+#     '<a class="result__a"' "" "result__snippet" "1"
+
 web_search_query_scrape_bing() {
   local query="$1" encoded_query
   encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$query"
+  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
+  # Each organic result is wrapped in <li class="b_algo">...</li>,
+  # containing both the <h2><a href=...>Title</a></h2> and the
+  # <div class="b_caption"><p>Snippet</p></div> — one self-contained
+  # block per result, no extra filtering needed.
   web_search_scrape_generic \
     "bing.com" \
     "https://www.bing.com/search?q=${encoded_query}&count=${WEB_SEARCH_MAX_RESULTS}" \
-    '<h2><a[^>]*>' \
-    '<h2><a[^>]*>\K.*?(?=</a>)' \
-    '<div class="b_caption"[^>]*><p[^>]*>\K.*?(?=</p>)' \
-    '<h2><a[^>]*>[^<]*</a>' \
-    'class="b_caption"[^>]*><p[^>]*>[^<]*' \
+    '<li class="b_algo"' \
+    "" \
+    "b_caption" \
     ""
 }
 
 web_search_query_scrape_startpage() {
   local query="$1" encoded_query
   encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$query"
+  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
+  # Each result sits inside a <div class="w-gl__result" ...> wrapper
+  # containing both the w-gl__result-title link and the
+  # w-gl__description snippet — another self-contained per-result block.
   web_search_scrape_generic \
     "startpage.com" \
     "https://www.startpage.com/sp/search?query=${encoded_query}" \
-    '<a[^>]*class="w-gl__result-title"[^>]*>' \
-    'class="w-gl__result-title"[^>]*>\K.*?(?=</a>)' \
-    'class="w-gl__description"[^>]*>\K.*?(?=</p>)' \
-    '<a[^>]*class="w-gl__result-title"[^>]*>[^<]*</a>' \
-    'class="w-gl__description"[^>]*>[^<]*' \
+    '<div class="w-gl__result"' \
+    "" \
+    "w-gl__description" \
     ""
 }
 
@@ -2216,11 +2315,11 @@ PYEOF
 
   printf '%s' "$out" | jq -r '
     .results
-    | to_entries
     | map(
-        "\(.key + 1). \(.value.title)\n"
-        + (if .value.link != "" then "   \(.value.link)\n" else "" end)
-        + (if .value.snippet != "" then "   \(.value.snippet)\n" else "" end)
+        "Title: \(.title)\n"
+        + "URL: \(if .link != "" then .link else "N/A" end)\n"
+        + "Snippet: \(if .snippet != "" then .snippet else "N/A" end)\n"
+        + "---\n"
       )
     | join("")
   '
