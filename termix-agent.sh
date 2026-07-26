@@ -342,6 +342,28 @@ status_panel() {
   printf "${C_MUTED}Type ${C_RESET}t> help${C_MUTED} for commands · ${C_RESET}Ctrl+C${C_MUTED} to exit${C_RESET}\n\n"
 }
 
+# Clears the terminal and reprints the banner + status panel. This is what
+# 't> clear' runs, and it's also run automatically right after a model
+# switch finishes (see apply_model_switch) so what's on screen afterward is
+# a clean session view showing the new model, not the picker's scrollback.
+run_clear_screen() {
+  clear
+  banner
+  status_panel
+}
+
+# Finalizes a confirmed model switch: sets CURRENT_MODEL/LABEL, announces
+# it, then runs the same clear-screen-and-reprint-status flow as 't> clear'.
+# Called from every model-picking path (tier picker, fuzzy search, direct
+# name, Google model picker, custom-provider free-text entry) so the
+# post-switch behavior is identical no matter how the model was chosen.
+apply_model_switch() {
+  CURRENT_MODEL="$1"
+  CURRENT_MODEL_LABEL="$CURRENT_MODEL"
+  ok "Switched to: $CURRENT_MODEL"
+  run_clear_screen
+}
+
 cleanup_exit() {
   stop_spinner
   printf '\n'
@@ -417,6 +439,25 @@ check_deps() {
   printf 'x' | grep -Pzo 'x' >/dev/null 2>&1 || HAVE_GREP_PCRE=0
   if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
     warn "This system's grep lacks PCRE (-P) support — web search will use a simpler fallback parser."
+  fi
+
+  # Preferred web search backend: LangChain's DuckDuckGoSearchAPIWrapper
+  # (from langchain-community, itself backed by the duckduckgo-search PyPI
+  # package). It does its own request handling and result parsing, which is
+  # sturdier than hand-rolled HTML scraping — the grep-based scraper above
+  # stays in the script purely as a dependency-free fallback for systems
+  # without python3 or those packages installed.
+  HAVE_PYTHON3=1
+  want_cmd python3 || HAVE_PYTHON3=0
+  HAVE_LANGCHAIN_SEARCH=0
+  if [[ "$HAVE_PYTHON3" -eq 1 ]]; then
+    python3 -c "from langchain_community.utilities import DuckDuckGoSearchAPIWrapper" >/dev/null 2>&1 \
+      && HAVE_LANGCHAIN_SEARCH=1
+  fi
+  if [[ "$HAVE_LANGCHAIN_SEARCH" -eq 0 ]]; then
+    if [[ "$HAVE_PYTHON3" -eq 1 ]]; then
+      muted "Tip: 'pip install langchain-community duckduckgo-search' gives web search a sturdier backend (currently using the built-in HTML scraper)."
+    fi
   fi
 }
 
@@ -580,6 +621,77 @@ append_message() {
   messages_json="$(jq -c --arg role "$role" --arg content "$content" '. + [{role:$role, content:$content}]' <<< "$messages_json")"
 }
 
+# Rough, provider-agnostic safeguard against runaway context growth: this
+# script has no real tokenizer and doesn't know each model's actual context
+# window, so it uses total JSON character count as a cheap proxy for size.
+# Not a hard API limit — just a local guardrail so a very long-running chat
+# gets a deliberate choice instead of silently growing until the provider
+# rejects the request.
+CHAT_HISTORY_CHAR_LIMIT=32000
+
+# Writes the full conversation (skipping the system prompt) out to a
+# timestamped markdown file in the sandbox. Prints the saved path on
+# success, nothing on failure.
+archive_chat_history() {
+  local ts path
+  ts="$(date +%Y%m%d-%H%M%S)"
+  path="$WORKSPACE_DIR/termix-chat-history-$ts.md"
+
+  {
+    printf '# Termix Agent — saved chat history\n\n'
+    printf '_saved %s · provider: %s · model: %s_\n\n' "$(date)" "$(provider_label)" "$CURRENT_MODEL"
+    jq -r '.[1:][] | "### \(.role)\n\n\(.content)\n"' <<< "$messages_json"
+  } > "$path" 2>/dev/null
+
+  if [[ -f "$path" ]]; then
+    printf '%s' "$path"
+  fi
+}
+
+# Drops the oldest half of the non-system messages (index 0, the system
+# prompt, is always kept) — used when the user declines to archive at the
+# chat limit, so they can keep going without saving anything.
+trim_oldest_history() {
+  local count keep_from
+  count="$(jq 'length' <<< "$messages_json")"
+  (( count <= 3 )) && return 0
+  keep_from=$(( count / 2 ))
+  messages_json="$(jq --argjson k "$keep_from" '[.[0]] + .[$k:]' <<< "$messages_json")"
+}
+
+# The chat-limit blocker: called at the start of every send_chat. Below the
+# threshold this is a no-op. At/above it, the user is stopped and must
+# choose — archive the full history to a sandbox file and continue with a
+# clean, effectively-unlimited context, or decline and have the oldest
+# turns silently trimmed to make room instead.
+check_chat_limit() {
+  local size saved_path
+
+  size="$(printf '%s' "$messages_json" | wc -c | tr -d ' ')"
+  [[ "$size" -lt "$CHAT_HISTORY_CHAR_LIMIT" ]] && return 0
+
+  echo
+  printf "${C_WARN}┌─ CHAT LIMIT REACHED ───────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} This conversation has grown large enough that it\n"
+  printf "${C_MUTED}│${C_RESET} risks hitting the model's real context limit.\n"
+  printf "${C_WARN}└─────────────────────────────────────────────${C_RESET}\n\n"
+
+  if confirm_yes_no "Save the full history to a file in your sandbox and continue unlimited?"; then
+    saved_path="$(archive_chat_history)"
+    if [[ -n "$saved_path" ]]; then
+      init_history
+      append_message "assistant" "(Earlier conversation archived to $(basename "$saved_path") in the sandbox. Continuing with a clean context — ask if you need something from before.)"
+      ok "History saved to $saved_path"
+      muted "Conversation reset — you're good for a lot more now."
+    else
+      err "Could not save history — continuing without archiving."
+    fi
+  else
+    warn "Continuing without saving — trimming the oldest messages to make room."
+    trim_oldest_history
+  fi
+}
+
 show_help() {
   echo
   printf "${C_ACCENT2}┌─ COMMANDS ────────────────────────────────────${C_RESET}\n"
@@ -598,6 +710,8 @@ show_help() {
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
   printf "\n${C_MUTED}Chat: type any normal message at the ${C_RESET}User>${C_MUTED} prompt.${C_RESET}\n"
+  printf "${C_MUTED}If the conversation gets very long, you'll be asked whether to save it to\n"
+  printf "a file in the sandbox and continue fresh, or trim the oldest turns instead.${C_RESET}\n"
 
   printf "\n${C_ACCENT2}┌─ FILE AGENT ──────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_READ} ${ICON_DIR} ${ICON_ZIP}${C_RESET}  read files, list folders, inspect zips —\n"
@@ -1036,9 +1150,7 @@ pick_model_from_tier() {
     if [[ "$query" == "0" && "$tier" == "free" ]]; then
       candidate="openrouter/free"
       if confirm_model_switch "$candidate"; then
-        CURRENT_MODEL="$candidate"
-        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        ok "Switched to: $CURRENT_MODEL"
+        apply_model_switch "$candidate"
         rm -f "$models_tmp" "$selection_tmp"
         return 0
       fi
@@ -1051,9 +1163,7 @@ pick_model_from_tier() {
       if (( selected_idx >= 1 && selected_idx <= models_count )); then
         candidate="${MODELS[$((selected_idx - 1))]}"
         if confirm_model_switch "$candidate"; then
-          CURRENT_MODEL="$candidate"
-          CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-          ok "Switched to: $CURRENT_MODEL"
+          apply_model_switch "$candidate"
           rm -f "$models_tmp" "$selection_tmp"
           return 0
         fi
@@ -1076,9 +1186,7 @@ pick_model_from_tier() {
     if [[ "$matches_count" -eq 1 ]]; then
       candidate="$(cat "$selection_tmp")"
       if confirm_model_switch "$candidate"; then
-        CURRENT_MODEL="$candidate"
-        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        ok "Switched to: $CURRENT_MODEL"
+        apply_model_switch "$candidate"
         rm -f "$models_tmp" "$selection_tmp"
         return 0
       fi
@@ -1100,9 +1208,7 @@ pick_model_from_tier() {
       if [[ -n "$match_line" ]]; then
         candidate="$match_line"
         if confirm_model_switch "$candidate"; then
-          CURRENT_MODEL="$candidate"
-          CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-          ok "Switched to: $CURRENT_MODEL"
+          apply_model_switch "$candidate"
           rm -f "$models_tmp" "$selection_tmp"
           return 0
         fi
@@ -1166,9 +1272,7 @@ prompt_custom_model_name() {
   [[ "$model" == "q" || "$model" == "Q" || -z "$model" ]] && { muted "Cancelled."; return 1; }
 
   if confirm_model_switch "$model"; then
-    CURRENT_MODEL="$model"
-    CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-    ok "Switched to: $CURRENT_MODEL"
+    apply_model_switch "$model"
     return 0
   fi
   muted "Cancelled."
@@ -1185,9 +1289,7 @@ set_model_by_name() {
 
   if [[ "$PROVIDER" == "custom" ]]; then
     if confirm_model_switch "$input"; then
-      CURRENT_MODEL="$input"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
+      apply_model_switch "$input"
       return 0
     fi
     muted "Cancelled."
@@ -1205,9 +1307,7 @@ set_model_by_name() {
     rm -f "$free_tmp" "$paid_tmp"
     if [[ "$input" == *":free" ]]; then
       if confirm_model_switch "$input"; then
-        CURRENT_MODEL="$input"
-        CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-        ok "Switched to: $CURRENT_MODEL"
+        apply_model_switch "$input"
         return 0
       fi
       muted "Cancelled."
@@ -1222,9 +1322,7 @@ set_model_by_name() {
   [[ -z "$exact_match" ]] && exact_match="$(grep -Fx "$input" "$paid_tmp" || true)"
   if [[ -n "$exact_match" ]]; then
     if confirm_model_switch "$input"; then
-      CURRENT_MODEL="$input"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
+      apply_model_switch "$input"
       rm -f "$free_tmp" "$paid_tmp"
       return 0
     fi
@@ -1244,9 +1342,7 @@ set_model_by_name() {
   if [[ "$count" -eq 1 ]]; then
     candidate="$(head -n 1 <<< "$fuzzy_match")"
     if confirm_model_switch "$candidate"; then
-      CURRENT_MODEL="$candidate"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
+      apply_model_switch "$candidate"
       rm -f "$free_tmp" "$paid_tmp"
       return 0
     fi
@@ -1265,9 +1361,7 @@ set_model_by_name() {
 
   if [[ "$input" == *":free" ]]; then
     if confirm_model_switch "$input"; then
-      CURRENT_MODEL="$input"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
+      apply_model_switch "$input"
       rm -f "$free_tmp" "$paid_tmp"
       return 0
     fi
@@ -1303,9 +1397,7 @@ set_model_by_name_google() {
   exact_match="$(grep -Fx "$input" "$models_tmp" || true)"
   if [[ -n "$exact_match" ]]; then
     if confirm_model_switch "$input"; then
-      CURRENT_MODEL="$input"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
+      apply_model_switch "$input"
       rm -f "$models_tmp"
       return 0
     fi
@@ -1324,9 +1416,7 @@ set_model_by_name_google() {
   if [[ "$count" -eq 1 ]]; then
     candidate="$(head -n 1 <<< "$fuzzy_match")"
     if confirm_model_switch "$candidate"; then
-      CURRENT_MODEL="$candidate"
-      CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-      ok "Switched to: $CURRENT_MODEL"
+      apply_model_switch "$candidate"
       rm -f "$models_tmp"
       return 0
     fi
@@ -1744,15 +1834,16 @@ url_decode() {
   printf '%b' "${encoded//%/\\x}"
 }
 
-# Free, no-API-key web search: scrapes DuckDuckGo's plain HTML results page
-# (no JS required, unlike duckduckgo.com itself). This never talks to
-# OpenRouter/Google at all — it's a plain curl + local HTML parse, so it
-# costs nothing and works the same regardless of which provider is active.
-# Sets WEB_SEARCH_LAST_ERROR to a short reason on failure so the caller can
-# tell the user something more useful than "it didn't work".
+# Fallback web search backend: scrapes DuckDuckGo's plain HTML results page
+# (no JS required, unlike duckduckgo.com itself). Used when the LangChain
+# backend (web_search_query_langchain, tried first — see web_search_query)
+# isn't available. This never talks to OpenRouter/Google at all — it's a
+# plain curl + local HTML parse, so it costs nothing either way. Sets
+# WEB_SEARCH_LAST_ERROR to a short reason on failure so the caller can tell
+# the user something more useful than "it didn't work".
 WEB_SEARCH_MAX_RESULTS=5
 WEB_SEARCH_LAST_ERROR=""
-web_search_query() {
+web_search_query_scrape() {
   local query="$1" encoded_query html_tmp curl_args=() titles_raw urls_raw snippets_raw
   local -a titles=() urls=() snippets=()
   local i out n
@@ -1873,6 +1964,105 @@ web_search_query() {
   done
   printf '%s' "$out"
   return 0
+}
+
+# Preferred web search backend: LangChain's DuckDuckGoSearchAPIWrapper
+# (langchain_community.utilities), which wraps the duckduckgo-search PyPI
+# package and does its own request handling and result parsing — no
+# hand-rolled HTML scraping here. Still completely free (DuckDuckGo has no
+# paid "search plugin" involved anywhere in this path, same as the scraper).
+# Only called when check_deps found the package importable (HAVE_LANGCHAIN_
+# SEARCH=1). Same output contract as web_search_query_scrape: formatted
+# numbered results on stdout, or empty + WEB_SEARCH_LAST_ERROR set on
+# failure.
+web_search_query_langchain() {
+  local query="$1" py_tmp out rc n
+
+  py_tmp="$(mktemp --suffix=.py)"
+  cat > "$py_tmp" << 'PYEOF'
+import sys, json
+
+try:
+    from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+except Exception as e:
+    print(json.dumps({"error": "import_error", "detail": str(e)}))
+    sys.exit(2)
+
+query = sys.argv[1]
+max_results = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+
+try:
+    wrapper = DuckDuckGoSearchAPIWrapper(max_results=max_results)
+    results = wrapper.results(query, max_results=max_results)
+except Exception as e:
+    print(json.dumps({"error": "search_error", "detail": str(e)}))
+    sys.exit(3)
+
+out = []
+for r in results[:max_results]:
+    out.append({
+        "title": r.get("title") or "",
+        "link": r.get("link") or r.get("href") or "",
+        "snippet": r.get("snippet") or r.get("body") or "",
+    })
+print(json.dumps({"results": out}))
+PYEOF
+
+  out="$(python3 "$py_tmp" "$query" "$WEB_SEARCH_MAX_RESULTS" 2>/dev/null)"
+  rc=$?
+  rm -f "$py_tmp"
+
+  if [[ $rc -ne 0 || -z "$out" ]]; then
+    WEB_SEARCH_LAST_ERROR="LangChain search backend failed (exit $rc) — falling back to the built-in scraper."
+    return 1
+  fi
+
+  if ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+    WEB_SEARCH_LAST_ERROR="LangChain search returned unparseable output — falling back to the built-in scraper."
+    return 1
+  fi
+
+  if printf '%s' "$out" | jq -e 'has("error")' >/dev/null 2>&1; then
+    local detail
+    detail="$(printf '%s' "$out" | jq -r '.detail // .error')"
+    WEB_SEARCH_LAST_ERROR="LangChain search error: $detail — falling back to the built-in scraper."
+    return 1
+  fi
+
+  n="$(printf '%s' "$out" | jq '.results | length')"
+  if [[ "$n" -eq 0 ]]; then
+    WEB_SEARCH_LAST_ERROR="LangChain search returned zero results."
+    return 1
+  fi
+
+  printf '%s' "$out" | jq -r '
+    .results
+    | to_entries
+    | map(
+        "\(.key + 1). \(.value.title)\n"
+        + (if .value.link != "" then "   \(.value.link)\n" else "" end)
+        + (if .value.snippet != "" then "   \(.value.snippet)\n" else "" end)
+      )
+    | join("")
+  '
+  return 0
+}
+
+# Dispatcher: tries the LangChain backend first when it's available (see
+# check_deps), and transparently drops back to the dependency-free HTML
+# scraper if that call fails for any reason (package missing at runtime,
+# duckduckgo-search internal error, network hiccup, etc.) — the caller
+# never needs to know which one actually answered.
+web_search_query() {
+  local query="$1"
+
+  if [[ "${HAVE_LANGCHAIN_SEARCH:-0}" -eq 1 ]]; then
+    if web_search_query_langchain "$query"; then
+      return 0
+    fi
+  fi
+
+  web_search_query_scrape "$query"
 }
 
 # WEB_SEARCH — read-only, no confirmation, same as FILE_READ/DIR_LIST.
@@ -2687,6 +2877,7 @@ run_agent_turns() {
 
 send_chat() {
   local user_text="$1"
+  check_chat_limit
   append_message "user" "$user_text"
   run_agent_turns
 }
@@ -2738,9 +2929,7 @@ command_router() {
       fi
       ;;
     clear)
-      clear
-      banner
-      status_panel
+      run_clear_screen
       ;;
     reset)
       init_history
