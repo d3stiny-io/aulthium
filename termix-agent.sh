@@ -339,7 +339,8 @@ status_panel() {
   printf "${C_MUTED}│${C_RESET} %-10s %s\n" "model" "$CURRENT_MODEL"
   printf "${C_MUTED}│${C_RESET} %-10s %s\n" "sandbox" "$WORKSPACE_DIR"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
-  printf "${C_MUTED}Type ${C_RESET}t> help${C_MUTED} for commands · ${C_RESET}Ctrl+C${C_MUTED} to exit${C_RESET}\n\n"
+  printf "${C_MUTED}Type ${C_RESET}t> help${C_MUTED} for commands · ${C_RESET}Ctrl+C${C_MUTED} to exit${C_RESET}\n"
+  printf "${C_MUTED}While waiting on a reply: ${C_RESET}Ctrl+T${C_MUTED} cancel thinking · ${C_RESET}Ctrl+S${C_MUTED} stop prompt${C_RESET}\n\n"
 }
 
 # Clears the terminal and reprints the banner + status panel. This is what
@@ -366,12 +367,30 @@ apply_model_switch() {
 
 cleanup_exit() {
   stop_spinner
+  restore_tty
   printf '\n'
   printf "${C_OK}%s${C_RESET}\n" "Termix Agent has been closed." >&2
   exit 0
 }
 
 trap cleanup_exit INT
+
+# ── Terminal setup for Ctrl+T / Ctrl+S cancellation ────────────────────────
+# Ctrl+S is XOFF under the terminal's software flow control (IXON) — by
+# default the tty driver swallows it to pause output and never hands the
+# byte to us at all. We turn IXON off for the life of the app so Ctrl+S (and
+# Ctrl+Q) behave like ordinary keystrokes instead, and restore the original
+# settings on exit. Ctrl+T has no such default binding on Linux, so it needs
+# no special handling here.
+ORIGINAL_STTY=""
+setup_tty_for_cancel() {
+  ORIGINAL_STTY="$(stty -g 2>/dev/null || true)"
+  stty -ixon 2>/dev/null || true
+}
+
+restore_tty() {
+  [[ -n "$ORIGINAL_STTY" ]] && stty "$ORIGINAL_STTY" 2>/dev/null || true
+}
 
 # ── Thinking spinner ─────────────────────────────────────────────────────
 # The OpenRouter call is a single blocking, non-streaming request, so we
@@ -431,10 +450,10 @@ check_deps() {
   HAVE_TIMEOUT=1
   want_cmd timeout || HAVE_TIMEOUT=0
 
-  # Web search parses DuckDuckGo's HTML with PCRE (grep -P, needed for \K
-  # and non-greedy matching) when available; otherwise it falls back to a
-  # plain POSIX-ERE parser (see web_search_query) that's a bit less precise
-  # but still functional.
+  # Web search parses HTML results (DuckDuckGo, then Bing, then Startpage —
+  # see web_search_query) with PCRE (grep -P, needed for \K and non-greedy
+  # matching) when available; otherwise it falls back to a plain POSIX-ERE
+  # parser that's a bit less precise but still functional.
   HAVE_GREP_PCRE=1
   printf 'x' | grep -Pzo 'x' >/dev/null 2>&1 || HAVE_GREP_PCRE=0
   if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
@@ -444,9 +463,10 @@ check_deps() {
   # Preferred web search backend: LangChain's DuckDuckGoSearchAPIWrapper
   # (from langchain-community, itself backed by the duckduckgo-search PyPI
   # package). It does its own request handling and result parsing, which is
-  # sturdier than hand-rolled HTML scraping — the grep-based scraper above
-  # stays in the script purely as a dependency-free fallback for systems
-  # without python3 or those packages installed.
+  # sturdier than hand-rolled HTML scraping — the scrapers above stay in the
+  # script as a dependency-free fallback chain (DuckDuckGo, then Bing, then
+  # Startpage) for systems without python3 or those packages installed, or
+  # for whenever a given provider is blocked or unreachable on the network.
   HAVE_PYTHON3=1
   want_cmd python3 || HAVE_PYTHON3=0
   HAVE_LANGCHAIN_SEARCH=0
@@ -456,7 +476,7 @@ check_deps() {
   fi
   if [[ "$HAVE_LANGCHAIN_SEARCH" -eq 0 ]]; then
     if [[ "$HAVE_PYTHON3" -eq 1 ]]; then
-      muted "Tip: 'pip install langchain-community duckduckgo-search' gives web search a sturdier backend (currently using the built-in HTML scraper)."
+      muted "Tip: 'pip install langchain-community duckduckgo-search' gives web search a sturdier backend (currently falling back to scraping DuckDuckGo/Bing/Startpage directly)."
     fi
   fi
 }
@@ -713,6 +733,11 @@ show_help() {
   printf "${C_MUTED}If the conversation gets very long, you'll be asked whether to save it to\n"
   printf "a file in the sandbox and continue fresh, or trim the oldest turns instead.${C_RESET}\n"
 
+  printf "\n${C_MUTED}While a reply is in progress:${C_RESET}\n"
+  printf "${C_MUTED}  ${C_RESET}Ctrl+T${C_MUTED}  cancel thinking — abort just the current network call.${C_RESET}\n"
+  printf "${C_MUTED}  ${C_RESET}Ctrl+S${C_MUTED}  stop prompt — abort the call and the rest of this turn\n"
+  printf "${C_MUTED}          (including any further tool-call rounds).${C_RESET}\n"
+
   printf "\n${C_ACCENT2}┌─ FILE AGENT ──────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_READ} ${ICON_DIR} ${ICON_ZIP}${C_RESET}  read files, list folders, inspect zips —\n"
   printf "${C_MUTED}│${C_RESET}       runs automatically, no confirmation (read-only),\n"
@@ -720,7 +745,9 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_SEARCH}${C_RESET}      the agent can also search the live web (free, no\n"
   printf "${C_MUTED}│${C_RESET}       API key) for current info it doesn't already know —\n"
-  printf "${C_MUTED}│${C_RESET}       also automatic, read-only, no confirmation needed.\n"
+  printf "${C_MUTED}│${C_RESET}       tries DuckDuckGo, then Bing, then Startpage if one is\n"
+  printf "${C_MUTED}│${C_RESET}       blocked or unreachable; also automatic, read-only, no\n"
+  printf "${C_MUTED}│${C_RESET}       confirmation needed.\n"
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_WARN}${ICON_WRITE} ${ICON_DELETE} ${ICON_FOLDER}${C_RESET}  write/overwrite a file, delete a single file,\n"
   printf "${C_MUTED}│${C_RESET}       delete a folder (and everything inside it), or create\n"
@@ -1834,59 +1861,71 @@ url_decode() {
   printf '%b' "${encoded//%/\\x}"
 }
 
-# Fallback web search backend: scrapes DuckDuckGo's plain HTML results page
-# (no JS required, unlike duckduckgo.com itself). Used when the LangChain
-# backend (web_search_query_langchain, tried first — see web_search_query)
-# isn't available. This never talks to OpenRouter/Google at all — it's a
-# plain curl + local HTML parse, so it costs nothing either way. Sets
-# WEB_SEARCH_LAST_ERROR to a short reason on failure so the caller can tell
-# the user something more useful than "it didn't work".
+# Generic HTML-scrape web search backend, parameterized per provider so
+# DuckDuckGo, Bing, and Startpage can all reuse the same fetch/parse/decode
+# logic (see the three thin wrappers below this function). Used whenever the
+# LangChain backend isn't available, or a given provider is unreachable —
+# see web_search_query for the fallback chain. This never talks to
+# OpenRouter/Google at all — it's a plain curl + local HTML parse, so it
+# costs nothing either way. Sets WEB_SEARCH_LAST_ERROR to a short reason on
+# failure so the caller can tell the user something more useful than "it
+# didn't work".
+#
+# Args:
+#   $1  provider_label   — short name for error messages (e.g. "bing.com")
+#   $2  url               — full request URL, query already percent-encoded
+#   $3  pcre_tag_re        — PCRE: the whole opening <a ...> tag of a result
+#                            title (used to pull href out of via bash regex)
+#   $4  pcre_title_re      — PCRE: the title link's inner text (\K...(?=</a>))
+#   $5  pcre_snippet_re    — PCRE: the snippet text (\K...(?=</...>))
+#   $6  ere_title_tag_re   — POSIX ERE fallback: whole "<a ...>text</a>" tag
+#                            (no PCRE -P support on this system's grep)
+#   $7  ere_snippet_tag_re — POSIX ERE fallback: snippet's opening tag plus
+#                            its text up to the next "<" (opening tag itself
+#                            is stripped off after the match, up to the
+#                            first ">")
+#   $8  unwrap_ddg_redirect — "1" if hrefs are wrapped DuckDuckGo-style as
+#                            //duckduckgo.com/l/?uddg=<encoded real URL> and
+#                            need unwrapping; empty/omitted otherwise
 WEB_SEARCH_MAX_RESULTS=5
 WEB_SEARCH_LAST_ERROR=""
-web_search_query_scrape() {
-  local query="$1" encoded_query html_tmp curl_args=() titles_raw urls_raw snippets_raw
+web_search_scrape_generic() {
+  local provider_label="$1" url="$2"
+  local pcre_tag_re="$3" pcre_title_re="$4" pcre_snippet_re="$5"
+  local ere_title_tag_re="$6" ere_snippet_tag_re="$7"
+  local unwrap_ddg_redirect="${8:-}"
+  local html_tmp curl_args=() titles_raw urls_raw snippets_raw
   local -a titles=() urls=() snippets=()
   local i out n
   WEB_SEARCH_LAST_ERROR=""
 
-  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$query"
-
   html_tmp="$(mktemp)"
   curl_args=(-sS -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
              --max-time 20
-             "https://html.duckduckgo.com/html/?q=${encoded_query}")
+             "$url")
 
   if ! curl "${curl_args[@]}" -o "$html_tmp" 2>/dev/null; then
     rm -f "$html_tmp"
-    WEB_SEARCH_LAST_ERROR="couldn't reach duckduckgo.com (network/curl error)."
+    WEB_SEARCH_LAST_ERROR="couldn't reach $provider_label (network/curl error)."
     return 1
   fi
 
   if [[ ! -s "$html_tmp" ]]; then
     rm -f "$html_tmp"
-    WEB_SEARCH_LAST_ERROR="got an empty response from duckduckgo.com."
+    WEB_SEARCH_LAST_ERROR="got an empty response from $provider_label."
     return 1
   fi
 
   if [[ "$HAVE_GREP_PCRE" -eq 1 ]]; then
-    # DuckDuckGo's HTML endpoint marks each result's title link with
-    # class="result__a" and its snippet with class="result__snippet". -z
-    # treats the whole file as one match space so \K + non-greedy .*? can
+    # -z treats the whole file as one match space so \K + non-greedy .*? can
     # span the (irrelevant) newlines in the markup. href and class can
     # appear in either order inside the tag, so grab the whole opening tag
     # first and pull href out of that with a plain bash regex rather than
     # assuming an order.
     local -a title_tags=()
-    mapfile -d '' -t title_tags < <(
-      grep -Pzo '<a[^>]*class="result__a"[^>]*>' "$html_tmp" 2>/dev/null
-    )
-    mapfile -d '' -t titles_raw < <(
-      grep -Pzo 'class="result__a"[^>]*>\K.*?(?=</a>)' "$html_tmp" 2>/dev/null
-    )
-    mapfile -d '' -t snippets_raw < <(
-      grep -Pzo 'class="result__snippet"[^>]*>\K.*?(?=</a>)' "$html_tmp" 2>/dev/null
-    )
+    mapfile -d '' -t title_tags < <(grep -Pzo "$pcre_tag_re" "$html_tmp" 2>/dev/null)
+    mapfile -d '' -t titles_raw < <(grep -Pzo "$pcre_title_re" "$html_tmp" 2>/dev/null)
+    mapfile -d '' -t snippets_raw < <(grep -Pzo "$pcre_snippet_re" "$html_tmp" 2>/dev/null)
 
     n="${#titles_raw[@]}"
     for ((i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS; i++)); do
@@ -1895,9 +1934,7 @@ web_search_query_scrape() {
       tag_text="${title_tags[$i]:-}"
       u=""
       [[ "$tag_text" =~ href=\"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
-      # DuckDuckGo wraps outbound links as //duckduckgo.com/l/?uddg=<real
-      # URL, percent-encoded>&rut=... — pull the real URL back out.
-      if [[ "$u" == *"uddg="* ]]; then
+      if [[ "$unwrap_ddg_redirect" == "1" && "$u" == *"uddg="* ]]; then
         real_url="${u#*uddg=}"
         real_url="${real_url%%&*}"
         real_url="$(url_decode "$real_url")"
@@ -1912,18 +1949,14 @@ web_search_query_scrape() {
     # busybox/toybox grep on some Termux setups). Fall back to plain POSIX
     # ERE: flatten the file to one line so -o can still return multiple
     # matches, and match "up to the next <" instead of a lazy quantifier
-    # (DuckDuckGo's result titles are plain text with no nested tags, so
-    # this holds in practice; snippets occasionally have a <b> highlight,
-    # which this simpler pass just stops at — good enough for a fallback).
+    # (result titles are plain text with no nested tags, so this holds in
+    # practice; snippets occasionally have a <b> highlight, which this
+    # simpler pass just stops at — good enough for a fallback).
     local flat
     flat="$(tr '\n\r' '  ' < "$html_tmp")"
     local -a title_tags=() snippet_tags=()
-    mapfile -t title_tags < <(
-      printf '%s' "$flat" | grep -oE '<a[^>]*class="result__a"[^>]*>[^<]*</a>' 2>/dev/null
-    )
-    mapfile -t snippet_tags < <(
-      printf '%s' "$flat" | grep -oE 'class="result__snippet"[^>]*>[^<]*' 2>/dev/null
-    )
+    mapfile -t title_tags < <(printf '%s' "$flat" | grep -oE "$ere_title_tag_re" 2>/dev/null)
+    mapfile -t snippet_tags < <(printf '%s' "$flat" | grep -oE "$ere_snippet_tag_re" 2>/dev/null)
 
     n="${#title_tags[@]}"
     for ((i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS; i++)); do
@@ -1931,7 +1964,7 @@ web_search_query_scrape() {
       u=""
       [[ "$tag" =~ href=\"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
       t="$(printf '%s' "$tag" | sed -e 's/^<a[^>]*>//' -e 's/<\/a>$//' -e 's/<[^>]*>//g' -e 's/&amp;/\&/g' -e 's/&#x27;/'"'"'/g' -e 's/&quot;/"/g')"
-      if [[ "$u" == *"uddg="* ]]; then
+      if [[ "$unwrap_ddg_redirect" == "1" && "$u" == *"uddg="* ]]; then
         real_url="${u#*uddg=}"
         real_url="${real_url%%&*}"
         real_url="$(url_decode "$real_url")"
@@ -1949,9 +1982,9 @@ web_search_query_scrape() {
 
   if [[ "${#titles[@]}" -eq 0 ]]; then
     if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
-      WEB_SEARCH_LAST_ERROR="page fetched fine, but this system's grep lacks PCRE (-P) support and the plain-ERE fallback parser also found nothing — DuckDuckGo's markup may have changed. Consider installing GNU grep."
+      WEB_SEARCH_LAST_ERROR="page fetched fine, but this system's grep lacks PCRE (-P) support and the plain-ERE fallback parser also found nothing — $provider_label's markup may have changed. Consider installing GNU grep."
     else
-      WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — DuckDuckGo's markup may have changed, or the query returned a no-results page."
+      WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — $provider_label's markup may have changed, or the query returned a no-results page."
     fi
     return 1
   fi
@@ -1966,13 +1999,63 @@ web_search_query_scrape() {
   return 0
 }
 
+# The three scrape providers, in the order web_search_query tries them.
+# Each is a thin wrapper around web_search_scrape_generic supplying just the
+# URL and that site's current markup patterns. All are free and require no
+# API key. If one provider is blocked, rate-limited, or unreachable on a
+# given network, the others still have a shot — see web_search_query.
+web_search_query_scrape_ddg() {
+  local query="$1" encoded_query
+  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
+  [[ -z "$encoded_query" ]] && encoded_query="$query"
+  web_search_scrape_generic \
+    "duckduckgo.com" \
+    "https://html.duckduckgo.com/html/?q=${encoded_query}" \
+    '<a[^>]*class="result__a"[^>]*>' \
+    'class="result__a"[^>]*>\K.*?(?=</a>)' \
+    'class="result__snippet"[^>]*>\K.*?(?=</a>)' \
+    '<a[^>]*class="result__a"[^>]*>[^<]*</a>' \
+    'class="result__snippet"[^>]*>[^<]*' \
+    "1"
+}
+
+web_search_query_scrape_bing() {
+  local query="$1" encoded_query
+  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
+  [[ -z "$encoded_query" ]] && encoded_query="$query"
+  web_search_scrape_generic \
+    "bing.com" \
+    "https://www.bing.com/search?q=${encoded_query}&count=${WEB_SEARCH_MAX_RESULTS}" \
+    '<h2><a[^>]*>' \
+    '<h2><a[^>]*>\K.*?(?=</a>)' \
+    '<div class="b_caption"[^>]*><p[^>]*>\K.*?(?=</p>)' \
+    '<h2><a[^>]*>[^<]*</a>' \
+    'class="b_caption"[^>]*><p[^>]*>[^<]*' \
+    ""
+}
+
+web_search_query_scrape_startpage() {
+  local query="$1" encoded_query
+  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
+  [[ -z "$encoded_query" ]] && encoded_query="$query"
+  web_search_scrape_generic \
+    "startpage.com" \
+    "https://www.startpage.com/sp/search?query=${encoded_query}" \
+    '<a[^>]*class="w-gl__result-title"[^>]*>' \
+    'class="w-gl__result-title"[^>]*>\K.*?(?=</a>)' \
+    'class="w-gl__description"[^>]*>\K.*?(?=</p>)' \
+    '<a[^>]*class="w-gl__result-title"[^>]*>[^<]*</a>' \
+    'class="w-gl__description"[^>]*>[^<]*' \
+    ""
+}
+
 # Preferred web search backend: LangChain's DuckDuckGoSearchAPIWrapper
 # (langchain_community.utilities), which wraps the duckduckgo-search PyPI
 # package and does its own request handling and result parsing — no
 # hand-rolled HTML scraping here. Still completely free (DuckDuckGo has no
 # paid "search plugin" involved anywhere in this path, same as the scraper).
 # Only called when check_deps found the package importable (HAVE_LANGCHAIN_
-# SEARCH=1). Same output contract as web_search_query_scrape: formatted
+# SEARCH=1). Same output contract as the scrape backends below: formatted
 # numbered results on stdout, or empty + WEB_SEARCH_LAST_ERROR set on
 # failure.
 web_search_query_langchain() {
@@ -2049,20 +2132,41 @@ PYEOF
 }
 
 # Dispatcher: tries the LangChain backend first when it's available (see
-# check_deps), and transparently drops back to the dependency-free HTML
-# scraper if that call fails for any reason (package missing at runtime,
-# duckduckgo-search internal error, network hiccup, etc.) — the caller
-# never needs to know which one actually answered.
+# check_deps), then falls through the scrape backends in order —
+# DuckDuckGo, then Bing, then Startpage — stopping at the first one that
+# returns real results. This means a provider that's blocked, rate-limited,
+# or just unreachable on a given network doesn't take web search down
+# entirely; the caller never needs to know which provider actually
+# answered. If every provider fails, WEB_SEARCH_LAST_ERROR is set to a
+# combined summary of why each one failed.
 web_search_query() {
   local query="$1"
+  local -a errs=()
 
   if [[ "${HAVE_LANGCHAIN_SEARCH:-0}" -eq 1 ]]; then
     if web_search_query_langchain "$query"; then
       return 0
     fi
+    errs+=("langchain/duckduckgo-search: ${WEB_SEARCH_LAST_ERROR:-failed}")
   fi
 
-  web_search_query_scrape "$query"
+  if web_search_query_scrape_ddg "$query"; then
+    return 0
+  fi
+  errs+=("${WEB_SEARCH_LAST_ERROR:-duckduckgo.com: failed}")
+
+  if web_search_query_scrape_bing "$query"; then
+    return 0
+  fi
+  errs+=("${WEB_SEARCH_LAST_ERROR:-bing.com: failed}")
+
+  if web_search_query_scrape_startpage "$query"; then
+    return 0
+  fi
+  errs+=("${WEB_SEARCH_LAST_ERROR:-startpage.com: failed}")
+
+  WEB_SEARCH_LAST_ERROR="all search providers failed — $(IFS='; '; echo "${errs[*]}")"
+  return 1
 }
 
 # WEB_SEARCH — read-only, no confirmation, same as FILE_READ/DIR_LIST.
@@ -2490,6 +2594,51 @@ ask_api_key() {
   fi
 }
 
+# Runs a curl command in the background and, while it's in flight, polls
+# the controlling terminal for two cancel keys:
+#   Ctrl+T (0x14) — "cancel thinking": abort just this network call.
+#   Ctrl+S (0x13) — "stop prompt": abort this call AND the rest of the
+#                    current turn (no further tool-call rounds happen,
+#                    since run_agent_turns simply stops when get_completion
+#                    fails — see there).
+# Either way we kill the in-flight curl and set CANCEL_SIGNAL so the caller
+# (call_openrouter/call_google/call_custom) can report "CANCELLED" instead
+# of a real HTTP status. Any other key typed during the wait is just
+# swallowed — there's no safe way to "give it back" to the next prompt
+# without a much heavier input layer, so this is a deliberate trade-off.
+# $1 = file to receive curl's -w output (its normal job); the rest of the
+# args is the curl command itself, run exactly as given.
+CANCEL_SIGNAL=""
+run_curl_watched() {
+  local code_file="$1"; shift
+  local curl_pid key
+
+  "$@" > "$code_file" 2>/dev/null &
+  curl_pid=$!
+
+  while kill -0 "$curl_pid" 2>/dev/null; do
+    if read -r -s -t 0.1 -n 1 key < /dev/tty 2>/dev/null; then
+      case "$key" in
+        $'\x14')
+          CANCEL_SIGNAL="thinking"
+          kill "$curl_pid" 2>/dev/null
+          wait "$curl_pid" 2>/dev/null
+          return 1
+          ;;
+        $'\x13')
+          CANCEL_SIGNAL="prompt"
+          kill "$curl_pid" 2>/dev/null
+          wait "$curl_pid" 2>/dev/null
+          return 1
+          ;;
+      esac
+    fi
+  done
+
+  wait "$curl_pid" 2>/dev/null
+  return 0
+}
+
 call_openrouter() {
   # $1 = messages JSON array. $2 = path to a file to write the raw numeric
   # HTTP status code into (nothing else — no prefix, no other output ever
@@ -2499,10 +2648,11 @@ call_openrouter() {
   # bookkeeping — stderr is shared with the spinner and warn/err logging,
   # and mixing a single-line marker into that stream is fragile (their
   # output has no reliable line breaks to split on).
-  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers http_code body
+  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers tmp_code http_code body
 
   tmp_body="$(mktemp)"
   tmp_headers="$(mktemp)"
+  tmp_code="$(mktemp)"
   payload="$(jq -nc \
     --arg model "$CURRENT_MODEL" \
     --argjson messages "$messages" \
@@ -2515,7 +2665,8 @@ call_openrouter() {
     }'
   )"
 
-  http_code="$(
+  CANCEL_SIGNAL=""
+  if ! run_curl_watched "$tmp_code" \
     curl -sS \
       -o "$tmp_body" \
       -D "$tmp_headers" \
@@ -2525,8 +2676,16 @@ call_openrouter() {
       -H "Content-Type: application/json" \
       -H "HTTP-Referer: http://localhost" \
       -H "X-Title: Termix Agent" \
-      --data "$payload" 2>/dev/null || true
-  )"
+      --data "$payload"
+  then
+    rm -f "$tmp_body" "$tmp_headers" "$tmp_code"
+    printf 'CANCELLED:%s' "$CANCEL_SIGNAL" > "$code_file"
+    printf ''
+    return 0
+  fi
+
+  http_code="$(cat "$tmp_code" 2>/dev/null)"
+  rm -f "$tmp_code"
   [[ -z "$http_code" ]] && http_code="000"
 
   body="$(cat "$tmp_body")"
@@ -2573,22 +2732,32 @@ build_google_payload() {
 # right before get_completion touches it, so nothing downstream needs to
 # know which provider actually answered.
 call_google() {
-  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers http_code body url
+  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers tmp_code http_code body url
 
   tmp_body="$(mktemp)"
   tmp_headers="$(mktemp)"
+  tmp_code="$(mktemp)"
   payload="$(build_google_payload "$messages")"
   url="${GOOGLE_API_BASE}/models/${CURRENT_MODEL}:generateContent?key=${GOOGLE_KEY}"
 
-  http_code="$(
+  CANCEL_SIGNAL=""
+  if ! run_curl_watched "$tmp_code" \
     curl -sS \
       -o "$tmp_body" \
       -D "$tmp_headers" \
       -w '%{http_code}' \
       -X POST "$url" \
       -H "Content-Type: application/json" \
-      --data "$payload" 2>/dev/null || true
-  )"
+      --data "$payload"
+  then
+    rm -f "$tmp_body" "$tmp_headers" "$tmp_code"
+    printf 'CANCELLED:%s' "$CANCEL_SIGNAL" > "$code_file"
+    printf ''
+    return 0
+  fi
+
+  http_code="$(cat "$tmp_code" 2>/dev/null)"
+  rm -f "$tmp_code"
   [[ -z "$http_code" ]] && http_code="000"
 
   body="$(cat "$tmp_body")"
@@ -2651,7 +2820,7 @@ MAX_RATE_LIMIT_WAIT=60
 # only sends an Authorization header if they said a key is required, so
 # purely local/self-hosted endpoints (no auth at all) work unmodified.
 call_custom() {
-  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers http_code body
+  local messages="$1" code_file="$2" header_file="${3:-}" payload tmp_body tmp_headers tmp_code http_code body
   local -a curl_hdrs=(-H "Content-Type: application/json")
 
   if [[ "$CUSTOM_REQUIRES_KEY" -eq 1 && -n "${CUSTOM_KEY:-}" ]]; then
@@ -2660,6 +2829,7 @@ call_custom() {
 
   tmp_body="$(mktemp)"
   tmp_headers="$(mktemp)"
+  tmp_code="$(mktemp)"
   payload="$(jq -nc \
     --arg model "$CURRENT_MODEL" \
     --argjson messages "$messages" \
@@ -2672,15 +2842,24 @@ call_custom() {
     }'
   )"
 
-  http_code="$(
+  CANCEL_SIGNAL=""
+  if ! run_curl_watched "$tmp_code" \
     curl -sS \
       -o "$tmp_body" \
       -D "$tmp_headers" \
       -w '%{http_code}' \
       -X POST "$CUSTOM_URL" \
       "${curl_hdrs[@]}" \
-      --data "$payload" 2>/dev/null || true
-  )"
+      --data "$payload"
+  then
+    rm -f "$tmp_body" "$tmp_headers" "$tmp_code"
+    printf 'CANCELLED:%s' "$CANCEL_SIGNAL" > "$code_file"
+    printf ''
+    return 0
+  fi
+
+  http_code="$(cat "$tmp_code" 2>/dev/null)"
+  rm -f "$tmp_code"
   [[ -z "$http_code" ]] && http_code="000"
 
   body="$(cat "$tmp_body")"
@@ -2702,7 +2881,7 @@ call_provider_with_retry() {
   header_file="$(mktemp)"
 
   while true; do
-    start_spinner "thinking..."
+    start_spinner "thinking... (Ctrl+T cancel · Ctrl+S stop)"
     case "$PROVIDER" in
       google)
         body="$(call_google "$messages" "$code_file" "$header_file")"
@@ -2719,6 +2898,12 @@ call_provider_with_retry() {
     esac
     stop_spinner
     http_code="$(cat "$code_file" 2>/dev/null)"
+
+    if [[ "$http_code" == CANCELLED:* ]]; then
+      rm -f "$header_file"
+      printf ''
+      return 0
+    fi
 
     if [[ "$http_code" != "429" ]]; then
       rm -f "$header_file"
@@ -2789,6 +2974,16 @@ get_completion() {
   body="$(call_provider_with_retry "$messages_json" "$code_tmp")"
   http_code="$(cat "$code_tmp" 2>/dev/null)"
 
+  if [[ "$http_code" == CANCELLED:* ]]; then
+    rm -f "$code_tmp"
+    if [[ "${http_code#CANCELLED:}" == "prompt" ]]; then
+      warn "Prompt stopped (Ctrl+S)."
+    else
+      warn "Thinking cancelled (Ctrl+T)."
+    fi
+    return 1
+  fi
+
   if [[ "$http_code" != "200" ]]; then
     err "$(provider_label) request failed (HTTP $http_code)."
     if [[ -n "$body" ]]; then
@@ -2812,6 +3007,16 @@ get_completion() {
       <<< "$messages_json")"
     body="$(call_provider_with_retry "$retry_messages" "$code_tmp")"
     http_code="$(cat "$code_tmp" 2>/dev/null)"
+
+    if [[ "$http_code" == CANCELLED:* ]]; then
+      rm -f "$code_tmp"
+      if [[ "${http_code#CANCELLED:}" == "prompt" ]]; then
+        warn "Prompt stopped (Ctrl+S)."
+      else
+        warn "Thinking cancelled (Ctrl+T)."
+      fi
+      return 1
+    fi
 
     if [[ "$http_code" == "200" ]]; then
       reply="$(jq -r '.choices[0].message.content // empty' <<< "$body" 2>/dev/null)"
@@ -2949,6 +3154,7 @@ command_router() {
 
 main() {
   check_deps
+  setup_tty_for_cancel
   banner
   pick_provider_startup
   ask_api_key
