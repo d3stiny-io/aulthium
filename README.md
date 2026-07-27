@@ -2,7 +2,7 @@
   <img
     src="https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/assets/src/public/icon.png"
     alt="Termix Agent"
-    width="120"
+    width="150"
   >
 </p>
 
