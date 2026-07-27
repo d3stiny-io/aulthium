@@ -256,7 +256,8 @@ Open source.
 
 🆚 Why Termix Agent?
 
-| Termix Agent| Traditional / Commercial Tools
+| | Termix Agent | Traditional Tools |
+|:--|:--|:--|
 💰 Cost| Free software + your provider's API costs| May require subscriptions
 🔌 AI Provider| Bring your own| Often tied to a platform
 🖥️ Interface| Terminal| Often desktop / IDE focused
