@@ -7,7 +7,7 @@ set -u
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="TERMIX AGENT"
-APP_VERSION="v1.2"
+APP_VERSION="v1.3"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
@@ -166,6 +166,45 @@ don't need a separate FOLDER_CREATE before writing a file into a new folder — 
 want an empty folder with no file in it yet. FOLDER_DELETE removes the folder and all of its contents
 recursively — only propose it when you actually mean to delete everything inside that folder, and the user
 must explicitly confirm it just like every other file-changing action.
+
+=== BULK FILE/FOLDER OPERATIONS (scaffolding, cleanup — one confirmation for the whole batch) ===
+
+FILE_WRITE / FOLDER_CREATE / FILE_DELETE / FOLDER_DELETE each get their own individual yes/no prompt. That's
+fine for a single change, but for anything creating, writing, or deleting THREE OR MORE files/folders in one
+go (scaffolding a new project, generating a batch of related files, cleaning up a set of old ones), use the
+bulk form instead — the user reviews and approves the whole batch in one prompt instead of one per item.
+
+To create or overwrite several files at once, output a block EXACTLY like this:
+<<<BULK_WRITE>>>
+<<<ITEM path="relative/path/one.txt">>>
+full content of the first file
+<<<END_ITEM>>>
+<<<ITEM path="relative/path/two.txt">>>
+full content of the second file
+<<<END_ITEM>>>
+<<<END_BULK_WRITE>>>
+(any number of ITEM blocks, each with its own path and full content — same content rules as FILE_WRITE, and
+missing parent folders are created automatically per item, same as FILE_WRITE)
+
+To create several empty folders at once, output a block EXACTLY like this — one relative path per line,
+nothing else on each line:
+<<<BULK_FOLDER_CREATE>>>
+relative/folder/one
+relative/folder/two
+relative/folder/three
+<<<END_BULK_FOLDER_CREATE>>>
+
+To delete several files and/or folders at once, output a block EXACTLY like this — one relative path per
+line. You do NOT need to know or say whether each path is a file or a folder; that's detected automatically
+and the right kind of removal is applied to each:
+<<<BULK_DELETE>>>
+relative/path/to/old-file.txt
+relative/path/to/old-folder
+<<<END_BULK_DELETE>>>
+
+For one or two items, still prefer the single-item FILE_WRITE/FOLDER_CREATE/FILE_DELETE/FOLDER_DELETE markers
+— bulk markers exist to save the user from a wall of repeated prompts on a real batch, not to be used for
+every change by default.
 
 === RUNNING SHELL COMMANDS (shown to the user, requires explicit yes/no confirmation) ===
 
@@ -1747,6 +1786,169 @@ handle_folder_delete_action() {
   fi
 }
 
+# --- Bulk variants -----------------------------------------------------
+# Same underlying operations as the single-item handlers above, but for a
+# whole batch collected from one <<<BULK_WRITE>>>, <<<BULK_FOLDER_CREATE>>>,
+# or <<<BULK_DELETE>>> block: one summary box listing every item, ONE
+# confirm_yes_no for the entire batch, then applied item-by-item. This
+# exists so scaffolding e.g. a 12-file project doesn't mean the user has
+# to sit through 12 separate y/n prompts — see process_agent_reply for how
+# these get parsed, and the system prompt section on BULK_* for when the
+# model should prefer these over repeated single markers.
+#
+# Both array arguments are passed BY NAME (nameref) so the whole batch can
+# be reviewed and applied together instead of one path at a time.
+
+handle_bulk_write_action() {
+  local -n _bw_paths="$1"
+  local -n _bw_files="$2"
+  local n="${#_bw_paths[@]}" i abs lines
+  local -a abs_list=()
+
+  box_top "BULK WRITE ($n file$([[ $n -eq 1 ]] || printf s))" "$ICON_WRITE" "$C_WARN"
+  for i in "${!_bw_paths[@]}"; do
+    abs="$(resolve_safe_path "${_bw_paths[$i]}")"
+    if [[ -z "$abs" ]]; then
+      box_line "${C_ERR}(skipped, unsafe path): ${_bw_paths[$i]}${C_RESET}"
+      abs_list+=("")
+      continue
+    fi
+    lines="$(wc -l < "${_bw_files[$i]}" | tr -d ' ')"
+    box_line "$abs ${C_DIM}(${lines} lines)${C_RESET}"
+    abs_list+=("$abs")
+  done
+  box_bottom "$C_WARN"
+
+  if confirm_yes_no "Apply all $n write(s)?"; then
+    local wrote=0 failed=0
+    for i in "${!_bw_paths[@]}"; do
+      abs="${abs_list[$i]}"
+      if [[ -z "$abs" ]]; then
+        failed=$((failed + 1))
+        continue
+      fi
+      mkdir -p "$(dirname "$abs")" 2>/dev/null
+      if cp "${_bw_files[$i]}" "$abs"; then
+        ok "Wrote $abs"
+        wrote=$((wrote + 1))
+      else
+        err "Failed to write $abs"
+        failed=$((failed + 1))
+      fi
+    done
+    [[ "$failed" -gt 0 ]] && warn "$wrote of $n write(s) succeeded, $failed failed."
+  else
+    warn "Skipped bulk write ($n file(s))."
+  fi
+}
+
+handle_bulk_folder_create_action() {
+  local -n _bfc_paths="$1"
+  local n="${#_bfc_paths[@]}" i abs
+  local -a abs_list=()
+
+  box_top "BULK CREATE FOLDERS ($n)" "$ICON_FOLDER" "$C_WARN"
+  for i in "${!_bfc_paths[@]}"; do
+    abs="$(resolve_safe_path "${_bfc_paths[$i]}")"
+    if [[ -z "$abs" ]]; then
+      box_line "${C_ERR}(skipped, unsafe path): ${_bfc_paths[$i]}${C_RESET}"
+      abs_list+=("")
+      continue
+    fi
+    if [[ -e "$abs" && ! -d "$abs" ]]; then
+      box_line "${C_ERR}(a file already exists here, not a folder): $abs${C_RESET}"
+    elif [[ -d "$abs" ]]; then
+      box_line "$abs ${C_DIM}(already exists)${C_RESET}"
+    else
+      box_line "$abs"
+    fi
+    abs_list+=("$abs")
+  done
+  box_bottom "$C_WARN"
+
+  if confirm_yes_no "Create all $n folder(s)?"; then
+    for i in "${!_bfc_paths[@]}"; do
+      abs="${abs_list[$i]}"
+      [[ -z "$abs" ]] && continue
+      if [[ -e "$abs" && ! -d "$abs" ]]; then
+        err "Skipped, a file already exists: $abs"
+        continue
+      fi
+      if mkdir -p "$abs"; then
+        ok "Created $abs"
+      else
+        err "Failed to create $abs"
+      fi
+    done
+  else
+    warn "Skipped bulk folder create ($n folder(s))."
+  fi
+}
+
+# Deletes a batch of files and/or folders in one confirmation. Unlike
+# FILE_DELETE/FOLDER_DELETE, the model doesn't have to know in advance
+# which entries are files vs folders — each path's type is detected at
+# preview time and the right removal (rm -f vs rm -rf) is applied
+# automatically, so a batch can freely mix both.
+handle_bulk_delete_action() {
+  local -n _bd_paths="$1"
+  local n="${#_bd_paths[@]}" i abs cnt
+  local -a abs_list=() kind_list=()
+
+  box_top "BULK DELETE ($n)" "$ICON_DELETE" "$C_ERR"
+  for i in "${!_bd_paths[@]}"; do
+    abs="$(resolve_safe_path "${_bd_paths[$i]}")"
+    if [[ -z "$abs" ]]; then
+      box_line "${C_ERR}(skipped, unsafe path): ${_bd_paths[$i]}${C_RESET}"
+      abs_list+=("")
+      kind_list+=("")
+      continue
+    fi
+    if [[ "$abs" == "$WORKSPACE_DIR" ]]; then
+      box_line "${C_ERR}(refusing to delete the sandbox root): $abs${C_RESET}"
+      abs_list+=("")
+      kind_list+=("")
+      continue
+    fi
+    if [[ -d "$abs" ]]; then
+      cnt="$(find "$abs" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+      box_line "$abs ${C_DIM}(folder, $cnt item(s) inside)${C_RESET}"
+      abs_list+=("$abs")
+      kind_list+=("folder")
+    elif [[ -f "$abs" ]]; then
+      box_line "$abs ${C_DIM}(file)${C_RESET}"
+      abs_list+=("$abs")
+      kind_list+=("file")
+    else
+      box_line "${C_DIM}(does not exist, will be skipped): $abs${C_RESET}"
+      abs_list+=("$abs")
+      kind_list+=("")
+    fi
+  done
+  box_bottom "$C_ERR"
+  warn "This permanently deletes every item listed above — this cannot be undone."
+
+  if confirm_yes_no "Delete all $n item(s)?"; then
+    for i in "${!_bd_paths[@]}"; do
+      abs="${abs_list[$i]}"
+      [[ -z "$abs" ]] && continue
+      case "${kind_list[$i]}" in
+        folder)
+          rm -rf "$abs" && ok "Deleted $abs" || err "Failed to delete $abs"
+          ;;
+        file)
+          rm -f "$abs" && ok "Deleted $abs" || err "Failed to delete $abs"
+          ;;
+        *)
+          warn "Nothing to delete, does not exist: $abs"
+          ;;
+      esac
+    done
+  else
+    warn "Skipped bulk delete ($n item(s))."
+  fi
+}
+
 # Caps applied when feeding file/command output back to the model, so a huge
 # file or noisy command can't blow up the conversation.
 MAX_PREVIEW_BYTES=8000
@@ -2436,7 +2638,8 @@ process_agent_reply() {
   local -a read_paths=() dirlist_paths=() ziplist_paths=() search_queries=()
   local -a zipread_paths=() zipread_entries=() shell_files=()
   local -a edit_paths=() edit_ops=() edit_starts=() edit_ends=() edit_files=()
-  local edit_file="" edit_idx=0
+  local -a bulk_write_paths=() bulk_write_files=() bulk_folder_paths=() bulk_delete_paths=()
+  local edit_file="" edit_idx=0 bulk_item_file="" bulk_idx=0
   local tmpdir
   tmpdir="$(mktemp -d)"
 
@@ -2501,6 +2704,21 @@ process_agent_reply() {
         path="${BASH_REMATCH[1]}"
         folder_delete_paths+=("$path")
         cleaned+="${C_ERR}${ICON_DELETE} delete folder: $path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<BULK_WRITE\>\>\>$ ]]; then
+        mode="bulkwrite"
+        cleaned+="${C_WARN}${ICON_WRITE} bulk write:${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<BULK_FOLDER_CREATE\>\>\>$ ]]; then
+        mode="bulkfoldercreate"
+        cleaned+="${C_WARN}${ICON_FOLDER} bulk create folders:${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<BULK_DELETE\>\>\>$ ]]; then
+        mode="bulkdelete"
+        cleaned+="${C_ERR}${ICON_DELETE} bulk delete:${C_RESET}"$'\n'
         continue
       fi
       if [[ "$line" =~ ^\<\<\<FILE_READ\ path=\"(.*)\"\>\>\>$ ]]; then
@@ -2601,7 +2819,7 @@ process_agent_reply() {
       # above — most likely a malformed/near-miss syntax (e.g. <tool_call>
       # instead of <<<...>>>). Don't just silently drop it: surface it to
       # the user and tell the model to retry with the exact marker syntax.
-      if [[ "$line" =~ (FILE_READ|FILE_WRITE|FILE_EDIT|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ|SHELL_RUN|WEB_SEARCH) ]] \
+      if [[ "$line" =~ (FILE_READ|FILE_WRITE|FILE_EDIT|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ|SHELL_RUN|WEB_SEARCH|BULK_WRITE|BULK_FOLDER_CREATE|BULK_DELETE) ]] \
         && [[ ! "$line" =~ ^\<\<\< ]]; then
         warn "Model attempted a malformed action marker: $line"
         AGENT_TOOL_OUTPUT+=$'\n\n'"[MARKER ERROR]: The line below was not recognized as a valid action — the ONLY valid syntax is the exact <<<...>>> markers described in your instructions (e.g. <<<DIR_LIST path=\".\">>>). Reissue it using that exact syntax:"$'\n'"$line"
@@ -2632,6 +2850,49 @@ process_agent_reply() {
         continue
       fi
       printf '%s\n' "$line" >> "$shell_file"
+    elif [[ "$mode" == "bulkwrite" ]]; then
+      if [[ "$line" == '<<<END_BULK_WRITE>>>' ]]; then
+        mode="text"
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<ITEM\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        bulk_idx=$((bulk_idx + 1))
+        bulk_item_file="$tmpdir/bulk_$bulk_idx"
+        : > "$bulk_item_file"
+        bulk_write_paths+=("$path")
+        mode="bulkwriteitem"
+        cleaned+="${C_DIM}  + $path${C_RESET}"$'\n'
+        continue
+      fi
+      # Anything else here (blank lines, stray text) is ignored rather
+      # than erroring — a batch is still valid as long as every ITEM it
+      # does contain is well-formed.
+    elif [[ "$mode" == "bulkwriteitem" ]]; then
+      if [[ "$line" == '<<<END_ITEM>>>' ]]; then
+        bulk_write_files+=("$bulk_item_file")
+        mode="bulkwrite"
+        continue
+      fi
+      printf '%s\n' "$line" >> "$bulk_item_file"
+    elif [[ "$mode" == "bulkfoldercreate" ]]; then
+      if [[ "$line" == '<<<END_BULK_FOLDER_CREATE>>>' ]]; then
+        mode="text"
+        continue
+      fi
+      if [[ -n "$line" ]]; then
+        bulk_folder_paths+=("$line")
+        cleaned+="${C_DIM}  + $line${C_RESET}"$'\n'
+      fi
+    elif [[ "$mode" == "bulkdelete" ]]; then
+      if [[ "$line" == '<<<END_BULK_DELETE>>>' ]]; then
+        mode="text"
+        continue
+      fi
+      if [[ -n "$line" ]]; then
+        bulk_delete_paths+=("$line")
+        cleaned+="${C_DIM}  + $line${C_RESET}"$'\n'
+      fi
     elif [[ "$mode" == "thinking" ]]; then
       if [[ "$line" == '<<<END_THINKING>>>' ]]; then
         mode="text"
@@ -2660,6 +2921,15 @@ process_agent_reply() {
   for path in "${folder_delete_paths[@]}"; do
     handle_folder_delete_action "$path"
   done
+  if [[ "${#bulk_write_paths[@]}" -gt 0 ]]; then
+    handle_bulk_write_action bulk_write_paths bulk_write_files
+  fi
+  if [[ "${#bulk_folder_paths[@]}" -gt 0 ]]; then
+    handle_bulk_folder_create_action bulk_folder_paths
+  fi
+  if [[ "${#bulk_delete_paths[@]}" -gt 0 ]]; then
+    handle_bulk_delete_action bulk_delete_paths
+  fi
 
   # Read-only inspection + shell execution: results are accumulated into
   # AGENT_TOOL_OUTPUT (reset by the caller each turn) so the caller can send
