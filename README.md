@@ -47,9 +47,9 @@ Just your terminal, your API key, and an AI coding agent.
 🚀 Quick Start
 
 Start Termix Agent with one command:
-
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/termix-agent.sh)
-
+```
 The script starts Termix Agent directly.
 
 There is no separate installation step or launcher command required for this startup method.
@@ -61,7 +61,7 @@ When Termix Agent starts, it gives you the available AI provider choices support
 Choose the provider you want to use, provide the required configuration, and continue.
 
 The basic flow is:
-
+```graph
 Run termix-agent.sh
         │
         ▼
@@ -78,7 +78,7 @@ Agent starts
         │
         ▼
 Chat with your coding agent
-
+```
 One command → choose your provider → start coding.
 
 ---
@@ -120,19 +120,20 @@ Termix Agent can use the information it finds on the web as additional context w
 
 ✨ Features
 
-| Feature| Description
-🤖| Natural Language Coding| Describe what you want and let the AI work through the task.
-📝| Read & Edit Files| Read, create, modify, and refactor files in your project.
-🗂️| Project Awareness| Work with the files and structure of your current workspace.
-⚡| Shell Commands| Execute commands and scripts when needed, with your approval.
-🔧| Debug & Fix| Analyze errors, logs, and failed commands to help find solutions.
-🔍| Real-Time Web Search| Search the web for current technical information and documentation.
-🧠| Web-Aware Reasoning| Use web-search results as context while reasoning about your task.
-🔌| Bring Your Own Provider| Choose your supported AI provider and use your own API key.
-📜| Bash-Based| The core agent is distributed as a portable Bash script.
-🛡️| Human-in-the-Loop| Actions requiring execution are presented for your approval.
-🔒| Zero Telemetry| No built-in proprietary tracking or analytics.
-🆓| Free & Open Source| Open source and licensed under GPL-3.0.
+| Feature | Description
+|:---|:---
+🤖 Natural Language Coding| Describe what you want and let the AI work through the task.
+📝 Read & Edit Files| Read, create, modify, and refactor files in your project.
+🗂️ Project Awareness| Work with the files and structure of your current workspace.
+⚡ Shell Commands| Execute commands and scripts when needed, with your approval.
+🔧 Debug & Fix| Analyze errors, logs, and failed commands to help find solutions.
+🔍 Real-Time Web Search| Search the web for current technical information and documentation.
+🧠 Web-Aware Reasoning| Use web-search results as context while reasoning about your task.
+🔌 Bring Your Own Provider| Choose your supported AI provider and use your own API key.
+📜 Bash-Based| The core agent is distributed as a portable Bash script.
+🛡️ Human-in-the-Loop| Actions requiring execution are presented for your approval.
+🔒 Zero Telemetry| No built-in proprietary tracking or analytics.
+🆓 Free & Open Source| Open source and licensed under GPL-3.0.
 
 ---
 
@@ -184,13 +185,13 @@ The AI can figure out what it thinks should happen, but actions that affect your
 When Termix needs to execute a command, you can review it before allowing it to run.
 
 For example:
-
+```
 Termix wants to run:
 
 npm install express
 
 Continue? [y/N]
-
+```
 You decide whether to continue.
 
 «The AI can suggest the action. You approve it.»
@@ -242,9 +243,9 @@ termix-agent.sh
 The goal is to keep Termix Agent straightforward and portable rather than turning it into a large desktop application.
 
 You can start it directly with:
-
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/termix-agent.sh)
-
+```
 Minimal setup.
 
 Terminal-first.
