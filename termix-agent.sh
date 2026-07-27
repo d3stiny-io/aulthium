@@ -7,7 +7,7 @@ set -u
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="TERMIX AGENT"
-APP_VERSION="v1.3"
+APP_VERSION="v1.4"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
@@ -2370,10 +2370,82 @@ web_search_scrape_generic() {
   return 0
 }
 
-# The three scrape providers, in the order web_search_query tries them.
-# Each is a thin wrapper around web_search_scrape_generic supplying just
-# the URL and that site's current block/snippet markers. All are free and
-# require no API key. If one provider is blocked, rate-limited, or
+# SearXNG JSON API provider — priv.au is a public SearXNG instance that
+# exposes /search?...&format=json, so unlike the scrape providers below
+# this one parses structured JSON instead of hand-rolled HTML block
+# splitting. Tried first in web_search_query since it's the least fragile
+# of the free backends (no markup to fall out of sync with). Same output
+# contract as every other provider: formatted "Title/URL/Snippet" text on
+# stdout, or empty + WEB_SEARCH_LAST_ERROR set on failure.
+web_search_query_searxng() {
+  local query="$1" encoded_query json_tmp http_code out n
+  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
+  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
+
+  json_tmp="$(mktemp)"
+  http_code="$(curl -sSL \
+    -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
+    -H "Accept: application/json" \
+    --max-time 20 \
+    -o "$json_tmp" \
+    -w '%{http_code}' \
+    "https://priv.au/search?q=${encoded_query}&format=json" \
+    2>/dev/null)"
+
+  if [[ -z "$http_code" ]]; then
+    rm -f "$json_tmp"
+    WEB_SEARCH_LAST_ERROR="couldn't reach priv.au (network/curl error)."
+    return 1
+  fi
+
+  if [[ "$http_code" != "200" ]]; then
+    rm -f "$json_tmp"
+    WEB_SEARCH_LAST_ERROR="priv.au returned HTTP $http_code."
+    return 1
+  fi
+
+  if [[ ! -s "$json_tmp" ]] || ! jq -e . "$json_tmp" >/dev/null 2>&1; then
+    rm -f "$json_tmp"
+    WEB_SEARCH_LAST_ERROR="got an unparseable response from priv.au."
+    return 1
+  fi
+
+  # Equivalent of: jq '.results[] | {title, url, content}' — reshaped
+  # straight into this script's standard "Title/URL/Snippet" block format
+  # instead of raw JSON, so it's a drop-in match for the scrape providers.
+  n="$(jq '[.results[]?] | length' "$json_tmp" 2>/dev/null)"
+  if [[ -z "$n" || "$n" -eq 0 ]]; then
+    rm -f "$json_tmp"
+    WEB_SEARCH_LAST_ERROR="priv.au returned zero results."
+    return 1
+  fi
+
+  out="$(jq -r --argjson max "$WEB_SEARCH_MAX_RESULTS" '
+    [.results[]?] | .[0:$max]
+    | map(
+        {title, url, content}
+        | "Title: \(.title // "N/A")\n"
+        + "URL: \(.url // "N/A")\n"
+        + "Snippet: \(.content // "N/A")\n"
+        + "---\n"
+      )
+    | join("")
+  ' "$json_tmp" 2>/dev/null)"
+  rm -f "$json_tmp"
+
+  if [[ -z "$out" ]]; then
+    WEB_SEARCH_LAST_ERROR="priv.au results couldn't be reshaped into output."
+    return 1
+  fi
+
+  printf '%s' "$out"
+  return 0
+}
+
+# The three scrape providers, tried after the SearXNG/LangChain backends
+# above. Each is a thin wrapper around web_search_scrape_generic supplying
+# just the URL and that site's current block/snippet markers. All are free
+# and require no API key. If one provider is blocked, rate-limited, or
 # unreachable on a given network, the others still have a shot — see
 # web_search_query.
 web_search_query_scrape_ddg() {
@@ -2529,9 +2601,10 @@ PYEOF
 }
 
 # Dispatcher: tries the LangChain backend first when it's available (see
-# check_deps), then falls through the scrape backends in order —
-# DuckDuckGo, then Bing, then Startpage — stopping at the first one that
-# returns real results. This means a provider that's blocked, rate-limited,
+# check_deps), then the priv.au SearXNG JSON API, then falls through the
+# scrape backends in order — DuckDuckGo, then Bing, then Startpage —
+# stopping at the first one that returns real results. This means a
+# provider that's blocked, rate-limited,
 # or just unreachable on a given network doesn't take web search down
 # entirely; the caller never needs to know which provider actually
 # answered. If every provider fails, WEB_SEARCH_LAST_ERROR is set to a
@@ -2546,6 +2619,11 @@ web_search_query() {
     fi
     errs+=("langchain/duckduckgo-search: ${WEB_SEARCH_LAST_ERROR:-failed}")
   fi
+
+  if web_search_query_searxng "$query"; then
+    return 0
+  fi
+  errs+=("${WEB_SEARCH_LAST_ERROR:-priv.au: failed}")
 
   if web_search_query_scrape_ddg "$query"; then
     return 0
