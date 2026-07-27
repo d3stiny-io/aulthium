@@ -520,26 +520,6 @@ check_deps() {
   if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
     warn "This system's grep lacks PCRE (-P) support — web search will use a simpler fallback parser."
   fi
-
-  # Preferred web search backend: LangChain's DuckDuckGoSearchAPIWrapper
-  # (from langchain-community, itself backed by the duckduckgo-search PyPI
-  # package). It does its own request handling and result parsing, which is
-  # sturdier than hand-rolled HTML scraping — the scrapers above stay in the
-  # script as a dependency-free fallback chain (DuckDuckGo, then Bing, then
-  # Startpage) for systems without python3 or those packages installed, or
-  # for whenever a given provider is blocked or unreachable on the network.
-  HAVE_PYTHON3=1
-  want_cmd python3 || HAVE_PYTHON3=0
-  HAVE_LANGCHAIN_SEARCH=0
-  if [[ "$HAVE_PYTHON3" -eq 1 ]]; then
-    python3 -c "from langchain_community.utilities import DuckDuckGoSearchAPIWrapper" >/dev/null 2>&1 \
-      && HAVE_LANGCHAIN_SEARCH=1
-  fi
-  if [[ "$HAVE_LANGCHAIN_SEARCH" -eq 0 ]]; then
-    if [[ "$HAVE_PYTHON3" -eq 1 ]]; then
-      muted "Tip: 'pip install langchain-community duckduckgo-search' gives web search a sturdier backend (currently falling back to scraping DuckDuckGo/Bing/Startpage directly)."
-    fi
-  fi
 }
 
 confirm_yes_no() {
@@ -2248,6 +2228,85 @@ extract_result_from_block() {
   EXTRACT_SNIPPET="$snippet"
 }
 
+# Turns parallel title/url/snippet arrays (passed by NAME, e.g.
+# `format_search_results titles urls snippets`) into the final, ready-to-
+# read block every web search provider ultimately returns to the model:
+#
+#   SEARCH RESULTS
+#
+#   [1]
+#   Title: ...
+#   URL: ...
+#   Snippet: ...
+#
+#   [2]
+#   ...
+#
+# Along the way it: re-normalizes whitespace defensively (belt-and-braces
+# — extract_result_from_block already does this, but a provider's markup
+# can still leave odd runs behind), drops any entry with neither a title
+# nor a URL, and de-duplicates on URL (falling back to title when a result
+# has no URL) case-insensitively, keeping the first — i.e. highest-ranked
+# — occurrence and preserving original order otherwise. Returns 1 with no
+# output if every entry turned out empty/duplicate.
+format_search_results() {
+  local -n _fsr_titles="$1" _fsr_urls="$2" _fsr_snippets="$3"
+  local -A seen=()
+  local out="SEARCH RESULTS"$'\n' i title url snippet key idx=0
+
+  for i in "${!_fsr_titles[@]}"; do
+    title="$(printf '%s' "${_fsr_titles[$i]:-}" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    url="$(printf '%s' "${_fsr_urls[$i]:-}" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    snippet="$(printf '%s' "${_fsr_snippets[$i]:-}" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    [[ "$url" == "N/A" ]] && url=""
+    [[ "$title" == "N/A" ]] && title=""
+    [[ "$snippet" == "N/A" ]] && snippet=""
+
+    # Nothing usable to show for this entry at all — skip rather than
+    # emitting a blank numbered block.
+    [[ -z "$title" && -z "$url" ]] && continue
+
+    key="${url:-$title}"
+    key="${key,,}"
+    [[ -n "${seen[$key]:-}" ]] && continue
+    seen[$key]=1
+
+    idx=$((idx + 1))
+    out+=$'\n'"[$idx]"$'\n'
+    out+="Title: ${title:-N/A}"$'\n'
+    out+="URL: ${url:-N/A}"$'\n'
+    out+="Snippet: ${snippet:-N/A}"$'\n'
+  done
+
+  [[ "$idx" -eq 0 ]] && return 1
+  printf '%s' "$out"
+  return 0
+}
+
+# Bing/Startpage still go through the older shared web_search_scrape_generic
+# (see below), which emits the plain "Title: ...\nURL: ...\nSnippet:
+# ...\n---\n" block shape. This re-parses that into arrays and hands them to
+# format_search_results, so every provider — DuckDuckGo included — ends up
+# returning the exact same final "SEARCH RESULTS" shape to the caller.
+reformat_legacy_blocks() {
+  local raw="$1" line title="" url="" snippet=""
+  local -a titles=() urls=() snippets=()
+
+  while IFS= read -r line; do
+    case "$line" in
+      "Title: "*) title="${line#Title: }" ;;
+      "URL: "*) url="${line#URL: }" ;;
+      "Snippet: "*) snippet="${line#Snippet: }" ;;
+      "---")
+        titles+=("$title"); urls+=("$url"); snippets+=("$snippet")
+        title=""; url=""; snippet=""
+        ;;
+    esac
+  done <<< "$raw"
+
+  format_search_results titles urls snippets
+}
+
 # Generic HTML-scrape web search backend, parameterized per provider so
 # DuckDuckGo, Bing, and Startpage can all reuse the same fetch/split/
 # extract/decode logic (see the three thin wrappers below). Used whenever
@@ -2370,262 +2429,146 @@ web_search_scrape_generic() {
   return 0
 }
 
-# SearXNG JSON API provider — priv.au is a public SearXNG instance that
-# exposes /search?...&format=json, so unlike the scrape providers below
-# this one parses structured JSON instead of hand-rolled HTML block
-# splitting. Tried first in web_search_query since it's the least fragile
-# of the free backends (no markup to fall out of sync with). Same output
-# contract as every other provider: formatted "Title/URL/Snippet" text on
-# stdout, or empty + WEB_SEARCH_LAST_ERROR set on failure.
-web_search_query_searxng() {
-  local query="$1" encoded_query json_tmp http_code out n
-  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
+# Primary web search backend: POSTs a query straight to DuckDuckGo's HTML
+# results endpoint (no JSON API, no SearXNG dependency, nothing but curl +
+# this script's own HTML-block parser). Uses the bare https://duckduckgo.com
+# endpoint rather than html.duckduckgo.com — the latter is blocked/
+# unreachable on some networks, per user confirmation. curl's own --data-urlencode is used for
+# the query instead of pre-encoding it by hand, so odd characters
+# (ampersands, quotes, unicode, etc.) in an AI-provided query are always
+# sent safely regardless of what's in them.
+#
+# Output is NOT the shared "Title/URL/Snippet/---" shape the other two
+# scrape providers use — this one produces the final, ready-to-read
+# "SEARCH RESULTS" block directly (see format_search_results below), since
+# it's the primary/preferred backend.
+web_search_query_ddg_html() {
+  local query="$1" html_tmp http_code flat
+  WEB_SEARCH_LAST_ERROR=""
 
-  json_tmp="$(mktemp)"
-  http_code="$(curl -sSL \
+  html_tmp="$(mktemp)"
+  http_code="$(curl -sSL -X POST \
     -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
-    -H "Accept: application/json" \
+    -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+    -H "Accept-Language: en-US,en;q=0.9" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -H "Origin: https://duckduckgo.com" \
+    --data-urlencode "q=${query}" \
     --max-time 20 \
-    -o "$json_tmp" \
+    -o "$html_tmp" \
     -w '%{http_code}' \
-    "https://priv.au/search?q=${encoded_query}&format=json" \
+    "https://duckduckgo.com" \
     2>/dev/null)"
 
   if [[ -z "$http_code" ]]; then
-    rm -f "$json_tmp"
-    WEB_SEARCH_LAST_ERROR="couldn't reach priv.au (network/curl error)."
+    rm -f "$html_tmp"
+    WEB_SEARCH_LAST_ERROR="couldn't reach duckduckgo.com (network/curl error)."
     return 1
   fi
 
   if [[ "$http_code" != "200" ]]; then
-    rm -f "$json_tmp"
-    WEB_SEARCH_LAST_ERROR="priv.au returned HTTP $http_code."
+    rm -f "$html_tmp"
+    WEB_SEARCH_LAST_ERROR="duckduckgo.com returned HTTP $http_code."
     return 1
   fi
 
-  if [[ ! -s "$json_tmp" ]] || ! jq -e . "$json_tmp" >/dev/null 2>&1; then
-    rm -f "$json_tmp"
-    WEB_SEARCH_LAST_ERROR="got an unparseable response from priv.au."
+  if [[ ! -s "$html_tmp" ]]; then
+    rm -f "$html_tmp"
+    WEB_SEARCH_LAST_ERROR="got an empty response from duckduckgo.com."
     return 1
   fi
 
-  # Equivalent of: jq '.results[] | {title, url, content}' — reshaped
-  # straight into this script's standard "Title/URL/Snippet" block format
-  # instead of raw JSON, so it's a drop-in match for the scrape providers.
-  n="$(jq '[.results[]?] | length' "$json_tmp" 2>/dev/null)"
-  if [[ -z "$n" || "$n" -eq 0 ]]; then
-    rm -f "$json_tmp"
-    WEB_SEARCH_LAST_ERROR="priv.au returned zero results."
+  # Flatten to one line (same reasoning as web_search_scrape_generic) so a
+  # result's tags never straddle a newline out from under the block
+  # splitter, then strip <script>/<style> blocks outright before anything
+  # else touches the markup — neither ever contains result text, and
+  # leaving them in risks JS/CSS source leaking into a snippet if a tag
+  # ever gets malformed.
+  flat="$(tr '\n\r' '  ' < "$html_tmp" \
+    | sed -E 's#<script[^>]*>.*?</script>##g; s#<style[^>]*>.*?</style>##g')"
+  rm -f "$html_tmp"
+
+  # Each organic result lives in <div class="result results_links...">,
+  # with the title in <a class="result__a" href="...">, and the snippet in
+  # <a class="result__snippet">...</a> right after it. DDG's own outbound
+  # links here are already plain, undecorated URLs (unlike the lite/html
+  # redirect-wrapped form some other DDG endpoints use), so no uddg=
+  # unwrapping is needed.
+  split_into_blocks "$flat" '<div class="result results_links' ""
+
+  local n i out=""
+  local -a titles=() urls=() snippets=()
+  n="${#RESULT_BLOCKS[@]}"
+  for (( i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS * 3; i++ )); do
+    extract_result_from_block "${RESULT_BLOCKS[$i]}" "" "result__snippet"
+    [[ -n "$EXTRACT_TITLE" || -n "$EXTRACT_URL" ]] || continue
+    titles+=("$EXTRACT_TITLE")
+    urls+=("$EXTRACT_URL")
+    snippets+=("$EXTRACT_SNIPPET")
+  done
+
+  if [[ "${#titles[@]}" -eq 0 ]]; then
+    WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — DuckDuckGo's markup may have changed, or the query returned a no-results page."
     return 1
   fi
 
-  out="$(jq -r --argjson max "$WEB_SEARCH_MAX_RESULTS" '
-    [.results[]?] | .[0:$max]
-    | map(
-        {title, url, content}
-        | "Title: \(.title // "N/A")\n"
-        + "URL: \(.url // "N/A")\n"
-        + "Snippet: \(.content // "N/A")\n"
-        + "---\n"
-      )
-    | join("")
-  ' "$json_tmp" 2>/dev/null)"
-  rm -f "$json_tmp"
-
-  if [[ -z "$out" ]]; then
-    WEB_SEARCH_LAST_ERROR="priv.au results couldn't be reshaped into output."
-    return 1
-  fi
-
-  printf '%s' "$out"
+  format_search_results titles urls snippets
   return 0
 }
 
-# The three scrape providers, tried after the SearXNG/LangChain backends
-# above. Each is a thin wrapper around web_search_scrape_generic supplying
-# just the URL and that site's current block/snippet markers. All are free
-# and require no API key. If one provider is blocked, rate-limited, or
-# unreachable on a given network, the others still have a shot — see
-# web_search_query.
-web_search_query_scrape_ddg() {
-  local query="$1" encoded_query
-  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
-  # DEFAULT: lite.duckduckgo.com. html.duckduckgo.com/html/ — the endpoint
-  # named in the original spec for this function — now sits behind
-  # stepped-up bot detection and frequently 403s or serves a JS challenge
-  # (that's the exact failure this whole rewrite exists to fix), so the
-  # officially supported lite endpoint is used instead. It only accepts
-  # POST with the query as URL-encoded form data.
-  #
-  # Every result's title anchor starts with `<a rel="nofollow" href="`
-  # (a plain server-rendered template, so this prefix is stable) and also
-  # carries class="result-link"; requiring both means nav links (next
-  # page, etc.) that happen to share the same href prefix get filtered
-  # out. The snippet sits in the very next table row's
-  # <td class="result-snippet">, which is why "result-snippet" alone is
-  # enough as the snippet marker — it's unique enough within a result's
-  # block not to need a class= match.
-  web_search_scrape_generic \
-    "duckduckgo.com" \
-    "https://lite.duckduckgo.com/lite/" \
-    '<a rel="nofollow" href="' \
-    'class="result-link"' \
-    "result-snippet" \
-    "1" \
-    "q=${encoded_query}"
-}
-
-# To use html.duckduckgo.com/html/ instead (e.g. on a network where lite.
-# duckduckgo.com happens to be the one that's blocked), swap the call
-# above for this — GET request, no post_data arg, block marker on the
-# old result__a anchor class:
-#   web_search_scrape_generic "duckduckgo.com" \
-#     "https://html.duckduckgo.com/html/?q=${encoded_query}" \
-#     '<a class="result__a"' "" "result__snippet" "1"
-
+# The two HTML-scrape fallback providers, tried only if the DuckDuckGo
+# POST endpoint above is blocked/rate-limited/unreachable on a given
+# network. Each is a thin wrapper around web_search_scrape_generic
+# supplying just the URL and that site's current block/snippet markers —
+# same dependency-free curl+sed/grep approach, no JSON anywhere. See
+# web_search_query for the fallback order.
 web_search_query_scrape_bing() {
-  local query="$1" encoded_query
+  local query="$1" encoded_query raw
   encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
   [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
   # Each organic result is wrapped in <li class="b_algo">...</li>,
   # containing both the <h2><a href=...>Title</a></h2> and the
   # <div class="b_caption"><p>Snippet</p></div> — one self-contained
   # block per result, no extra filtering needed.
-  web_search_scrape_generic \
+  raw="$(web_search_scrape_generic \
     "bing.com" \
     "https://www.bing.com/search?q=${encoded_query}&count=${WEB_SEARCH_MAX_RESULTS}" \
     '<li class="b_algo"' \
     "" \
     "b_caption" \
-    ""
+    "")" || return 1
+  reformat_legacy_blocks "$raw"
 }
 
 web_search_query_scrape_startpage() {
-  local query="$1" encoded_query
+  local query="$1" encoded_query raw
   encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
   [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
   # Each result sits inside a <div class="w-gl__result" ...> wrapper
   # containing both the w-gl__result-title link and the
   # w-gl__description snippet — another self-contained per-result block.
-  web_search_scrape_generic \
+  raw="$(web_search_scrape_generic \
     "startpage.com" \
     "https://www.startpage.com/sp/search?query=${encoded_query}" \
     '<div class="w-gl__result"' \
     "" \
     "w-gl__description" \
-    ""
+    "")" || return 1
+  reformat_legacy_blocks "$raw"
 }
 
-# Preferred web search backend: LangChain's DuckDuckGoSearchAPIWrapper
-# (langchain_community.utilities), which wraps the duckduckgo-search PyPI
-# package and does its own request handling and result parsing — no
-# hand-rolled HTML scraping here. Still completely free (DuckDuckGo has no
-# paid "search plugin" involved anywhere in this path, same as the scraper).
-# Only called when check_deps found the package importable (HAVE_LANGCHAIN_
-# SEARCH=1). Same output contract as the scrape backends below: formatted
-# numbered results on stdout, or empty + WEB_SEARCH_LAST_ERROR set on
-# failure.
-web_search_query_langchain() {
-  local query="$1" py_tmp out rc n
-
-  py_tmp="$(mktemp --suffix=.py)"
-  cat > "$py_tmp" << 'PYEOF'
-import sys, json
-
-try:
-    from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
-except Exception as e:
-    print(json.dumps({"error": "import_error", "detail": str(e)}))
-    sys.exit(2)
-
-query = sys.argv[1]
-max_results = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-
-try:
-    wrapper = DuckDuckGoSearchAPIWrapper(max_results=max_results)
-    results = wrapper.results(query, max_results=max_results)
-except Exception as e:
-    print(json.dumps({"error": "search_error", "detail": str(e)}))
-    sys.exit(3)
-
-out = []
-for r in results[:max_results]:
-    out.append({
-        "title": r.get("title") or "",
-        "link": r.get("link") or r.get("href") or "",
-        "snippet": r.get("snippet") or r.get("body") or "",
-    })
-print(json.dumps({"results": out}))
-PYEOF
-
-  out="$(python3 "$py_tmp" "$query" "$WEB_SEARCH_MAX_RESULTS" 2>/dev/null)"
-  rc=$?
-  rm -f "$py_tmp"
-
-  if [[ $rc -ne 0 || -z "$out" ]]; then
-    WEB_SEARCH_LAST_ERROR="LangChain search backend failed (exit $rc) — falling back to the built-in scraper."
-    return 1
-  fi
-
-  if ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
-    WEB_SEARCH_LAST_ERROR="LangChain search returned unparseable output — falling back to the built-in scraper."
-    return 1
-  fi
-
-  if printf '%s' "$out" | jq -e 'has("error")' >/dev/null 2>&1; then
-    local detail
-    detail="$(printf '%s' "$out" | jq -r '.detail // .error')"
-    WEB_SEARCH_LAST_ERROR="LangChain search error: $detail — falling back to the built-in scraper."
-    return 1
-  fi
-
-  n="$(printf '%s' "$out" | jq '.results | length')"
-  if [[ "$n" -eq 0 ]]; then
-    WEB_SEARCH_LAST_ERROR="LangChain search returned zero results."
-    return 1
-  fi
-
-  printf '%s' "$out" | jq -r '
-    .results
-    | map(
-        "Title: \(.title)\n"
-        + "URL: \(if .link != "" then .link else "N/A" end)\n"
-        + "Snippet: \(if .snippet != "" then .snippet else "N/A" end)\n"
-        + "---\n"
-      )
-    | join("")
-  '
-  return 0
-}
-
-# Dispatcher: tries the LangChain backend first when it's available (see
-# check_deps), then the priv.au SearXNG JSON API, then falls through the
-# scrape backends in order — DuckDuckGo, then Bing, then Startpage —
-# stopping at the first one that returns real results. This means a
-# provider that's blocked, rate-limited,
-# or just unreachable on a given network doesn't take web search down
-# entirely; the caller never needs to know which provider actually
-# answered. If every provider fails, WEB_SEARCH_LAST_ERROR is set to a
-# combined summary of why each one failed.
+# Dispatcher: DuckDuckGo's HTML POST endpoint first, falling through to
+# Bing then Startpage (both pure HTML scrapes, same as DDG — no JSON
+# anywhere in this chain) if it's blocked, rate-limited, or unreachable on
+# a given network. Stops at the first provider that returns real results,
+# so the caller never needs to know which one actually answered. If every
+# provider fails, WEB_SEARCH_LAST_ERROR is set to a combined summary of
+# why each one failed.
 web_search_query() {
   local query="$1"
   local -a errs=()
 
-  if [[ "${HAVE_LANGCHAIN_SEARCH:-0}" -eq 1 ]]; then
-    if web_search_query_langchain "$query"; then
-      return 0
-    fi
-    errs+=("langchain/duckduckgo-search: ${WEB_SEARCH_LAST_ERROR:-failed}")
-  fi
-
-  if web_search_query_searxng "$query"; then
-    return 0
-  fi
-  errs+=("${WEB_SEARCH_LAST_ERROR:-priv.au: failed}")
-
-  if web_search_query_scrape_ddg "$query"; then
+  if web_search_query_ddg_html "$query"; then
     return 0
   fi
   errs+=("${WEB_SEARCH_LAST_ERROR:-duckduckgo.com: failed}")
