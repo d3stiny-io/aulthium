@@ -7,7 +7,7 @@ set -u
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="TERMIX AGENT"
-APP_VERSION="v1.4"
+APP_VERSION="v1.5"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
@@ -510,9 +510,14 @@ check_deps() {
   want_cmd file || HAVE_FILE=0
   HAVE_TIMEOUT=1
   want_cmd timeout || HAVE_TIMEOUT=0
+  HAVE_FLOCK=1
+  want_cmd flock || HAVE_FLOCK=0
+  if [[ "$HAVE_FLOCK" -eq 0 ]]; then
+    warn "flock not found — DDG Lite's rate limiter will run without cross-process locking (fine for normal single-session use)."
+  fi
 
-  # Web search parses HTML results (DuckDuckGo, then Bing, then Startpage —
-  # see web_search_query) with PCRE (grep -P, needed for \K and non-greedy
+  # Web search parses HTML results (3 SearXNG instances, then DuckDuckGo
+  # Lite — see web_search_query) with PCRE (grep -P, needed for \K and non-greedy
   # matching) when available; otherwise it falls back to a plain POSIX-ERE
   # parser that's a bit less precise but still functional.
   HAVE_GREP_PCRE=1
@@ -786,8 +791,8 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_SEARCH}${C_RESET}      the agent can also search the live web (free, no\n"
   printf "${C_MUTED}│${C_RESET}       API key) for current info it doesn't already know —\n"
-  printf "${C_MUTED}│${C_RESET}       tries DuckDuckGo, then Bing, then Startpage if one is\n"
-  printf "${C_MUTED}│${C_RESET}       blocked or unreachable; also automatic, read-only, no\n"
+  printf "${C_MUTED}│${C_RESET}       tries 3 SearXNG instances, then DuckDuckGo Lite if all\n"
+  printf "${C_MUTED}│${C_RESET}       are blocked or unreachable; also automatic, read-only, no\n"
   printf "${C_MUTED}│${C_RESET}       confirmation needed.\n"
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} ${C_WARN}${ICON_WRITE} ${ICON_DELETE} ${ICON_FOLDER}${C_RESET}  write/overwrite a file, delete a single file,\n"
@@ -2117,6 +2122,23 @@ html_decode() {
       -e 's/&gt;/>/g'
 }
 
+# Dumps the raw HTML a provider returned to a persistent file, so that when
+# parsing fails (block markers no longer match — the single most common way
+# these scrapers break, since search engines change their markup without
+# notice) there's something concrete to inspect instead of just "it didn't
+# work". Kept under /tmp rather than WORKSPACE_DIR since it's diagnostic
+# output about the search provider, not agent-produced sandbox content.
+# Prints the saved path on stdout so callers can fold it into
+# WEB_SEARCH_LAST_ERROR; on any failure to write it, prints nothing and the
+# caller's error message just won't mention a path.
+save_search_debug_html() {
+  local provider="$1" content="$2" path
+  path="$(mktemp -t "termix-search-${provider}-XXXXXX.html" 2>/dev/null)" || return 0
+  if printf '%s' "$content" > "$path" 2>/dev/null; then
+    printf '%s' "$path"
+  fi
+}
+
 # Percent-encodes a string for a URL query using only bash/printf builtins
 # — no python/perl. Used as a fallback when `jq` isn't installed; jq's
 # `@uri` is tried first in each provider wrapper below since it's already
@@ -2181,18 +2203,34 @@ split_into_blocks() {
 # just no longer load-bearing for the parser itself).
 #
 # Sets: EXTRACT_TITLE, EXTRACT_URL, EXTRACT_SNIPPET
+#
+# Optional global SCRAPE_TITLE_ANCHOR_AFTER: if set and present in the
+# block, only the portion of the block AFTER that literal marker is
+# searched for the title anchor. Needed for providers whose result markup
+# has an earlier, non-title <a href="..."> before the real title link —
+# e.g. SearXNG's Simple theme puts a breadcrumb/url_wrapper link ahead of
+# the <h3><a>Title</a></h3> title link in the same <article> block, so
+# grabbing the first anchor in the block would silently return the
+# breadcrumb instead of the title. Each provider wrapper sets/clears this
+# before calling in; empty (the default) preserves old first-anchor
+# behavior for providers without that structure (e.g. DDG Lite).
 extract_result_from_block() {
   local block="$1" unwrap_ddg="$2" snippet_class="$3"
   local href="" title="" snippet="" anchor_start title_chunk after cut
+  local search_block="$block"
+
+  if [[ -n "${SCRAPE_TITLE_ANCHOR_AFTER:-}" && "$block" == *"$SCRAPE_TITLE_ANCHOR_AFTER"* ]]; then
+    search_block="${block#*"$SCRAPE_TITLE_ANCHOR_AFTER"}"
+  fi
 
   # Title + URL: the first <a ...href="...">, then everything up to that
   # tag's matching </a>. Matched greedily to the end of the block (POSIX
   # ERE has no lazy quantifier) and then trimmed back to the first </a>
   # with a bash suffix-strip — that two-step is what lets this handle a
-  # title wrapped in a nested tag (e.g. Startpage's <a...><h3>Title</h3>
-  # </a>) instead of assuming plain text right after the anchor's '>',
-  # which silently produced an empty title whenever a provider nests one.
-  anchor_start="$(printf '%s' "$block" | grep -oE '<a[^>]*href="[^"]*"[^>]*>.*' | head -n1)"
+  # title wrapped in a nested tag (e.g. <a...><h3>Title</h3></a>) instead
+  # of assuming plain text right after the anchor's '>', which silently
+  # produced an empty title whenever a provider nests one.
+  anchor_start="$(printf '%s' "$search_block" | grep -oE '<a[^>]*href="[^"]*"[^>]*>.*' | head -n1)"
   [[ "$anchor_start" =~ href=\"([^\"]*)\" ]] && href="${BASH_REMATCH[1]}"
   title_chunk="${anchor_start%%</a>*}"
   title="$(printf '%s' "$title_chunk" | sed -e 's/<[^>]*>//g' | html_decode)"
@@ -2247,12 +2285,23 @@ extract_result_from_block() {
 # can still leave odd runs behind), drops any entry with neither a title
 # nor a URL, and de-duplicates on URL (falling back to title when a result
 # has no URL) case-insensitively, keeping the first — i.e. highest-ranked
-# — occurrence and preserving original order otherwise. Returns 1 with no
-# output if every entry turned out empty/duplicate.
+# — occurrence and preserving original order otherwise. On success, sets
+# FORMAT_SEARCH_RESULT (global) to the formatted text and returns 0. On
+# failure (every entry was empty/duplicate), sets WEB_SEARCH_LAST_ERROR
+# and returns 1 — and does NOT print anything.
+#
+# Deliberately does NOT print its result on stdout for the caller to
+# capture via $(...): command substitution runs the function in a
+# subshell, and any WEB_SEARCH_LAST_ERROR assignment made inside a
+# subshell is invisible to the parent shell once it exits — which would
+# silently swallow the exact error message this function exists to
+# produce. Call this directly (`if format_search_results a b c; then`),
+# never as `x="$(format_search_results a b c)"`.
 format_search_results() {
   local -n _fsr_titles="$1" _fsr_urls="$2" _fsr_snippets="$3"
   local -A seen=()
   local out="SEARCH RESULTS"$'\n' i title url snippet key idx=0
+  FORMAT_SEARCH_RESULT=""
 
   for i in "${!_fsr_titles[@]}"; do
     title="$(printf '%s' "${_fsr_titles[$i]:-}" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
@@ -2278,16 +2327,19 @@ format_search_results() {
     out+="Snippet: ${snippet:-N/A}"$'\n'
   done
 
-  [[ "$idx" -eq 0 ]] && return 1
-  printf '%s' "$out"
+  if [[ "$idx" -eq 0 ]]; then
+    WEB_SEARCH_LAST_ERROR="page fetched fine and results were parsed, but every entry was empty (no title/URL) or a duplicate — nothing usable remained after filtering."
+    return 1
+  fi
+  FORMAT_SEARCH_RESULT="$out"
   return 0
 }
 
-# Bing/Startpage still go through the older shared web_search_scrape_generic
+# The 3 SearXNG providers go through the shared web_search_scrape_generic
 # (see below), which emits the plain "Title: ...\nURL: ...\nSnippet:
 # ...\n---\n" block shape. This re-parses that into arrays and hands them to
-# format_search_results, so every provider — DuckDuckGo included — ends up
-# returning the exact same final "SEARCH RESULTS" shape to the caller.
+# format_search_results, so every provider ends up returning the exact same
+# final "SEARCH RESULTS" shape to the caller.
 reformat_legacy_blocks() {
   local raw="$1" line title="" url="" snippet=""
   local -a titles=() urls=() snippets=()
@@ -2346,7 +2398,7 @@ web_search_scrape_generic() {
   local snippet_class="$5" unwrap_ddg_redirect="${6:-}"
   local have_post_data=$(( $# >= 7 ? 1 : 0 ))
   local post_data="${7:-}"
-  local html_tmp curl_args=() flat out i n
+  local html_tmp curl_args=() flat out i n http_code
   local -a titles=() urls=() snippets=()
   WEB_SEARCH_LAST_ERROR=""
 
@@ -2356,7 +2408,13 @@ web_search_scrape_generic() {
   # (DuckDuckGo's html.duckduckgo.com in particular). These mimic a current
   # desktop Chrome/Windows request closely enough to pass basic bot checks
   # without needing a real browser/JS engine.
+  # --connect-timeout bounds the connection phase (DNS + TCP/TLS handshake)
+  # separately from --max-time, which bounds the whole request including
+  # the response body — so a provider that's up but slow to send data
+  # doesn't hang indefinitely, and one that's unreachable fails fast.
   curl_args=(-sSL
+             --connect-timeout 8
+             --max-time 20
              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
              -H "Accept-Language: en-US,en;q=0.9"
@@ -2364,8 +2422,7 @@ web_search_scrape_generic() {
              -H "Sec-Fetch-Site: none"
              -H "Sec-Fetch-User: ?1"
              -H "Sec-Fetch-Dest: document"
-             -H "Upgrade-Insecure-Requests: 1"
-             --max-time 20)
+             -H "Upgrade-Insecure-Requests: 1")
 
   if [[ "$have_post_data" -eq 1 ]]; then
     curl_args+=(-X POST
@@ -2373,11 +2430,21 @@ web_search_scrape_generic() {
                 -H "Origin: https://$(printf '%s' "$url" | sed -E 's#^https?://##; s#/.*##')"
                 --data "$post_data")
   fi
-  curl_args+=("$url")
+  curl_args+=(-o "$html_tmp" -w '%{http_code}' "$url")
 
-  if ! curl "${curl_args[@]}" -o "$html_tmp" 2>/dev/null; then
+  http_code="$(curl "${curl_args[@]}" 2>/dev/null)"
+  if [[ -z "$http_code" ]]; then
     rm -f "$html_tmp"
-    WEB_SEARCH_LAST_ERROR="couldn't reach $provider_label (network/curl error)."
+    WEB_SEARCH_LAST_ERROR="couldn't reach $provider_label (network/DNS/timeout error)."
+    return 1
+  fi
+
+  # Treat the provider as failed on any non-2xx status — explicitly
+  # including 403 (blocked), 429 (rate-limited), and 5xx (server error) —
+  # rather than trying to parse a blocked/error page as if it were results.
+  if [[ "$http_code" != 2* ]]; then
+    rm -f "$html_tmp"
+    WEB_SEARCH_LAST_ERROR="$provider_label returned HTTP $http_code."
     return 1
   fi
 
@@ -2407,17 +2474,23 @@ web_search_scrape_generic() {
   done
 
   if [[ "${#titles[@]}" -eq 0 ]]; then
+    local debug_path
+    debug_path="$(save_search_debug_html "$provider_label" "$flat")"
     if [[ "${HAVE_GREP_PCRE:-1}" -eq 0 ]]; then
       WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — $provider_label's markup may have changed. (This system's grep also lacks PCRE (-P) support, though this parser no longer depends on it.)"
     else
       WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — $provider_label's markup may have changed, or the query returned a no-results page."
     fi
+    [[ -n "$debug_path" ]] && WEB_SEARCH_LAST_ERROR+=" Raw response saved to: $debug_path"
     return 1
   fi
 
   # Standardized, provider-agnostic output format — easy for a downstream
   # consumer (or a human) to parse reliably regardless of which provider
-  # actually answered.
+  # actually answered. Set on a global rather than printed, so callers can
+  # invoke this directly (no $() subshell) and keep any WEB_SEARCH_LAST_ERROR
+  # this function sets on failure visible to them — see format_search_results
+  # for why that matters.
   out=""
   for i in "${!titles[@]}"; do
     out+="Title: ${titles[$i]}"$'\n'
@@ -2425,82 +2498,297 @@ web_search_scrape_generic() {
     out+="Snippet: ${snippets[$i]:-N/A}"$'\n'
     out+="---"$'\n'
   done
-  printf '%s' "$out"
+  WEB_SEARCH_SCRAPE_RESULT="$out"
   return 0
 }
 
-# Primary web search backend: POSTs a query straight to DuckDuckGo's HTML
-# results endpoint (no JSON API, no SearXNG dependency, nothing but curl +
-# this script's own HTML-block parser). Uses the bare https://duckduckgo.com
-# endpoint rather than html.duckduckgo.com — the latter is blocked/
-# unreachable on some networks, per user confirmation. curl's own --data-urlencode is used for
-# the query instead of pre-encoding it by hand, so odd characters
-# (ampersands, quotes, unicode, etc.) in an AI-provided query are always
-# sent safely regardless of what's in them.
+# --- SearXNG (primary provider, 3 fixed public instances) ----------------
+# Exactly these three HTML-scrape SearXNG instances, tried in this fixed
+# order. No other instance is ever contacted and none are discovered
+# dynamically — this list is the complete, permanent set. Each is queried
+# via its plain HTML /search endpoint (never the JSON API, so no API key
+# and no special Accept negotiation is needed).
+SEARXNG_INSTANCES=(
+  "https://searx.tiekoetter.com"
+  "https://searxng.website"
+  "https://search.ctq.ro"
+)
+
+# Queries one SearXNG instance's HTML /search endpoint and normalizes the
+# result into this script's shared "SEARCH RESULTS" format. A provider
+# counts as failed — triggering the next one in web_search_query below —
+# on connection/DNS failure, timeout, any non-2xx HTTP status (403, 429,
+# 5xx included), an empty body, or zero parseable results; all of that is
+# handled inside web_search_scrape_generic already.
 #
-# Output is NOT the shared "Title/URL/Snippet/---" shape the other two
-# scrape providers use — this one produces the final, ready-to-read
-# "SEARCH RESULTS" block directly (see format_search_results below), since
-# it's the primary/preferred backend.
-web_search_query_ddg_html() {
-  local query="$1" html_tmp http_code flat
-  WEB_SEARCH_LAST_ERROR=""
+# SearXNG's Simple theme (the markup nearly every public instance runs)
+# wraps each organic result in <article class="result ...">, with the
+# title link inside it and the snippet text in <p class="content">.
+web_search_query_searxng() {
+  local instance="$1" query="$2" encoded_query rc
+  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
+  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
+
+  # Each <article class="result ..."> opens with a favicon + breadcrumb
+  # "url display" link before the real <h3><a>Title</a></h3> title link —
+  # skip past the first "<h3" so extract_result_from_block grabs the
+  # title anchor instead of that breadcrumb one.
+  SCRAPE_TITLE_ANCHOR_AFTER='<h3'
+  web_search_scrape_generic \
+    "$instance" \
+    "${instance}/search?q=${encoded_query}" \
+    '<article' \
+    'class="result' \
+    "content" \
+    ""
+  rc=$?
+  SCRAPE_TITLE_ANCHOR_AFTER=""
+  [[ "$rc" -eq 0 ]] || return 1
+
+  reformat_legacy_blocks "$WEB_SEARCH_SCRAPE_RESULT"
+}
+
+# --- DuckDuckGo Lite (fallback provider) ----------------------------------
+# KEPT as the fallback behind the three SearXNG instances above — never
+# removed, still HTML-scraped (no JSON/API-key backend exists for it
+# anyway). What's new here is a shared rate limiter, a large User-Agent
+# pool for normal request diversity, and cooldown-on-block handling; the
+# actual result markup/parsing is unchanged from before.
+
+# A broad pool of realistic desktop/mobile browser User-Agent strings,
+# covering Chrome/Firefox/Safari/Edge/Samsung Internet across
+# Windows/Linux/macOS/Android/iOS. Purely for normal header diversity and
+# browser compatibility — picked at random per request. This is NOT used
+# to bypass CAPTCHAs, rate limits, or any other access control; see
+# ddg_response_is_blocked below, which always backs off on a real block
+# rather than trying to push through it with a different UA.
+DDG_USER_AGENTS=(
+  # Chrome / Windows
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  # Chrome / Linux
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  # Chrome / macOS
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  # Chrome / Android
+  "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+  # Firefox / Windows
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+  # Firefox / Linux
+  "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+  # Firefox / macOS
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0"
+  # Firefox / Android
+  "Mozilla/5.0 (Android 14; Mobile; rv:128.0) Gecko/128.0 Firefox/128.0"
+  # Safari / macOS
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+  # Safari / iPhone
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+  # Safari / iPad
+  "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+  # Edge / Windows
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
+  # Edge / macOS
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
+  # Samsung Internet / Android
+  "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/122.0.0.0 Mobile Safari/537.36"
+)
+
+ddg_random_user_agent() {
+  printf '%s' "${DDG_USER_AGENTS[$(( RANDOM % ${#DDG_USER_AGENTS[@]} ))]}"
+}
+
+# Rate limiter + cooldown state, shared across (potentially concurrent)
+# Termix Agent processes via a lock file rather than just in-process
+# variables — a plain in-memory variable wouldn't stop two separate
+# invocations of this script from both firing at once. Configurable via
+# environment variables, per the requested defaults.
+DDG_MIN_DELAY="${DDG_MIN_DELAY:-5}"                     # seconds, floor between requests
+DDG_RANDOM_EXTRA_DELAY="${DDG_RANDOM_EXTRA_DELAY:-5}"    # seconds, max extra jitter on top
+DDG_COOLDOWN_AFTER_BLOCK="${DDG_COOLDOWN_AFTER_BLOCK:-300}" # seconds (5 minutes)
+DDG_STATE_FILE="${TMPDIR:-/tmp}/termix-agent-ddg-state"
+DDG_LOCK_FILE="${TMPDIR:-/tmp}/termix-agent-ddg.lock"
+
+# Reads DDG_STATE_FILE ("<last_request_epoch> <cooldown_until_epoch>")
+# into DDG_LAST_REQUEST / DDG_COOLDOWN_UNTIL. Missing or corrupt state
+# reads as "0 0" so a fresh run never blocks unnecessarily.
+_ddg_read_state() {
+  local line
+  line="$(cat "$DDG_STATE_FILE" 2>/dev/null)"
+  DDG_LAST_REQUEST="${line%% *}"
+  DDG_COOLDOWN_UNTIL="${line##* }"
+  [[ "$DDG_LAST_REQUEST" =~ ^[0-9]+$ ]] || DDG_LAST_REQUEST=0
+  [[ "$DDG_COOLDOWN_UNTIL" =~ ^[0-9]+$ ]] || DDG_COOLDOWN_UNTIL=0
+}
+
+# True (exit 0) while DDG Lite is inside a post-block cooldown window.
+ddg_in_cooldown() {
+  local now
+  now="$(date +%s)"
+  _ddg_read_state
+  [[ "$now" -lt "$DDG_COOLDOWN_UNTIL" ]]
+}
+
+# Starts (or extends) the cooldown after a detected block. Lock-protected
+# so a burst of near-simultaneous blocked responses only ever pushes the
+# cooldown further out, never resets it backwards. Falls back to running
+# unlocked if flock isn't installed (see check_deps/HAVE_FLOCK) rather
+# than failing outright — still correct for the common single-process
+# case, just without the cross-process guarantee.
+_ddg_set_cooldown_body() {
+  local now until
+  now="$(date +%s)"
+  until=$(( now + DDG_COOLDOWN_AFTER_BLOCK ))
+  _ddg_read_state
+  [[ "$until" -lt "$DDG_COOLDOWN_UNTIL" ]] && until="$DDG_COOLDOWN_UNTIL"
+  printf '%s %s\n' "$DDG_LAST_REQUEST" "$until" > "$DDG_STATE_FILE" 2>/dev/null
+}
+ddg_set_cooldown() {
+  if [[ "${HAVE_FLOCK:-1}" -eq 1 ]]; then
+    ( flock -x 200; _ddg_set_cooldown_body ) 200>"$DDG_LOCK_FILE"
+  else
+    _ddg_set_cooldown_body
+  fi
+}
+
+# Waits (sleeps) until it's this caller's turn to hit DDG Lite, then
+# reserves the slot by recording the new "last request" time — all inside
+# one flock critical section, so two processes racing to search at the
+# same instant still end up DDG_MIN_DELAY(+jitter) apart rather than both
+# firing immediately; queued rather than dropped. Falls back to running
+# unlocked if flock isn't installed (HAVE_FLOCK=0), same as
+# ddg_set_cooldown above. Returns 1 (no sleep, no slot reserved) if a
+# cooldown is currently active — the caller should treat that exactly
+# like a provider failure and skip DDG Lite entirely.
+_ddg_rate_limit_wait_body() {
+  local now last wait_for extra_ms
+  now="$(date +%s)"
+  _ddg_read_state
+
+  if [[ "$now" -lt "$DDG_COOLDOWN_UNTIL" ]]; then
+    return 1
+  fi
+
+  last="$DDG_LAST_REQUEST"
+  wait_for=$(( last + DDG_MIN_DELAY - now ))
+  [[ "$wait_for" -gt 0 ]] && sleep "$wait_for"
+
+  extra_ms=$(( RANDOM % (DDG_RANDOM_EXTRA_DELAY * 1000 + 1) ))
+  if [[ "$extra_ms" -gt 0 ]]; then
+    sleep "$(printf '%d.%03d' $((extra_ms / 1000)) $((extra_ms % 1000)))" 2>/dev/null \
+      || sleep $(( (extra_ms + 999) / 1000 ))
+  fi
+
+  printf '%s %s\n' "$(date +%s)" "$DDG_COOLDOWN_UNTIL" > "$DDG_STATE_FILE" 2>/dev/null
+}
+ddg_rate_limit_wait() {
+  if [[ "${HAVE_FLOCK:-1}" -eq 1 ]]; then
+    ( flock -x 200; _ddg_rate_limit_wait_body ) 200>"$DDG_LOCK_FILE"
+  else
+    _ddg_rate_limit_wait_body
+  fi
+}
+
+# Narrow, deliberately conservative detection of a DDG Lite CAPTCHA /
+# bot-check / hard block — specific HTTP status codes plus a couple of
+# DDG's own known block-page phrases — so an ordinary no-results page is
+# never mistaken for a block. On a match, the caller starts a cooldown and
+# stops; nothing here attempts to solve, bypass, or push through it.
+ddg_response_is_blocked() {
+  local http_code="$1" body="$2"
+  case "$http_code" in
+    403|429|503) return 0 ;;
+  esac
+  printf '%s' "$body" | grep -qiE 'unusual traffic|complete the security check|id="anomaly-modal"|g-recaptcha|/sorry/'
+}
+
+# lite.duckduckgo.com/lite/ — a plain, server-rendered, no-JS results page.
+# Confirmed from a captured debug dump (mid/late-2026): each result is now
+# <a rel="nofollow" href="https://real-url..." class='result-link'>Title</a>
+# — note the SINGLE quotes around the class value and that class comes
+# AFTER href (not `<a class="result-link" ...>` like it used to), and the
+# href is a plain, already-unwrapped URL — no more //duckduckgo.com/l/
+# ?uddg= redirect wrapping. The snippet is a sibling row's
+# <td class='result-snippet'>, also single-quoted. The block marker below
+# is a plain substring match so the quote style/attribute order inside
+# the tag doesn't matter for splitting, but it still has to be the exact
+# substring actually present on the page.
+web_search_query_scrape_ddglite() {
+  local query="$1" encoded_query html_tmp http_code flat body_snippet
+  SCRAPE_TITLE_ANCHOR_AFTER=""
+
+  if ddg_in_cooldown; then
+    WEB_SEARCH_LAST_ERROR="lite.duckduckgo.com is in a post-block cooldown (recently rate-limited/CAPTCHA'd) — skipping until it expires."
+    return 1
+  fi
+
+  if ! ddg_rate_limit_wait; then
+    WEB_SEARCH_LAST_ERROR="lite.duckduckgo.com is in a post-block cooldown — skipping until it expires."
+    return 1
+  fi
+
+  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
+  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
 
   html_tmp="$(mktemp)"
-  http_code="$(curl -sSL -X POST \
-    -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" \
+  http_code="$(curl -sSL \
+    --connect-timeout 8 --max-time 20 \
+    -A "$(ddg_random_user_agent)" \
     -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
     -H "Accept-Language: en-US,en;q=0.9" \
     -H "Content-Type: application/x-www-form-urlencoded" \
-    -H "Origin: https://duckduckgo.com" \
-    --data-urlencode "q=${query}" \
-    --max-time 20 \
+    --data "q=${encoded_query}" \
     -o "$html_tmp" \
     -w '%{http_code}' \
-    "https://duckduckgo.com" \
+    "https://lite.duckduckgo.com/lite/" \
     2>/dev/null)"
 
   if [[ -z "$http_code" ]]; then
     rm -f "$html_tmp"
-    WEB_SEARCH_LAST_ERROR="couldn't reach duckduckgo.com (network/curl error)."
+    WEB_SEARCH_LAST_ERROR="couldn't reach lite.duckduckgo.com (network/DNS/timeout error)."
     return 1
   fi
 
-  if [[ "$http_code" != "200" ]]; then
+  body_snippet="$(head -c 4000 "$html_tmp" 2>/dev/null)"
+  if ddg_response_is_blocked "$http_code" "$body_snippet"; then
     rm -f "$html_tmp"
-    WEB_SEARCH_LAST_ERROR="duckduckgo.com returned HTTP $http_code."
+    ddg_set_cooldown
+    WEB_SEARCH_LAST_ERROR="lite.duckduckgo.com returned a CAPTCHA/bot-check response (HTTP $http_code) — backing off for $(( DDG_COOLDOWN_AFTER_BLOCK / 60 )) minute(s)."
+    return 1
+  fi
+
+  if [[ "$http_code" != 2* ]]; then
+    rm -f "$html_tmp"
+    WEB_SEARCH_LAST_ERROR="lite.duckduckgo.com returned HTTP $http_code."
     return 1
   fi
 
   if [[ ! -s "$html_tmp" ]]; then
     rm -f "$html_tmp"
-    WEB_SEARCH_LAST_ERROR="got an empty response from duckduckgo.com."
+    WEB_SEARCH_LAST_ERROR="got an empty response from lite.duckduckgo.com."
     return 1
   fi
 
-  # Flatten to one line (same reasoning as web_search_scrape_generic) so a
-  # result's tags never straddle a newline out from under the block
-  # splitter, then strip <script>/<style> blocks outright before anything
-  # else touches the markup — neither ever contains result text, and
-  # leaving them in risks JS/CSS source leaking into a snippet if a tag
-  # ever gets malformed.
-  flat="$(tr '\n\r' '  ' < "$html_tmp" \
-    | sed -E 's#<script[^>]*>.*?</script>##g; s#<style[^>]*>.*?</style>##g')"
+  flat="$(tr '\n\r' '  ' < "$html_tmp")"
   rm -f "$html_tmp"
 
-  # Each organic result lives in <div class="result results_links...">,
-  # with the title in <a class="result__a" href="...">, and the snippet in
-  # <a class="result__snippet">...</a> right after it. DDG's own outbound
-  # links here are already plain, undecorated URLs (unlike the lite/html
-  # redirect-wrapped form some other DDG endpoints use), so no uddg=
-  # unwrapping is needed.
-  split_into_blocks "$flat" '<div class="result results_links' ""
+  # Marker deliberately starts at "<a rel=..." (the literal text right
+  # BEFORE the href value) rather than at "class='result-link'" itself —
+  # split_into_blocks starts each block AT the marker, so anchoring on
+  # text after href would cut the href right off the front of its own
+  # block. require_substring="result-link" then rejects any block that
+  # happens to share this opening but isn't actually an organic result.
+  split_into_blocks "$flat" '<a rel="nofollow" href="' "result-link"
 
-  local n i out=""
+  local n i
   local -a titles=() urls=() snippets=()
   n="${#RESULT_BLOCKS[@]}"
   for (( i = 0; i < n && i < WEB_SEARCH_MAX_RESULTS * 3; i++ )); do
-    extract_result_from_block "${RESULT_BLOCKS[$i]}" "" "result__snippet"
+    # unwrap_ddg="1": harmless either way — it only fires if a href
+    # actually contains "uddg=", which current DDG Lite hrefs don't, but
+    # this keeps parsing working without changes if DDG ever brings the
+    # redirect-wrapped form back.
+    extract_result_from_block "${RESULT_BLOCKS[$i]}" "1" "result-snippet"
     [[ -n "$EXTRACT_TITLE" || -n "$EXTRACT_URL" ]] || continue
     titles+=("$EXTRACT_TITLE")
     urls+=("$EXTRACT_URL")
@@ -2508,80 +2796,38 @@ web_search_query_ddg_html() {
   done
 
   if [[ "${#titles[@]}" -eq 0 ]]; then
-    WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — DuckDuckGo's markup may have changed, or the query returned a no-results page."
+    local debug_path
+    debug_path="$(save_search_debug_html "ddglite" "$flat")"
+    WEB_SEARCH_LAST_ERROR="page fetched fine, but no results could be parsed out of it — DuckDuckGo Lite's markup may have changed, or the query returned a no-results page."
+    [[ -n "$debug_path" ]] && WEB_SEARCH_LAST_ERROR+=" Raw response saved to: $debug_path"
     return 1
   fi
 
   format_search_results titles urls snippets
-  return 0
 }
 
-# The two HTML-scrape fallback providers, tried only if the DuckDuckGo
-# POST endpoint above is blocked/rate-limited/unreachable on a given
-# network. Each is a thin wrapper around web_search_scrape_generic
-# supplying just the URL and that site's current block/snippet markers —
-# same dependency-free curl+sed/grep approach, no JSON anywhere. See
-# web_search_query for the fallback order.
-web_search_query_scrape_bing() {
-  local query="$1" encoded_query raw
-  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
-  # Each organic result is wrapped in <li class="b_algo">...</li>,
-  # containing both the <h2><a href=...>Title</a></h2> and the
-  # <div class="b_caption"><p>Snippet</p></div> — one self-contained
-  # block per result, no extra filtering needed.
-  raw="$(web_search_scrape_generic \
-    "bing.com" \
-    "https://www.bing.com/search?q=${encoded_query}&count=${WEB_SEARCH_MAX_RESULTS}" \
-    '<li class="b_algo"' \
-    "" \
-    "b_caption" \
-    "")" || return 1
-  reformat_legacy_blocks "$raw"
-}
-
-web_search_query_scrape_startpage() {
-  local query="$1" encoded_query raw
-  encoded_query="$(jq -rn --arg q "$query" '$q|@uri' 2>/dev/null)"
-  [[ -z "$encoded_query" ]] && encoded_query="$(url_encode_fallback "$query")"
-  # Each result sits inside a <div class="w-gl__result" ...> wrapper
-  # containing both the w-gl__result-title link and the
-  # w-gl__description snippet — another self-contained per-result block.
-  raw="$(web_search_scrape_generic \
-    "startpage.com" \
-    "https://www.startpage.com/sp/search?query=${encoded_query}" \
-    '<div class="w-gl__result"' \
-    "" \
-    "w-gl__description" \
-    "")" || return 1
-  reformat_legacy_blocks "$raw"
-}
-
-# Dispatcher: DuckDuckGo's HTML POST endpoint first, falling through to
-# Bing then Startpage (both pure HTML scrapes, same as DDG — no JSON
-# anywhere in this chain) if it's blocked, rate-limited, or unreachable on
-# a given network. Stops at the first provider that returns real results,
-# so the caller never needs to know which one actually answered. If every
-# provider fails, WEB_SEARCH_LAST_ERROR is set to a combined summary of
-# why each one failed.
+# Dispatcher: SearXNG #1 -> #2 -> #3, falling through to DuckDuckGo Lite
+# only if all three are unreachable/blocked/unparsable. DDG Lite is
+# skipped outright while it's in cooldown (ddg_in_cooldown / the check
+# inside web_search_query_scrape_ddglite) rather than being retried. Stops
+# at the first provider that returns real results; if every provider
+# fails, WEB_SEARCH_LAST_ERROR is set to a combined summary of why.
 web_search_query() {
   local query="$1"
   local -a errs=()
+  local instance
 
-  if web_search_query_ddg_html "$query"; then
+  for instance in "${SEARXNG_INSTANCES[@]}"; do
+    if web_search_query_searxng "$instance" "$query"; then
+      return 0
+    fi
+    errs+=("${WEB_SEARCH_LAST_ERROR:-$instance: failed}")
+  done
+
+  if web_search_query_scrape_ddglite "$query"; then
     return 0
   fi
-  errs+=("${WEB_SEARCH_LAST_ERROR:-duckduckgo.com: failed}")
-
-  if web_search_query_scrape_bing "$query"; then
-    return 0
-  fi
-  errs+=("${WEB_SEARCH_LAST_ERROR:-bing.com: failed}")
-
-  if web_search_query_scrape_startpage "$query"; then
-    return 0
-  fi
-  errs+=("${WEB_SEARCH_LAST_ERROR:-startpage.com: failed}")
+  errs+=("${WEB_SEARCH_LAST_ERROR:-lite.duckduckgo.com: failed}")
 
   WEB_SEARCH_LAST_ERROR="all search providers failed — $(IFS='; '; echo "${errs[*]}")"
   return 1
@@ -2594,14 +2840,14 @@ handle_web_search_action() {
   box_top "WEB SEARCH" "$ICON_SEARCH" "$C_ACCENT2"
   box_line "$query"
 
-  results="$(web_search_query "$query")"
-  if [[ -z "$results" ]]; then
+  if ! web_search_query "$query"; then
     box_bottom "$C_ACCENT2"
     local reason="${WEB_SEARCH_LAST_ERROR:-unknown reason}"
     warn "Web search failed for \"$query\": $reason"
     AGENT_TOOL_OUTPUT+=$'\n\n'"[WEB_SEARCH \"$query\"]: no results ($reason). Tell the user real-time lookup didn't work rather than guessing an answer."
     return
   fi
+  results="$FORMAT_SEARCH_RESULT"
 
   printf '%s\n' "$results" | sed -n '1,15p' | while IFS= read -r pl; do box_line "$pl"; done
   box_bottom "$C_ACCENT2"
