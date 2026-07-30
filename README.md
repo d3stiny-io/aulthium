@@ -1,12 +1,12 @@
 <p align="center">
   <img
-    src="https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/assets/src/public/icon.png"
-    alt="Termix Agent"
+    src="assets/src/public/icon.png"
+    alt="Aulthium Logo"
     width="150"
   >
 </p>
 
-<h1 align="center">Termix Agent</h1>
+<h1 align="center">Aulthium</h1>
 
 <p align="center">
   <strong>Your AI coding agent, right inside your terminal.</strong>
@@ -18,14 +18,22 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/d3stiny-io/termix-agent/stargazers">
-    <img src="https://img.shields.io/github/stars/d3stiny-io/termix-agent?style=flat-square&color=yellow" alt="Stars">
+  <img
+    src="assets/src/public/banner.gif"
+    alt="Aulthium Banner"
+    width="850"
+  >
+</p>
+
+<p align="center">
+  <a href="https://github.com/d3stiny-io/aulthium/stargazers">
+    <img src="https://img.shields.io/github/stars/d3stiny-io/aulthium?style=flat-square&color=yellow" alt="Stars">
   </a>
-  <a href="https://github.com/d3stiny-io/termix-agent/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/d3stiny-io/termix-agent?style=flat-square&color=blue" alt="License">
+  <a href="https://github.com/d3stiny-io/aulthium/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/d3stiny-io/aulthium?style=flat-square&color=blue" alt="License">
   </a>
-  <a href="https://github.com/d3stiny-io/termix-agent/releases">
-    <img src="https://img.shields.io/github/v/release/d3stiny-io/termix-agent?style=flat-square&color=green" alt="Release">
+  <a href="https://github.com/d3stiny-io/aulthium/releases">
+    <img src="https://img.shields.io/github/v/release/d3stiny-io/aulthium?style=flat-square&color=green" alt="Release">
   </a>
 </p>
 
@@ -44,7 +52,7 @@ You already have a terminal.
 
 Now give it an AI.
 
-**Termix Agent** is a free, open-source AI coding assistant built to work directly from your terminal. Describe what you want in natural language and let the agent help you understand, create, edit, debug, and work with your code.
+**Aulthium** is a free, open-source AI coding assistant built to work directly from your terminal. Describe what you want in natural language and let the agent help you understand, create, edit, debug, and work with your code.
 
 It can also search the web for fresh information and use those search results when reasoning about your request.
 
@@ -60,29 +68,29 @@ Just your terminal, your API key, and an AI coding agent.
 
 ## 🚀 Quick Start
 
-Start Termix Agent with one command:
+Start Aulthium with one command:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/termix-agent.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/aulthium/main/aulthium.sh)
 ```
 
-The script starts **Termix Agent directly**.
+The script starts **Aulthium directly**.
 
 There is no separate installation step or launcher command required for this startup method.
 
 ### 🔌 Choose Your Provider
 
-When Termix Agent starts, it gives you the available AI provider choices supported by the current version.
+When Aulthium starts, it gives you the available AI provider choices supported by the current version.
 
 Choose the provider you want to use, provide the required configuration, and continue.
 
 The basic flow is:
 
 ```text
-Run termix-agent.sh
+Run aulthium.sh
         │
         ▼
-Termix Agent starts
+Aulthium starts
         │
         ▼
 Choose AI provider
@@ -105,7 +113,7 @@ Chat with your coding agent
 
 You don't need to memorize commands for every task.
 
-Just tell Termix Agent what you want.
+Just tell Aulthium what you want.
 
 ### 💻 Build
 
@@ -127,7 +135,7 @@ Just tell Termix Agent what you want.
 
 > Search the web for the latest documentation about this error.
 
-Termix Agent can use the information it finds on the web as additional context while working on your request.
+Aulthium can use the information it finds on the web as additional context while working on your request.
 
 ---
 
@@ -143,6 +151,7 @@ Termix Agent can use the information it finds on the web as additional context w
 | 🔍 **Real-Time Web Search** | Search the web for current technical information and documentation. |
 | 🧠 **Web-Aware Reasoning** | Use web-search results as context while reasoning about your task. |
 | 🔌 **Bring Your Own Provider** | Choose your supported AI provider and use your own API key. |
+| 🔗 **HTTPS MCP Support** | Connect to MCP servers through HTTPS and give Aulthium access to additional tools and services. |
 | 📜 **Bash-Based** | The core agent is distributed as a portable Bash script. |
 | 🛡️ **Human-in-the-Loop** | Actions requiring execution are presented for your approval. |
 | 🔒 **Zero Telemetry** | No built-in proprietary tracking or analytics. |
@@ -164,7 +173,7 @@ Frameworks change.
 
 Errors change.
 
-**Termix Agent can search the web when it needs fresh information.**
+**Aulthium can search the web when it needs fresh information.**
 
 You can ask it things like:
 
@@ -188,18 +197,46 @@ Useful for:
 
 ---
 
+## 🔗 MCP Support
+
+Aulthium now has **MCP (Model Context Protocol) support over HTTPS**.
+
+This allows Aulthium to connect to compatible MCP servers through HTTPS and use the tools they expose, extending what the agent can do beyond its built-in capabilities.
+
+With MCP, Aulthium can work with external tools and services through supported HTTPS MCP endpoints.
+
+### 🌐 HTTPS-Only MCP
+
+The current implementation focuses on **HTTPS-based MCP connections**.
+
+It does not yet provide full MCP support across every transport or use case, but the current implementation is already working well and is actively being improved.
+
+> 🧪 **MCP support is currently experimental.** Some features may still have bugs or limitations.
+
+Current focus:
+
+- 🔗 Connect to MCP servers through HTTPS
+- 🧰 Discover and use supported MCP tools
+- 🧠 Allow the AI to reason with tool results
+- 🌐 Extend Aulthium with external services
+- 🛠️ Continue improving compatibility and reliability
+
+As MCP support matures, more capabilities and transports may be added.
+
+---
+
 ## 🛡️ You Stay in Control
 
-Termix Agent is designed around **human-in-the-loop execution**.
+Aulthium is designed around **human-in-the-loop execution**.
 
 The AI can figure out what it thinks should happen, but actions that affect your environment are not something you should blindly trust.
 
-When Termix needs to execute a command, you can review it before allowing it to run.
+When Aulthium needs to execute a command, you can review it before allowing it to run.
 
 For example:
 
 ```text
-Termix wants to run:
+Aulthium wants to run:
 
 npm install express
 
@@ -216,7 +253,7 @@ Always review commands and file changes before approving them, especially when w
 
 ## 🔌 Bring Your Own AI Provider
 
-Termix Agent is built around the idea that **you should choose how your AI is powered**.
+Aulthium is built around the idea that **you should choose how your AI is powered**.
 
 Depending on the current version, you can choose from supported providers such as:
 
@@ -230,13 +267,13 @@ Your provider is your choice.
 
 Your model selection is yours.
 
-Termix Agent doesn't require you to use one proprietary AI platform.
+Aulthium doesn't require you to use one proprietary AI platform.
 
 ---
 
 ## 📱 Terminal First
 
-Termix Agent is made for environments where a terminal is already available.
+Aulthium is made for environments where a terminal is already available.
 
 Supported environments include:
 
@@ -253,15 +290,17 @@ That makes it possible to use an AI coding assistant even when you're working fr
 The core project is centered around:
 
 ```text
-termix-agent.sh
+aulthium.sh
 ```
 
-The goal is to keep Termix Agent straightforward and portable rather than turning it into a large desktop application.
+The goal is to keep Aulthium straightforward and portable rather than turning it into a large desktop application.
+
+Despite its lightweight Bash-based core, Aulthium is growing beyond basic terminal automation with features such as web search and HTTPS-based MCP support.
 
 You can start it directly with:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/termix-agent/main/termix-agent.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/aulthium/main/aulthium.sh)
 ```
 
 Minimal setup.
@@ -272,15 +311,16 @@ Open source.
 
 ---
 
-## 🆚 Why Termix Agent?
+## 🆚 Why Aulthium?
 
-| | Termix Agent | Traditional Tools |
+| | Aulthium | Traditional Tools |
 | :--- | :--- | :--- |
 | 💰 **Cost** | Free software + your provider's API costs | May require subscriptions |
 | 🔌 **AI Provider** | Bring your own | Often tied to a platform |
 | 🖥️ **Interface** | Terminal | Often desktop / IDE focused |
 | 📦 **Startup** | One command | Can require more setup |
 | 🌐 **Web Search** | Built into the agent | Depends on the tool |
+| 🔗 **MCP** | HTTPS-based MCP support | Depends on the tool |
 | 🔓 **Source** | Open source | Often proprietary |
 | 🛡️ **Control** | User approval for actions | Depends on the tool |
 | 📱 **Termux** | Supported | Often unavailable |
@@ -292,20 +332,23 @@ Open source.
 
 > **Built with vision. Powered by AI. Improved by humans.**
 
-Full disclosure: Termix Agent is a vibe-coded project.
+Full disclosure: Aulthium is a vibe-coded project.
 
 The creator does not manually write every line of raw syntax. The project is driven by product vision, experimentation, constraints, user experience, and safety requirements, while LLMs generate much of the implementation.
 
-That makes Termix Agent an experiment in AI-assisted software development itself.
+That makes Aulthium an experiment in AI-assisted software development itself.
 
 And because of that, the code may not always be perfect.
+
+The project is actively evolving, especially as newer capabilities such as HTTPS MCP support are being integrated.
 
 You might find:
 
 - Unoptimized logic
 - Strange edge cases
-- Code that could be cleaner
+- Features that need refinement
 - Bugs that need fixing
+- Experimental functionality that may behave unexpectedly
 
 That's part of the experiment.
 
@@ -317,21 +360,31 @@ Open an issue.
 
 Submit a pull request.
 
-Help make Termix Agent better.
+Help make Aulthium better.
+
+---
+
+## 🧪 Current Status
+
+Aulthium is **actively evolving**.
+
+Core agent functionality is working, while newer features such as **HTTPS MCP support** are still being refined. MCP is already greatly functional, but it is **not completely bug-free yet**.
+
+If you use experimental features, keep that in mind and report anything that behaves unexpectedly.
 
 ---
 
 ## 🤝 Contributing
 
-Termix Agent is open source and contributions are welcome.
+Aulthium is open source and contributions are welcome.
 
 Found a bug?
 
-👉 [Open an issue](https://github.com/d3stiny-io/termix-agent/issues)
+👉 [Open an issue](https://github.com/d3stiny-io/aulthium/issues)
 
 Have an improvement?
 
-👉 [Submit a pull request](https://github.com/d3stiny-io/termix-agent/pulls)
+👉 [Submit a pull request](https://github.com/d3stiny-io/aulthium/pulls)
 
 Have an idea?
 
@@ -351,10 +404,16 @@ Have an idea?
 
 ## 📄 License
 
-Termix Agent is licensed under the **GPL-3.0 License**.
+Aulthium is licensed under the **GPL-3.0 License**.
 
-See the [LICENSE](https://github.com/d3stiny-io/termix-agent/blob/main/LICENSE) file for the complete license text.
+See the [LICENSE](https://github.com/d3stiny-io/aulthium/blob/main/LICENSE) file for the complete license text.
 
 ---
 
-If Termix Agent is useful to you, consider giving it a star. ⭐
+<p align="center">
+  <strong>Built with vision. Powered by AI. Improved by humans.</strong>
+</p>
+
+<p align="center">
+  If Aulthium is useful to you, consider giving it a star. ⭐
+</p>
