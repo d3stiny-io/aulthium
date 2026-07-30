@@ -2,7 +2,7 @@
   <img
     src="assets/src/public/icon.png"
     alt="Aulthium Logo"
-    width="150"
+    width="250"
   >
 </p>
 
@@ -17,13 +17,6 @@
   <strong>You stay in control.</strong>
 </p>
 
-<p align="center">
-  <img
-    src="assets/src/public/banner.gif"
-    alt="Aulthium Banner"
-    width="850"
-  >
-</p>
 
 <p align="center">
   <a href="https://github.com/d3stiny-io/aulthium/stargazers">
@@ -36,6 +29,15 @@
     <img src="https://img.shields.io/github/v/release/d3stiny-io/aulthium?style=flat-square&color=green" alt="Release">
   </a>
 </p>
+
+<p align="center">
+  <img
+    src="assets/src/public/banner.gif"
+    alt="Aulthium Banner"
+    width="420"
+  >
+</p>
+
 
 <p align="center">
   <a href="#-quick-start">Quick Start</a> •
