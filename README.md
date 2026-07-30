@@ -2,7 +2,7 @@
   <img
     src="assets/src/public/icon.png"
     alt="Aulthium Logo"
-    width="250"
+    width="240"
   >
 </p>
 
@@ -42,7 +42,7 @@
 <p align="center">
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-features">Features</a> •
-  <a href="#-web-search">Web Search</a> •
+  <a href="#-real-time-web-search">Web Search</a> •
   <a href="#-contributing">Contributing</a>
 </p>
 
