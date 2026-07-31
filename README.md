@@ -238,11 +238,13 @@ When Aulthium needs to execute a command, you can review it before allowing it t
 For example:
 
 ```text
-Aulthium wants to run:
+Aulthium> ❯ shell command
 
-npm install express
 
-Continue? [y/N]
+┌─ ❯ SHELL RUN ────────────────────────────────────────────────                                             │ cwd: /storage/emulated/0/Download/aulthium-workspace
+│ npm install express
+└────────────────────────────────────────────────     ⚠ This is NOT sandboxed to the workspace folder — it runs with your normal shell privileges.
+? Run this command? [y/N] 
 ```
 
 You decide whether to continue.
