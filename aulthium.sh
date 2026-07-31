@@ -7,7 +7,7 @@ set -u
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="AULTHIUM"
-APP_VERSION="v1.0.0"
+APP_VERSION="v1.0.2"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
@@ -88,6 +88,15 @@ CURRENT_MODEL_LABEL="$DEFAULT_MODEL"
 # Sandbox directory the agent is allowed to create/edit/delete files in.
 # Every file action is confined to this folder — nothing outside it is ever touched.
 WORKSPACE_DIR=""
+
+# Global on/off switch for the y/N confirmation blocker in front of every
+# file-changing action, shell command, and MCP tool call. Defaults ON (1 =
+# ask first) since that's the safe behavior; 't> confirm off' flips this to
+# 0, at which point confirm_yes_no auto-approves everything instantly
+# instead of prompting. The action is still always PRINTED to the screen
+# either way — this only removes the "do you want to proceed?" gate, not
+# the visibility.
+SKIP_CONFIRMATIONS=0
 
 # In-memory conversation history only.
 # We keep the system prompt in the history from the start.
@@ -458,6 +467,9 @@ status_panel() {
   if [[ -n "$MEMORY_FILE" ]]; then
     printf "${C_MUTED}│${C_RESET} %-10s %s\n" "memory" "connected — $MEMORY_FILE"
   fi
+  if [[ "$SKIP_CONFIRMATIONS" -eq 1 ]]; then
+    printf "${C_MUTED}│${C_RESET} %-10s ${C_WARN}%s${C_RESET}\n" "confirm" "OFF — actions auto-run, no y/N asked (t> confirm on to re-enable)"
+  fi
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}Type ${C_RESET}t> help${C_MUTED} for commands · ${C_RESET}Ctrl+C${C_MUTED} to exit${C_RESET}\n"
   printf "${C_MUTED}While waiting on a reply: ${C_RESET}Ctrl+T${C_MUTED} cancel thinking · ${C_RESET}Ctrl+S${C_MUTED} stop prompt${C_RESET}\n\n"
@@ -590,6 +602,67 @@ confirm_yes_no() {
   local prompt="$1" ans
   read -r -p "$(printf "${C_ACCENT2}?${C_RESET} %s ${C_MUTED}[y/N]${C_RESET} " "$prompt")" ans || ans="n"
   [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# Confirmation gate specifically for agent-PROPOSED actions (file writes,
+# edits, deletes, folder create/delete, shell commands, MCP tool calls) —
+# as opposed to one-off setup/config prompts (create workspace dir?, load
+# this memory file?, switch model/provider?), which always use plain
+# confirm_yes_no above and always ask regardless of this setting. Honors
+# the 't> confirm off' toggle: the action is still always printed to the
+# screen either way, this only decides whether the "do you want to
+# proceed?" gate actually waits for a y/N or auto-approves instantly.
+confirm_action() {
+  local prompt="$1"
+  if [[ "$SKIP_CONFIRMATIONS" -eq 1 ]]; then
+    printf "${C_ACCENT2}?${C_RESET} %s ${C_WARN}[auto-yes, confirmations off]${C_RESET}\n" "$prompt"
+    return 0
+  fi
+  confirm_yes_no "$prompt"
+}
+
+# 't> confirm' with no argument — reports the current state.
+confirm_status() {
+  if [[ "$SKIP_CONFIRMATIONS" -eq 1 ]]; then
+    warn "Confirmations are OFF — file writes/edits/deletes, folder actions, shell"
+    warn "commands, and MCP tool calls all run immediately without asking first."
+    muted "Run 't> confirm on' to turn the y/N blocker back on."
+  else
+    ok "Confirmations are ON — every file/folder/shell/MCP action asks for a y/N first."
+    muted "Run 't> confirm off' to disable it (not recommended)."
+  fi
+}
+
+# 't> confirm on' — always safe, no extra prompt needed to turn safety back on.
+enable_confirmations() {
+  if [[ "$SKIP_CONFIRMATIONS" -eq 0 ]]; then
+    muted "Confirmations are already on."
+    return 0
+  fi
+  SKIP_CONFIRMATIONS=0
+  ok "Confirmations enabled — every action will ask for a y/N before running."
+}
+
+# 't> confirm off' — requires an explicit extra confirmation of its own
+# (via plain confirm_yes_no, which always asks regardless of this setting)
+# since this is the one toggle that removes every other safety gate at once.
+disable_confirmations() {
+  if [[ "$SKIP_CONFIRMATIONS" -eq 1 ]]; then
+    muted "Confirmations are already off."
+    return 0
+  fi
+  echo
+  warn "This turns OFF the y/N blocker for EVERY agent action: file writes, edits,"
+  warn "deletes, folder creates/deletes, shell commands, and MCP tool calls will all"
+  warn "run immediately, with no chance to review or decline first."
+  muted "Everything the agent does is still shown on screen — this only removes the gate."
+  if confirm_yes_no "Are you sure you want to disable confirmations?"; then
+    SKIP_CONFIRMATIONS=1
+    ok "Confirmations disabled. Actions will now run automatically."
+    muted "Run 't> confirm on' anytime to turn the blocker back on."
+  else
+    muted "Cancelled — confirmations remain on."
+  fi
 }
 
 # Refuses any workspace directory that IS or lives inside a critical system path.
@@ -948,6 +1021,9 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory" "show whether a history file is connected"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory connect <p>" "connect/reconnect a history file (load or start it)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory disconnect" "stop appending turns to the connected file"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm" "show whether the y/N action blocker is on or off"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm on" "require y/N before every file/shell/MCP action (default)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm off" "auto-approve every action instantly (no more asking)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> clear" "clear the terminal"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> reset" "start a new conversation"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> history" "show chat history"
@@ -1772,7 +1848,7 @@ handle_write_action() {
   sed -n '1,40p' "$content_file" | while IFS= read -r pl; do box_line "$pl"; done
   box_bottom "$C_WARN"
 
-  if confirm_yes_no "Apply this write?"; then
+  if confirm_action "Apply this write?"; then
     mkdir -p "$parent_dir" 2>/dev/null
     if cp "$content_file" "$abs"; then
       ok "Wrote $abs"
@@ -1804,7 +1880,14 @@ handle_edit_action() {
     return
   fi
 
-  total="$(wc -l < "$abs" | tr -d ' ')"
+  # NOTE: intentionally NOT `wc -l` here. wc -l counts newline characters,
+  # so a file whose last line has no trailing newline (extremely common —
+  # most source files, JSON, hand-edited configs) gets undercounted by one.
+  # FILE_READ numbers lines with `nl`, which counts the final unterminated
+  # line correctly, so a wc-l-based total here would silently reject any
+  # edit/delete/insert touching that last line as "out of range" even
+  # though the model just saw it listed. grep -c '' matches nl's counting.
+  total="$(grep -c '' "$abs" 2>/dev/null | tr -d ' ')"
 
   if [[ "$op" == "insert" ]]; then
     if ! [[ "$start" =~ ^[0-9]+$ ]] || (( start < 0 || start > total )); then
@@ -1858,7 +1941,7 @@ handle_edit_action() {
       ;;
   esac
 
-  if confirm_yes_no "Apply this edit?"; then
+  if confirm_action "Apply this edit?"; then
     if cp "$tmpfile" "$abs"; then
       ok "Edited $abs"
     else
@@ -1888,7 +1971,7 @@ handle_folder_create_action() {
   box_line "$abs"
   box_bottom "$C_WARN"
 
-  if confirm_yes_no "Create this folder?"; then
+  if confirm_action "Create this folder?"; then
     if mkdir -p "$abs"; then
       ok "Created $abs"
     else
@@ -1918,7 +2001,7 @@ handle_delete_action() {
   box_line "$abs"
   box_bottom "$C_ERR"
 
-  if confirm_yes_no "Delete this file?"; then
+  if confirm_action "Delete this file?"; then
     if rm -f "$abs"; then
       ok "Deleted $abs"
     else
@@ -1959,7 +2042,7 @@ handle_folder_delete_action() {
   box_bottom "$C_ERR"
   warn "This deletes the folder AND everything inside it — this cannot be undone."
 
-  if confirm_yes_no "Delete this folder and everything inside it?"; then
+  if confirm_action "Delete this folder and everything inside it?"; then
     if rm -rf "$abs"; then
       ok "Deleted $abs"
     else
@@ -2003,7 +2086,7 @@ handle_bulk_write_action() {
   done
   box_bottom "$C_WARN"
 
-  if confirm_yes_no "Apply all $n write(s)?"; then
+  if confirm_action "Apply all $n write(s)?"; then
     local wrote=0 failed=0
     for i in "${!_bw_paths[@]}"; do
       abs="${abs_list[$i]}"
@@ -2050,7 +2133,7 @@ handle_bulk_folder_create_action() {
   done
   box_bottom "$C_WARN"
 
-  if confirm_yes_no "Create all $n folder(s)?"; then
+  if confirm_action "Create all $n folder(s)?"; then
     for i in "${!_bfc_paths[@]}"; do
       abs="${abs_list[$i]}"
       [[ -z "$abs" ]] && continue
@@ -2112,7 +2195,7 @@ handle_bulk_delete_action() {
   box_bottom "$C_ERR"
   warn "This permanently deletes every item listed above — this cannot be undone."
 
-  if confirm_yes_no "Delete all $n item(s)?"; then
+  if confirm_action "Delete all $n item(s)?"; then
     for i in "${!_bd_paths[@]}"; do
       abs="${abs_list[$i]}"
       [[ -z "$abs" ]] && continue
@@ -2145,7 +2228,7 @@ cap_preview() {
   out="$(printf '%s' "$input" | head -c "$MAX_PREVIEW_BYTES")"
   out="$(printf '%s' "$out" | head -n "$MAX_PREVIEW_LINES")"
   bytes="${#input}"
-  lines="$(printf '%s' "$input" | wc -l | tr -d ' ')"
+  lines="$(printf '%s' "$input" | grep -c '' | tr -d ' ')"
   printf '%s' "$out"
   if (( bytes > ${#out} )); then
     printf '\n[...truncated, %s bytes / %s lines total...]' "$bytes" "$lines"
@@ -3558,7 +3641,7 @@ handle_mcp_call_action() {
   box_bottom "$C_ACCENT2"
   warn "This calls out to an external MCP server — this script has no idea what \"$tool\" actually does on the other end."
 
-  if ! confirm_yes_no "Call $server.$tool?"; then
+  if ! confirm_action "Call $server.$tool?"; then
     warn "Skipped MCP call."
     AGENT_TOOL_OUTPUT+=$'\n\n'"[MCP_CALL $server.$tool]: user declined to run this call."
     return
@@ -3642,7 +3725,7 @@ handle_shell_run_action() {
   box_bottom "$C_ERR"
   warn "This is NOT sandboxed to the workspace folder — it runs with your normal shell privileges."
 
-  if ! confirm_yes_no "Run this command?"; then
+  if ! confirm_action "Run this command?"; then
     warn "Skipped shell command."
     AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN]: user declined to run this command."
     return
@@ -4823,6 +4906,18 @@ command_router() {
     memory\ *)
       warn "Unknown memory subcommand. Usage: t> memory [connect <file_path> | disconnect]"
       ;;
+    confirm)
+      confirm_status
+      ;;
+    confirm\ on)
+      enable_confirmations
+      ;;
+    confirm\ off)
+      disable_confirmations
+      ;;
+    confirm\ *)
+      warn "Unknown confirm subcommand. Usage: t> confirm [on | off]"
+      ;;
     clear)
       run_clear_screen
       ;;
@@ -4845,9 +4940,18 @@ command_router() {
 main() {
   check_deps
   setup_tty_for_cancel
+
+  clear
   banner
   pick_provider_startup
   ask_api_key
+
+  # Provider + key setup is done — wipe the "choose a provider" wizard off
+  # the screen (same effect as 't> clear') before moving on to the rest of
+  # startup, so what's left on screen from here reads as one clean session
+  # rather than the tail end of a multi-step prompt.
+  clear
+  banner
 
   if ! init_workspace_auto; then
     err "Could not set up a sandbox workspace. Exiting."
