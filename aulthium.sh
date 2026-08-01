@@ -7,7 +7,7 @@ set -u
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="AULTHIUM"
-APP_VERSION="v1.0.2"
+APP_VERSION="v1.0.3"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
@@ -198,12 +198,46 @@ want an empty folder with no file in it yet. FOLDER_DELETE removes the folder an
 recursively — only propose it when you actually mean to delete everything inside that folder, and the user
 must explicitly confirm it just like every other file-changing action.
 
+To move or rename a file, output a line EXACTLY like this:
+<<<FILE_MOVE path="relative/old/path.txt" to="relative/new/path.txt">>>
+
+To move or rename a folder (and everything inside it), output a line EXACTLY like this:
+<<<FOLDER_MOVE path="relative/old/folder" to="relative/new/folder">>>
+
+A rename is just a move to a new name in the same parent folder — use FILE_MOVE/FOLDER_MOVE for both; there is
+no separate "rename" marker. Both "path" and "to" are relative paths inside the sandbox, same rules as every
+other marker. Missing parent folders in the destination are created automatically. If "to" is an existing
+folder, the item is dropped inside it under its own name (same as the Unix \`mv\` command) — you do not need to
+spell out the final filename yourself when moving something into a folder that already exists. Moving a folder
+inside itself or its own subfolder is always refused, no matter what.
+
+If "to" resolves to something that already exists (not counting the "move into an existing folder" case
+above), add an optional conflict= attribute to say how to handle it — conflict="overwrite" replaces it,
+conflict="rename" picks a free name like "name (1).txt" automatically, and conflict="skip" (the default when
+conflict= is omitted) leaves it untouched and skips that move. Example:
+<<<FILE_MOVE path="draft.txt" to="final/draft.txt" conflict="rename">>>
+
+To zip up one or more existing sandboxed files/folders into a new archive, output a block EXACTLY like
+this — one relative source path per line:
+<<<ZIP_CREATE path="relative/archive.zip">>>
+relative/source/file-or-folder-one
+relative/source/file-or-folder-two
+<<<END_ZIP_CREATE>>>
+If the archive path already exists it is overwritten (the confirmation prompt says so).
+
+To extract every entry of a sandboxed archive into a sandboxed destination folder, output a line EXACTLY
+like this:
+<<<ZIP_EXTRACT path="relative/archive.zip" to="relative/destination">>>
+Add conflict="overwrite" to replace files that already exist at the destination; the default,
+conflict="skip", leaves any existing file untouched and only extracts entries that don't already exist there.
+
 === BULK FILE/FOLDER OPERATIONS (scaffolding, cleanup — one confirmation for the whole batch) ===
 
-FILE_WRITE / FOLDER_CREATE / FILE_DELETE / FOLDER_DELETE each get their own individual yes/no prompt. That's
-fine for a single change, but for anything creating, writing, or deleting THREE OR MORE files/folders in one
-go (scaffolding a new project, generating a batch of related files, cleaning up a set of old ones), use the
-bulk form instead — the user reviews and approves the whole batch in one prompt instead of one per item.
+FILE_WRITE / FOLDER_CREATE / FILE_DELETE / FOLDER_DELETE / FILE_MOVE / FOLDER_MOVE each get their own
+individual yes/no prompt. That's fine for a single change, but for anything creating, writing, deleting, or
+moving THREE OR MORE files/folders in one go (scaffolding a new project, generating a batch of related files,
+cleaning up or reorganizing a set of old ones), use the bulk form instead — the user reviews and approves the
+whole batch in one prompt instead of one per item.
 
 To create or overwrite several files at once, output a block EXACTLY like this:
 <<<BULK_WRITE>>>
@@ -233,9 +267,19 @@ relative/path/to/old-file.txt
 relative/path/to/old-folder
 <<<END_BULK_DELETE>>>
 
-For one or two items, still prefer the single-item FILE_WRITE/FOLDER_CREATE/FILE_DELETE/FOLDER_DELETE markers
-— bulk markers exist to save the user from a wall of repeated prompts on a real batch, not to be used for
-every change by default.
+To move or rename several files and/or folders at once, output a block EXACTLY like this — one ITEM line per
+entry, and unlike BULK_DELETE you DO need to say whether each one is a "file" or "folder" via kind=. The same
+"move into an existing folder" behavior and optional conflict= attribute (overwrite/skip/rename, default
+skip) from FILE_MOVE/FOLDER_MOVE apply to each item here too:
+<<<BULK_MOVE>>>
+<<<ITEM path="relative/old/one.txt" to="relative/new/one.txt" kind="file">>>
+<<<ITEM path="relative/old-folder" to="relative/new-folder" kind="folder">>>
+<<<ITEM path="relative/old/two.txt" to="relative/new/two.txt" kind="file" conflict="overwrite">>>
+<<<END_BULK_MOVE>>>
+
+For one or two items, still prefer the single-item FILE_WRITE/FOLDER_CREATE/FILE_DELETE/FOLDER_DELETE/
+FILE_MOVE/FOLDER_MOVE markers — bulk markers exist to save the user from a wall of repeated prompts on a real
+batch, not to be used for every change by default.
 
 === RUNNING SHELL COMMANDS (shown to the user, requires explicit yes/no confirmation) ===
 
@@ -252,12 +296,33 @@ Prefer FILE_READ / FILE_WRITE / DIR_LIST for simple file inspection or edits; re
 actually need to execute something (e.g. running a build, a script, git, or a CLI tool). Output from the
 command (stdout/stderr, possibly truncated) is sent back to you the same way as the reading markers above.
 
+=== NETWORK REQUESTS (shown to the user, requires explicit yes/no confirmation) ===
+
+To send an HTTP GET request and see the response, output a line EXACTLY like this:
+<<<NET_GET url="https://example.com/api/thing">>>
+
+To send an HTTP POST request with a body, output a block EXACTLY like this (content_type= is optional,
+defaults to application/json):
+<<<NET_POST url="https://example.com/api/thing" content_type="application/json">>>
+the request body goes here
+<<<END_NET_POST>>>
+
+To download a URL's content straight into a sandboxed file, output a line EXACTLY like this:
+<<<NET_DOWNLOAD url="https://example.com/file.zip" path="relative/save/path.zip">>>
+
+All three reach the real internet, not just the sandbox, so treat them like SHELL_RUN: only propose a request
+you're confident is safe and relevant, and expect the user to review the exact URL (and body, for POST) before
+approving it. Responses are truncated if very large, and NET_DOWNLOAD refuses anything over 100MB. Use
+WEB_SEARCH instead of NET_GET when you just need to find information — reach for NET_GET/NET_POST when you
+already know the specific URL/API endpoint to call, and NET_DOWNLOAD only when you want the raw response saved
+as a file rather than read back to you as text.
+
 === TOOL USE POLICY (avoid wasting actions) ===
 
 You get a limited number of action rounds per user message ($MAX_AGENT_ROUNDS) before you're cut off and
 asked to wrap up, so spend them deliberately:
-- Never call a read/inspect marker (FILE_READ, DIR_LIST, ZIP_LIST, ZIP_READ, WEB_SEARCH) for something already
-  shown earlier in this same conversation — check what you already know before asking again.
+- Never call a read/inspect marker (FILE_READ, DIR_LIST, ZIP_LIST, ZIP_READ, WEB_SEARCH, NET_GET) for something
+  already shown earlier in this same conversation — check what you already know before asking again.
 - Only inspect something when the answer or action genuinely depends on it. Don't DIR_LIST or FILE_READ
   "just to be safe" when the user's request doesn't hinge on the current state of that path. Only WEB_SEARCH
   when the answer genuinely depends on current/real-time information — not for things you already know.
@@ -350,9 +415,12 @@ ICON_WRITE="✎"    # writing/overwriting a file
 ICON_EDIT="✐"     # editing specific lines of a file
 ICON_DELETE="✕"   # deleting a file
 ICON_FOLDER="+"   # creating a folder
+ICON_MOVE="⇒"     # moving/renaming a file or folder
 ICON_SHELL="❯"    # running a shell command
 ICON_SEARCH="⌕"   # web search
 ICON_MCP="⚡"      # MCP server tool call
+ICON_NET="↯"      # HTTP request / download
+ICON_UNDO="↺"     # undo/redo
 ICON_OK="✓"
 ICON_WARN="⚠"
 ICON_ERR="✗"
@@ -485,21 +553,26 @@ run_clear_screen() {
   status_panel
 }
 
-# Finalizes a confirmed model switch: sets CURRENT_MODEL/LABEL, announces
-# it, then runs the same clear-screen-and-reprint-status flow as 't> clear'.
-# Called from every model-picking path (tier picker, fuzzy search, direct
-# name, Google model picker, custom-provider free-text entry) so the
-# post-switch behavior is identical no matter how the model was chosen.
+# Finalizes a confirmed model switch: runs the same clear-screen-and-
+# reprint-status flow as 't> clear' FIRST, then announces the switch on
+# the now-clean screen — so the confirmation is the last thing printed and
+# actually stays visible, instead of being wiped by the clear that used to
+# come after it. Called from every model-picking path (tier picker, fuzzy
+# search, direct name, Google model picker, custom-provider free-text
+# entry) so the post-switch behavior is identical no matter how the model
+# was chosen.
 apply_model_switch() {
   CURRENT_MODEL="$1"
   CURRENT_MODEL_LABEL="$CURRENT_MODEL"
-  ok "Switched to: $CURRENT_MODEL"
   run_clear_screen
+  ok "Switched to: $CURRENT_MODEL"
 }
 
 cleanup_exit() {
   stop_spinner
   restore_tty
+  rm -f "${OPENROUTER_MODELS_CACHE_FILE:-}"
+  [[ -n "${UNDO_DIR:-}" ]] && rm -rf "$UNDO_DIR" 2>/dev/null
   printf '\n'
   printf "${C_OK}%s${C_RESET}\n" "Aulthium has been closed." >&2
   exit 0
@@ -577,6 +650,8 @@ check_deps() {
 
   HAVE_UNZIP=1
   want_cmd unzip || HAVE_UNZIP=0
+  HAVE_ZIP=1
+  want_cmd zip || HAVE_ZIP=0
   HAVE_FILE=1
   want_cmd file || HAVE_FILE=0
   HAVE_TIMEOUT=1
@@ -824,7 +899,26 @@ MEMORY_FILE=""
 append_message() {
   local role="$1"
   local content="$2"
-  messages_json="$(jq -c --arg role "$role" --arg content "$content" '. + [{role:$role, content:$content}]' <<< "$messages_json")"
+  local obj
+
+  # Perf note: this used to be
+  #   jq -c '. + [{role:$role, content:$content}]' <<< "$messages_json"
+  # which re-parses AND re-serializes the *entire* growing conversation on
+  # every single append (assistant replies, tool-result turns, etc — several
+  # times per user message via run_agent_turns). That's O(n) work — plus an
+  # extra jq process fork and a here-string temp file — repeated on every
+  # call, so a long chat degrades quadratically and every round gets slower
+  # than the last. Since messages_json is always compact ("-c") JSON with no
+  # trailing whitespace, appending is just: encode the ONE new object (a
+  # small, constant-size jq call) and splice it in before the final "]"
+  # with plain string ops — no re-parsing of existing history at all.
+  obj="$(jq -nc --arg role "$role" --arg content "$content" '{role:$role, content:$content}')"
+  if [[ "$messages_json" == "[]" ]]; then
+    messages_json="[${obj}]"
+  else
+    messages_json="${messages_json%]},${obj}]"
+  fi
+
   memory_append_message_to_file "$role" "$content"
 }
 
@@ -1024,6 +1118,8 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm" "show whether the y/N action blocker is on or off"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm on" "require y/N before every file/shell/MCP action (default)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm off" "auto-approve every action instantly (no more asking)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> undo" "reverse the last file/folder/zip/network change"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> redo" "re-apply the last change you undid"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> clear" "clear the terminal"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> reset" "start a new conversation"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> history" "show chat history"
@@ -1052,11 +1148,15 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       are blocked or unreachable; also automatic, read-only, no\n"
   printf "${C_MUTED}│${C_RESET}       confirmation needed.\n"
   printf "${C_MUTED}│${C_RESET}\n"
-  printf "${C_MUTED}│${C_RESET} ${C_WARN}${ICON_WRITE} ${ICON_DELETE} ${ICON_FOLDER}${C_RESET}  write/overwrite a file, delete a single file,\n"
-  printf "${C_MUTED}│${C_RESET}       delete a folder (and everything inside it), or create\n"
-  printf "${C_MUTED}│${C_RESET}       an empty folder — every one of these is shown to you\n"
-  printf "${C_MUTED}│${C_RESET}       and needs a yes/no confirmation first. Nothing ever\n"
-  printf "${C_MUTED}│${C_RESET}       reaches outside the sandbox folder.\n"
+  printf "${C_MUTED}│${C_RESET} ${C_WARN}${ICON_WRITE} ${ICON_DELETE} ${ICON_FOLDER} ${ICON_MOVE} ${ICON_ZIP} ${ICON_NET}${C_RESET}  write/overwrite a file, delete a\n"
+  printf "${C_MUTED}│${C_RESET}       single file, delete a folder (and everything inside it),\n"
+  printf "${C_MUTED}│${C_RESET}       create an empty folder, move/rename a file or folder,\n"
+  printf "${C_MUTED}│${C_RESET}       zip/unzip an archive, or make a network request/download —\n"
+  printf "${C_MUTED}│${C_RESET}       every one of these is shown to you and needs a yes/no\n"
+  printf "${C_MUTED}│${C_RESET}       confirmation first. File/folder/zip/network-download\n"
+  printf "${C_MUTED}│${C_RESET}       changes can be undone with 't> undo' (redo with 't> redo').\n"
+  printf "${C_MUTED}│${C_RESET}       Network requests reach the real internet; everything else\n"
+  printf "${C_MUTED}│${C_RESET}       never touches anything outside the sandbox folder.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
   printf "\n${C_ACCENT2}┌─ SHELL AGENT ─────────────────────────────────${C_RESET}\n"
@@ -1107,42 +1207,64 @@ show_history() {
   done
 }
 
-fetch_free_models() {
-  # Returns a sorted list of free model IDs, one per line.
+# Raw-catalog cache shared by fetch_free_models/fetch_paid_models below, so
+# toggling between tiers in the model picker (free -> back -> paid -> back
+# -> free...) doesn't re-download the same multi-hundred-KB /models response
+# over and over inside one session. Short TTL — long enough to cover a user
+# bouncing between tiers a few times, short enough that a real 't> mcp
+# refresh'-style manual retry (or just waiting) still gets fresh data.
+OPENROUTER_MODELS_CACHE_FILE=""
+OPENROUTER_MODELS_CACHE_TIME=0
+OPENROUTER_MODELS_CACHE_TTL=120
+
+fetch_openrouter_models_raw() {
+  # Prints the path to a tmp file holding OpenRouter's raw /models JSON.
+  # Reuses the cached copy if it's still within TTL; caller must NOT delete
+  # the path it's given. Returns 1 (prints nothing) on fetch failure.
+  local now
+  now="$(date +%s)"
+
+  if [[ -n "$OPENROUTER_MODELS_CACHE_FILE" && -s "$OPENROUTER_MODELS_CACHE_FILE" \
+        && $(( now - OPENROUTER_MODELS_CACHE_TIME )) -lt "$OPENROUTER_MODELS_CACHE_TTL" ]]; then
+    printf '%s' "$OPENROUTER_MODELS_CACHE_FILE"
+    return 0
+  fi
+
   local tmp
   tmp="$(mktemp)"
-
   if ! curl -fsSL "$OPENROUTER_MODELS_URL" -o "$tmp" >/dev/null 2>&1; then
     rm -f "$tmp"
     return 1
   fi
+
+  rm -f "$OPENROUTER_MODELS_CACHE_FILE"
+  OPENROUTER_MODELS_CACHE_FILE="$tmp"
+  OPENROUTER_MODELS_CACHE_TIME="$now"
+  printf '%s' "$tmp"
+}
+
+fetch_free_models() {
+  # Returns a sorted list of free model IDs, one per line.
+  local tmp
+  tmp="$(fetch_openrouter_models_raw)" || return 1
 
   jq -r '
     .data[]
     | .id
     | select(endswith(":free"))
   ' "$tmp" 2>/dev/null | sort -u
-
-  rm -f "$tmp"
 }
 
 fetch_paid_models() {
   # Returns a sorted list of non-free (billed) model IDs, one per line.
   local tmp
-  tmp="$(mktemp)"
-
-  if ! curl -fsSL "$OPENROUTER_MODELS_URL" -o "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"
-    return 1
-  fi
+  tmp="$(fetch_openrouter_models_raw)" || return 1
 
   jq -r '
     .data[]
     | .id
     | select(endswith(":free") | not)
   ' "$tmp" 2>/dev/null | sort -u
-
-  rm -f "$tmp"
 }
 
 fetch_google_models() {
@@ -1528,6 +1650,9 @@ pick_model_from_tier() {
         ;;
       refresh|REFRESH)
         rm -f "$models_tmp" "$selection_tmp"
+        rm -f "$OPENROUTER_MODELS_CACHE_FILE"
+        OPENROUTER_MODELS_CACHE_FILE=""
+        OPENROUTER_MODELS_CACHE_TIME=0
         pick_model_from_tier "$tier"
         return $?
         ;;
@@ -1826,6 +1951,204 @@ set_model_by_name_google() {
   return 1
 }
 
+# ── Undo / Redo journal ─────────────────────────────────────────────────
+# Session-only, snapshot-based undo covering every action that changes the
+# sandbox: FILE_WRITE/FILE_EDIT/FILE_DELETE, FOLDER_CREATE/FOLDER_DELETE,
+# FILE_MOVE/FOLDER_MOVE, all BULK_* variants, ZIP_EXTRACT, and NET_DOWNLOAD.
+# Not available for SHELL_RUN or MCP_CALL — those can have arbitrary side
+# effects outside the sandbox that nothing here could snapshot or reverse.
+#
+# Model: two parallel stacks (undo/redo). Each entry is one changed path,
+# described as kind + two fields:
+#   file/dir — a = absolute path, b = snapshot to restore ("" means the
+#              path didn't exist before, so undo/redo just removes it)
+#   move     — a = where the item currently is, b = where to move it back to
+# A single logical action (one marker, or one whole BULK_*/ZIP_EXTRACT
+# block) is wrapped in undo_group_begin/undo_group_end so all its entries
+# share one group id — one 't> undo' reverts the whole batch together.
+# Undo and redo are the same operation aimed at opposite stacks: applying
+# an entry first snapshots whatever it's about to overwrite and pushes
+# THAT as the inverse onto the other stack, so flipping back and forth
+# never loses information.
+UNDO_DIR=""
+UNDO_SNAP_SEQ=0
+UNDO_GROUP_SEQ=0
+CURRENT_UNDO_GROUP=""
+declare -a UNDO_KIND=() UNDO_A=() UNDO_B=() UNDO_LABEL=() UNDO_GROUP=()
+declare -a REDO_KIND=() REDO_A=() REDO_B=() REDO_LABEL=() REDO_GROUP=()
+
+init_undo_dir() {
+  [[ -n "$UNDO_DIR" && -d "$UNDO_DIR" ]] && return 0
+  UNDO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aulthium_undo.XXXXXX" 2>/dev/null)" || UNDO_DIR=""
+}
+
+undo_new_snapshot_path() {
+  init_undo_dir
+  UNDO_SNAP_SEQ=$((UNDO_SNAP_SEQ + 1))
+  printf '%s/snap_%s' "$UNDO_DIR" "$UNDO_SNAP_SEQ"
+}
+
+# Snapshots whatever currently exists at $1 (file, dir, or nothing) into
+# the undo store and prints "file:<path>" / "dir:<path>" / "file:" so the
+# caller can build an undo/redo entry from the result.
+_snapshot_path() {
+  local abs="$1" snap
+  if [[ -d "$abs" && ! -L "$abs" ]]; then
+    snap="$(undo_new_snapshot_path)"
+    mkdir -p "$snap"
+    cp -a "$abs" "$snap/payload" 2>/dev/null
+    printf 'dir:%s/payload' "$snap"
+  elif [[ -e "$abs" ]]; then
+    snap="$(undo_new_snapshot_path)"
+    cp -a "$abs" "$snap" 2>/dev/null
+    printf 'file:%s' "$snap"
+  else
+    printf 'file:'
+  fi
+}
+
+# Starts a new undo group. Call once before a logical action that may push
+# several undo entries (a single marker, or one BULK_*/ZIP_EXTRACT block).
+# Clears the redo stack, since taking a new action invalidates whatever
+# used to be "ahead" of it — standard undo/redo behavior.
+undo_group_begin() {
+  UNDO_GROUP_SEQ=$((UNDO_GROUP_SEQ + 1))
+  CURRENT_UNDO_GROUP="g$UNDO_GROUP_SEQ"
+  REDO_KIND=(); REDO_A=(); REDO_B=(); REDO_LABEL=(); REDO_GROUP=()
+}
+
+undo_group_end() {
+  CURRENT_UNDO_GROUP=""
+}
+
+_stack_push() {
+  local -n _k="${1}_KIND" _a="${1}_A" _b="${1}_B" _l="${1}_LABEL" _g="${1}_GROUP"
+  _k+=("$2"); _a+=("$3"); _b+=("$4"); _l+=("$5"); _g+=("$6")
+}
+
+# push_undo kind a b label — records one entry in the CURRENT group. A
+# no-op outside of undo_group_begin/end (so code paths that shouldn't be
+# undoable, or run before init, never silently corrupt the journal).
+push_undo() {
+  [[ -z "$CURRENT_UNDO_GROUP" ]] && return 0
+  _stack_push "UNDO" "$1" "$2" "$3" "$4" "$CURRENT_UNDO_GROUP"
+}
+
+# Snapshots the CURRENT state of $1 and records an undo entry that would
+# restore exactly that state. Call this BEFORE mutating $1 (write, edit,
+# delete, or overwrite-on-move). $2 is the human label shown in
+# 't> undo'/'t> redo' output (usually the workspace-relative path).
+snapshot_before_change() {
+  local abs="$1" label="$2" desc
+  desc="$(_snapshot_path "$abs")"
+  push_undo "${desc%%:*}" "$abs" "${desc#*:}" "$label"
+}
+
+# Records that $2 was just moved from $1 — undo moves it back to $1.
+record_move_undo() {
+  push_undo "move" "$2" "$1" "$3"
+}
+
+# Pops the most recent group off stack $1 (UNDO or REDO) into the globals
+# POPPED_KIND/POPPED_A/POPPED_B/POPPED_LABEL, oldest-entry-first. Returns 1
+# if that stack is empty.
+_stack_pop_last_group() {
+  local -n _k="${1}_KIND" _a="${1}_A" _b="${1}_B" _l="${1}_LABEL" _g="${1}_GROUP"
+  local n="${#_g[@]}"
+  POPPED_KIND=(); POPPED_A=(); POPPED_B=(); POPPED_LABEL=()
+  [[ "$n" -eq 0 ]] && return 1
+  local top_group="${_g[$((n-1))]}" start=$((n-1))
+  while (( start > 0 )) && [[ "${_g[$((start-1))]}" == "$top_group" ]]; do
+    start=$((start-1))
+  done
+  local i
+  for (( i = start; i < n; i++ )); do
+    POPPED_KIND+=("${_k[$i]}"); POPPED_A+=("${_a[$i]}"); POPPED_B+=("${_b[$i]}"); POPPED_LABEL+=("${_l[$i]}")
+  done
+  _k=("${_k[@]:0:$start}"); _a=("${_a[@]:0:$start}"); _b=("${_b[@]:0:$start}")
+  _l=("${_l[@]:0:$start}"); _g=("${_g[@]:0:$start}")
+  return 0
+}
+
+# Applies a just-popped group (newest entry first is how undo should be
+# applied within a batch, so this walks it in reverse) and pushes the
+# inverse of each entry onto $1 (the other stack), building the new group
+# under a fresh group id so it undoes/redoes back together as one unit.
+_apply_popped_group() {
+  local push_to="$1" verb="$2"
+  local n="${#POPPED_KIND[@]}" i kind a b label
+  local new_group="g$((++UNDO_GROUP_SEQ))"
+  box_top "$verb" "$ICON_UNDO" "$C_WARN"
+  for (( i = n - 1; i >= 0; i-- )); do
+    kind="${POPPED_KIND[$i]}"; a="${POPPED_A[$i]}"; b="${POPPED_B[$i]}"; label="${POPPED_LABEL[$i]}"
+    case "$kind" in
+      file|dir)
+        local desc
+        desc="$(_snapshot_path "$a")"
+        rm -rf "$a" 2>/dev/null
+        if [[ -n "$b" ]]; then
+          mkdir -p "$(dirname "$a")" 2>/dev/null
+          cp -a "$b" "$a" 2>/dev/null
+          box_line "restored: ${a#"$WORKSPACE_DIR"/} ${C_DIM}($label)${C_RESET}"
+        else
+          box_line "removed: ${a#"$WORKSPACE_DIR"/} ${C_DIM}($label)${C_RESET}"
+        fi
+        _stack_push "$push_to" "${desc%%:*}" "$a" "${desc#*:}" "$label" "$new_group"
+        ;;
+      move)
+        if [[ -e "$b" ]]; then
+          box_line "${C_WARN}skipped, something now exists at the old location: ${b#"$WORKSPACE_DIR"/}${C_RESET}"
+        elif [[ -e "$a" ]]; then
+          mkdir -p "$(dirname "$b")" 2>/dev/null
+          robust_move "$a" "$b"
+          box_line "moved back: ${a#"$WORKSPACE_DIR"/} -> ${b#"$WORKSPACE_DIR"/} ${C_DIM}($label)${C_RESET}"
+          _stack_push "$push_to" "move" "$b" "$a" "$label" "$new_group"
+        else
+          box_line "${C_WARN}skipped, source missing: ${a#"$WORKSPACE_DIR"/}${C_RESET}"
+        fi
+        ;;
+    esac
+  done
+  box_bottom "$C_WARN"
+  ok "$verb $n change(s)."
+}
+
+run_undo() {
+  if ! _stack_pop_last_group "UNDO"; then
+    warn "Nothing to undo."
+    return
+  fi
+  _apply_popped_group "REDO" "Undid"
+}
+
+run_redo() {
+  if ! _stack_pop_last_group "REDO"; then
+    warn "Nothing to redo."
+    return
+  fi
+  _apply_popped_group "UNDO" "Redid"
+}
+
+undo_status() {
+  local -a seen=() g
+  local i n_undo n_redo
+  n_undo=0
+  for g in "${UNDO_GROUP[@]}"; do
+    [[ " ${seen[*]} " == *" $g "* ]] && continue
+    seen+=("$g"); n_undo=$((n_undo + 1))
+  done
+  seen=()
+  n_redo=0
+  for g in "${REDO_GROUP[@]}"; do
+    [[ " ${seen[*]} " == *" $g "* ]] && continue
+    seen+=("$g"); n_redo=$((n_redo + 1))
+  done
+  printf "${C_MUTED}undo:${C_RESET} %s step(s) available\n" "$n_undo"
+  printf "${C_MUTED}redo:${C_RESET} %s step(s) available\n" "$n_redo"
+  muted "SHELL_RUN and MCP_CALL are never covered by undo — only sandboxed file/folder/zip/network actions are."
+}
+
+
 handle_write_action() {
   local rel="$1" content_file="$2" abs lines parent_dir missing_dirs
 
@@ -1850,6 +2173,9 @@ handle_write_action() {
 
   if confirm_action "Apply this write?"; then
     mkdir -p "$parent_dir" 2>/dev/null
+    undo_group_begin
+    snapshot_before_change "$abs" "write ${abs#"$WORKSPACE_DIR"/}"
+    undo_group_end
     if cp "$content_file" "$abs"; then
       ok "Wrote $abs"
     else
@@ -1867,7 +2193,7 @@ handle_write_action() {
 # (0 = insert at the top of the file).
 handle_edit_action() {
   local rel="$1" op="$2" start="$3" end="$4" content_file="$5"
-  local abs total new_lines old_lines tmpfile
+  local abs total old_lines tmpfile
 
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe edit proposal: $rel"; return; }
 
@@ -1901,7 +2227,6 @@ handle_edit_action() {
     fi
   fi
 
-  new_lines="$(wc -l < "$content_file" | tr -d ' ')"
   tmpfile="$(mktemp)"
 
   case "$op" in
@@ -1942,6 +2267,9 @@ handle_edit_action() {
   esac
 
   if confirm_action "Apply this edit?"; then
+    undo_group_begin
+    snapshot_before_change "$abs" "edit ${abs#"$WORKSPACE_DIR"/}"
+    undo_group_end
     if cp "$tmpfile" "$abs"; then
       ok "Edited $abs"
     else
@@ -1973,6 +2301,9 @@ handle_folder_create_action() {
 
   if confirm_action "Create this folder?"; then
     if mkdir -p "$abs"; then
+      undo_group_begin
+      push_undo "dir" "$abs" "" "create ${abs#"$WORKSPACE_DIR"/}"
+      undo_group_end
       ok "Created $abs"
     else
       err "Failed to create $abs"
@@ -2002,6 +2333,9 @@ handle_delete_action() {
   box_bottom "$C_ERR"
 
   if confirm_action "Delete this file?"; then
+    undo_group_begin
+    snapshot_before_change "$abs" "delete ${abs#"$WORKSPACE_DIR"/}"
+    undo_group_end
     if rm -f "$abs"; then
       ok "Deleted $abs"
     else
@@ -2009,6 +2343,197 @@ handle_delete_action() {
     fi
   else
     warn "Skipped delete: $rel"
+  fi
+}
+
+# FILE_MOVE / FOLDER_MOVE — requires confirmation. Handles both a real move
+# (different folder) and a rename (same folder, new name) since on a
+# filesystem those are the same `mv` operation; the marker name in the box
+# just reflects which one it looks like to the user. Works for both files
+# and folders — the underlying check is identical, so one handler covers
+# FILE_MOVE and FOLDER_MOVE rather than duplicating this for each.
+# On plain local filesystems `mv` is a single atomic rename() and its exit
+# code is trustworthy. On Android shared storage (which is where this
+# script's default workspace lives on Termux — see default_workspace_dir),
+# access goes through a FUSE/SAF bridge that has a known failure mode: it
+# can report the rename as successful when it silently didn't complete,
+# particularly for folder moves. Rather than trust that single exit code,
+# do the move as copy -> verify the copy actually landed -> only then
+# remove the source. This costs a bit of I/O but means "Moved" printed to
+# the user is backed by an actual check that the destination is real,
+# instead of forwarding whatever the underlying syscall claimed.
+robust_move() {
+  local src="$1" dst="$2"
+
+  if [[ -d "$src" ]]; then
+    local src_count dst_count
+    src_count="$(find "$src" -type f 2>/dev/null | wc -l)"
+
+    if ! cp -a "$src" "$dst" 2>/dev/null; then
+      rm -rf "$dst" 2>/dev/null
+      return 1
+    fi
+
+    dst_count="$(find "$dst" -type f 2>/dev/null | wc -l)"
+    if [[ ! -d "$dst" || "$src_count" != "$dst_count" ]]; then
+      rm -rf "$dst" 2>/dev/null
+      return 1
+    fi
+
+    rm -rf "$src" 2>/dev/null
+    return 0
+  else
+    local src_size dst_size
+    src_size="$(wc -c < "$src" 2>/dev/null)"
+
+    if ! cp -p "$src" "$dst" 2>/dev/null; then
+      rm -f "$dst" 2>/dev/null
+      return 1
+    fi
+
+    dst_size="$(wc -c < "$dst" 2>/dev/null)"
+    if [[ ! -f "$dst" || "$src_size" != "$dst_size" ]]; then
+      rm -f "$dst" 2>/dev/null
+      return 1
+    fi
+
+    rm -f "$src" 2>/dev/null
+    return 0
+  fi
+}
+
+# Generates a free filename by appending " (1)", " (2)", etc. before the
+# extension — used by the "rename" conflict strategy on moves, so a
+# collision doesn't require picking overwrite or skip.
+find_available_name() {
+  local target="$1" dir base ext candidate n=1
+  dir="$(dirname "$target")"
+  base="$(basename "$target")"
+  if [[ "$base" == *.* && "$base" != .* ]]; then
+    ext=".${base##*.}"
+    base="${base%.*}"
+  else
+    ext=""
+  fi
+  candidate="$target"
+  while [[ -e "$candidate" ]]; do
+    candidate="$dir/${base} (${n})${ext}"
+    n=$((n + 1))
+  done
+  printf '%s' "$candidate"
+}
+
+handle_move_action() {
+  local rel_from="$1" rel_to="$2" kind_label="$3" conflict="${4:-skip}"
+  local abs_from abs_to dest_dir action_label
+
+  abs_from="$(resolve_safe_path "$rel_from")" || { warn "Skipped unsafe move proposal: $rel_from"; return; }
+  abs_to="$(resolve_safe_path "$rel_to")" || { warn "Skipped unsafe move destination: $rel_to"; return; }
+
+  if [[ ! -e "$abs_from" ]]; then
+    err "Nothing to move, source does not exist: $abs_from"
+    return
+  fi
+
+  if [[ "$abs_from" == "$WORKSPACE_DIR" ]]; then
+    err "Refusing to move the sandbox root itself: $abs_from"
+    return
+  fi
+
+  # Explicit, redundant guard against critical system directories — belt
+  # and braces on top of resolve_safe_path (which already confines every
+  # path to WORKSPACE_DIR and rejects is_dangerous_root locations). Kept
+  # here too so the block is visible right at the point of the move, not
+  # just buried in path resolution.
+  if is_dangerous_root "$abs_from" || is_dangerous_root "$abs_to"; then
+    err "Refusing to move a critical system directory: $abs_from -> $abs_to"
+    return
+  fi
+
+  if [[ -d "$abs_from" && "$kind_label" == "file" ]]; then
+    err "That's a folder, not a file (use FOLDER_MOVE instead): $abs_from"
+    return
+  fi
+  if [[ ! -d "$abs_from" && "$kind_label" == "folder" ]]; then
+    err "That's a file, not a folder (use FILE_MOVE instead): $abs_from"
+    return
+  fi
+
+  # If the destination is an existing FOLDER, treat this the way `mv` does:
+  # drop the source inside it (dest/basename), rather than requiring the
+  # caller to already know and spell out the final filename. Without this,
+  # the completely ordinary "move this into that folder" request — where
+  # the target folder legitimately already exists — was indistinguishable
+  # from trying to overwrite something, and got refused outright.
+  if [[ -d "$abs_to" ]]; then
+    abs_to="${abs_to%/}/$(basename "$abs_from")"
+  fi
+
+  # Name-conflict handling: overwrite / skip / rename. Defaults to "skip"
+  # (the old hard-refuse behavior, just framed as an intentional skip
+  # rather than an error) when the model doesn't specify a strategy.
+  # "rename" picks the final destination name now (a pure computation, no
+  # side effects) so the confirmation box below shows the real path the
+  # move will use; "overwrite" only records that removal is PENDING —
+  # the destination isn't actually touched until the user confirms below,
+  # so declining leaves it untouched instead of already being gone.
+  local pending_overwrite=0
+  if [[ -e "$abs_to" ]]; then
+    case "$conflict" in
+      overwrite)
+        pending_overwrite=1
+        ;;
+      rename)
+        abs_to="$(find_available_name "$abs_to")"
+        ;;
+      *)
+        warn "Skipped move (destination already exists): $abs_from -> $abs_to"
+        return
+        ;;
+    esac
+  fi
+
+  # A destination inside the source itself (moving a folder into its own
+  # subtree) would corrupt or infinite-loop the move — block it outright.
+  if [[ -d "$abs_from" ]]; then
+    case "$abs_to" in
+      "$abs_from"|"$abs_from"/*)
+        err "Refusing to move a folder into itself or its own subfolder: $abs_to"
+        return
+        ;;
+    esac
+  fi
+
+  dest_dir="$(dirname "$abs_to")"
+  if [[ "$(dirname "$abs_from")" == "$dest_dir" ]]; then
+    action_label="RENAME $([[ "$kind_label" == "folder" ]] && printf FOLDER || printf FILE)"
+  else
+    action_label="MOVE $([[ "$kind_label" == "folder" ]] && printf FOLDER || printf FILE)"
+  fi
+
+  box_top "$action_label" "$ICON_MOVE" "$C_WARN"
+  box_line "from: $abs_from"
+  box_line "to:   $abs_to"
+  [[ "$pending_overwrite" -eq 1 ]] && box_line "${C_WARN}this replaces what's already at the destination${C_RESET}"
+  box_bottom "$C_WARN"
+
+  if confirm_action "Proceed with this ${kind_label}?"; then
+    mkdir -p "$dest_dir" 2>/dev/null
+    undo_group_begin
+    if [[ "$pending_overwrite" -eq 1 ]]; then
+      snapshot_before_change "$abs_to" "overwritten by move ${abs_to#"$WORKSPACE_DIR"/}"
+      if [[ -d "$abs_to" && ! -L "$abs_to" ]]; then rm -rf "$abs_to" 2>/dev/null; else rm -f "$abs_to" 2>/dev/null; fi
+    fi
+    if robust_move "$abs_from" "$abs_to"; then
+      record_move_undo "$abs_from" "$abs_to" "$([[ "$action_label" == RENAME* ]] && printf rename || printf move) ${kind_label}"
+      undo_group_end
+      ok "Moved $abs_from -> $abs_to"
+    else
+      undo_group_end
+      err "Failed to move $abs_from -> $abs_to"
+    fi
+  else
+    warn "Skipped move: $rel_from -> $rel_to"
   fi
 }
 
@@ -2040,9 +2565,12 @@ handle_folder_delete_action() {
   box_line "$abs"
   box_line "${C_DIM}contains $entry_count item(s), all of which will be removed${C_RESET}"
   box_bottom "$C_ERR"
-  warn "This deletes the folder AND everything inside it — this cannot be undone."
+  warn "This deletes the folder AND everything inside it (run 't> undo' to reverse it)."
 
   if confirm_action "Delete this folder and everything inside it?"; then
+    undo_group_begin
+    snapshot_before_change "$abs" "delete folder ${abs#"$WORKSPACE_DIR"/}"
+    undo_group_end
     if rm -rf "$abs"; then
       ok "Deleted $abs"
     else
@@ -2088,6 +2616,7 @@ handle_bulk_write_action() {
 
   if confirm_action "Apply all $n write(s)?"; then
     local wrote=0 failed=0
+    undo_group_begin
     for i in "${!_bw_paths[@]}"; do
       abs="${abs_list[$i]}"
       if [[ -z "$abs" ]]; then
@@ -2095,6 +2624,7 @@ handle_bulk_write_action() {
         continue
       fi
       mkdir -p "$(dirname "$abs")" 2>/dev/null
+      snapshot_before_change "$abs" "write ${abs#"$WORKSPACE_DIR"/}"
       if cp "${_bw_files[$i]}" "$abs"; then
         ok "Wrote $abs"
         wrote=$((wrote + 1))
@@ -2103,6 +2633,7 @@ handle_bulk_write_action() {
         failed=$((failed + 1))
       fi
     done
+    undo_group_end
     [[ "$failed" -gt 0 ]] && warn "$wrote of $n write(s) succeeded, $failed failed."
   else
     warn "Skipped bulk write ($n file(s))."
@@ -2134,6 +2665,7 @@ handle_bulk_folder_create_action() {
   box_bottom "$C_WARN"
 
   if confirm_action "Create all $n folder(s)?"; then
+    undo_group_begin
     for i in "${!_bfc_paths[@]}"; do
       abs="${abs_list[$i]}"
       [[ -z "$abs" ]] && continue
@@ -2141,12 +2673,18 @@ handle_bulk_folder_create_action() {
         err "Skipped, a file already exists: $abs"
         continue
       fi
+      if [[ -d "$abs" ]]; then
+        ok "Already exists: $abs"
+        continue
+      fi
       if mkdir -p "$abs"; then
+        push_undo "dir" "$abs" "" "create ${abs#"$WORKSPACE_DIR"/}"
         ok "Created $abs"
       else
         err "Failed to create $abs"
       fi
     done
+    undo_group_end
   else
     warn "Skipped bulk folder create ($n folder(s))."
   fi
@@ -2193,17 +2731,20 @@ handle_bulk_delete_action() {
     fi
   done
   box_bottom "$C_ERR"
-  warn "This permanently deletes every item listed above — this cannot be undone."
+  warn "This deletes every item listed above (run 't> undo' to reverse it)."
 
   if confirm_action "Delete all $n item(s)?"; then
+    undo_group_begin
     for i in "${!_bd_paths[@]}"; do
       abs="${abs_list[$i]}"
       [[ -z "$abs" ]] && continue
       case "${kind_list[$i]}" in
         folder)
+          snapshot_before_change "$abs" "delete folder ${abs#"$WORKSPACE_DIR"/}"
           rm -rf "$abs" && ok "Deleted $abs" || err "Failed to delete $abs"
           ;;
         file)
+          snapshot_before_change "$abs" "delete ${abs#"$WORKSPACE_DIR"/}"
           rm -f "$abs" && ok "Deleted $abs" || err "Failed to delete $abs"
           ;;
         *)
@@ -2211,8 +2752,129 @@ handle_bulk_delete_action() {
           ;;
       esac
     done
+    undo_group_end
   else
     warn "Skipped bulk delete ($n item(s))."
+  fi
+}
+
+# Moves/renames a batch of files and/or folders in one confirmation. Each
+# item already carries its own from/to/kind (parsed from the ITEM lines in
+# process_agent_reply), so this just validates and previews each one before
+# applying, same pattern as handle_bulk_delete_action.
+handle_bulk_move_action() {
+  local -n _bm_from="$1"
+  local -n _bm_to="$2"
+  local -n _bm_kind="$3"
+  local -n _bm_conflict="$4"
+  local n="${#_bm_from[@]}" i abs_from abs_to kind conflict
+  local -a from_list=() to_list=() overwrite_list=()
+
+  box_top "BULK MOVE ($n)" "$ICON_MOVE" "$C_WARN"
+  for i in "${!_bm_from[@]}"; do
+    abs_from="$(resolve_safe_path "${_bm_from[$i]}")"
+    abs_to="$(resolve_safe_path "${_bm_to[$i]}")"
+    kind="${_bm_kind[$i]}"
+    conflict="${_bm_conflict[$i]:-skip}"
+    if [[ -z "$abs_from" || -z "$abs_to" ]]; then
+      box_line "${C_ERR}(skipped, unsafe path): ${_bm_from[$i]} -> ${_bm_to[$i]}${C_RESET}"
+      from_list+=(""); to_list+=(""); overwrite_list+=("0")
+      continue
+    fi
+    if [[ "$abs_from" == "$WORKSPACE_DIR" ]]; then
+      box_line "${C_ERR}(refusing to move the sandbox root itself): $abs_from${C_RESET}"
+      from_list+=(""); to_list+=(""); overwrite_list+=("0")
+      continue
+    fi
+    # Explicit, redundant guard against critical system directories — see
+    # the matching comment in handle_move_action.
+    if is_dangerous_root "$abs_from" || is_dangerous_root "$abs_to"; then
+      box_line "${C_ERR}(refusing critical system directory): $abs_from -> $abs_to${C_RESET}"
+      from_list+=(""); to_list+=(""); overwrite_list+=("0")
+      continue
+    fi
+    if [[ ! -e "$abs_from" ]]; then
+      box_line "${C_ERR}(source does not exist, will be skipped): $abs_from${C_RESET}"
+      from_list+=(""); to_list+=(""); overwrite_list+=("0")
+      continue
+    fi
+    if [[ -d "$abs_from" && "$kind" == "file" ]]; then
+      box_line "${C_ERR}(that's a folder, not a file — will be skipped): $abs_from${C_RESET}"
+      from_list+=(""); to_list+=(""); overwrite_list+=("0")
+      continue
+    fi
+    if [[ ! -d "$abs_from" && "$kind" == "folder" ]]; then
+      box_line "${C_ERR}(that's a file, not a folder — will be skipped): $abs_from${C_RESET}"
+      from_list+=(""); to_list+=(""); overwrite_list+=("0")
+      continue
+    fi
+    # Same "move into an existing folder" handling as the single-item
+    # handler: an existing-directory destination means drop it inside,
+    # not "refuse because something is already there".
+    if [[ -d "$abs_to" ]]; then
+      abs_to="${abs_to%/}/$(basename "$abs_from")"
+    fi
+    local this_overwrite=0
+    if [[ -e "$abs_to" ]]; then
+      case "$conflict" in
+        overwrite)
+          # Only FLAGGED here, not removed yet — the actual removal (and
+          # its undo snapshot) happens at apply time below, so declining
+          # the batch leaves the destination untouched.
+          this_overwrite=1
+          ;;
+        rename)
+          abs_to="$(find_available_name "$abs_to")"
+          ;;
+        *)
+          box_line "${C_ERR}(destination already exists, will be skipped): $abs_to${C_RESET}"
+          from_list+=(""); to_list+=(""); overwrite_list+=("0")
+          continue
+          ;;
+      esac
+    fi
+    if [[ -d "$abs_from" ]]; then
+      case "$abs_to" in
+        "$abs_from"|"$abs_from"/*)
+          box_line "${C_ERR}(refusing to move a folder into itself or its own subfolder): $abs_to${C_RESET}"
+          from_list+=(""); to_list+=(""); overwrite_list+=("0")
+          continue
+          ;;
+      esac
+    fi
+    [[ "$this_overwrite" -eq 1 ]] && box_line "$abs_from ${C_DIM}->${C_RESET} $abs_to ${C_WARN}(replaces existing)${C_RESET}" || box_line "$abs_from ${C_DIM}->${C_RESET} $abs_to"
+    from_list+=("$abs_from"); to_list+=("$abs_to"); overwrite_list+=("$this_overwrite")
+  done
+  box_bottom "$C_WARN"
+
+  if confirm_action "Apply all $n move(s)?"; then
+    local moved=0 failed=0
+    undo_group_begin
+    for i in "${!from_list[@]}"; do
+      abs_from="${from_list[$i]}"
+      abs_to="${to_list[$i]}"
+      if [[ -z "$abs_from" ]]; then
+        failed=$((failed + 1))
+        continue
+      fi
+      mkdir -p "$(dirname "$abs_to")" 2>/dev/null
+      if [[ "${overwrite_list[$i]}" == "1" ]]; then
+        snapshot_before_change "$abs_to" "overwritten by move ${abs_to#"$WORKSPACE_DIR"/}"
+        if [[ -d "$abs_to" && ! -L "$abs_to" ]]; then rm -rf "$abs_to" 2>/dev/null; else rm -f "$abs_to" 2>/dev/null; fi
+      fi
+      if robust_move "$abs_from" "$abs_to"; then
+        record_move_undo "$abs_from" "$abs_to" "move ${abs_to#"$WORKSPACE_DIR"/}"
+        ok "Moved $abs_from -> $abs_to"
+        moved=$((moved + 1))
+      else
+        err "Failed to move $abs_from -> $abs_to"
+        failed=$((failed + 1))
+      fi
+    done
+    undo_group_end
+    [[ "$failed" -gt 0 ]] && warn "$moved of $n move(s) succeeded, $failed failed."
+  else
+    warn "Skipped bulk move ($n item(s))."
   fi
 }
 
@@ -2224,15 +2886,41 @@ SHELL_TIMEOUT_SECS=60
 
 # Truncates stdin to MAX_PREVIEW_BYTES/MAX_PREVIEW_LINES and notes if it did.
 cap_preview() {
-  local input="$1" out lines bytes
+  local input="$1" out lines bytes out_bytes
   out="$(printf '%s' "$input" | head -c "$MAX_PREVIEW_BYTES")"
   out="$(printf '%s' "$out" | head -n "$MAX_PREVIEW_LINES")"
-  bytes="${#input}"
+  # Real byte counts (not bash's char-count ${#var}) so this matches what
+  # head -c actually cut against — otherwise multi-byte UTF-8 content (any
+  # non-ASCII file/output) gets a misleading "N bytes" figure.
+  bytes="$(printf '%s' "$input" | wc -c | tr -d ' ')"
+  out_bytes="$(printf '%s' "$out" | wc -c | tr -d ' ')"
   lines="$(printf '%s' "$input" | grep -c '' | tr -d ' ')"
   printf '%s' "$out"
-  if (( bytes > ${#out} )); then
+  if (( bytes > out_bytes )); then
     printf '\n[...truncated, %s bytes / %s lines total...]' "$bytes" "$lines"
   fi
+}
+
+# Strips ANSI/terminal control sequences (CSI codes, OSC codes, charset
+# selectors, and any other lone ESC-prefixed byte) plus bare carriage
+# returns from arbitrary text. Used on SHELL_RUN's captured output before
+# it's ever printed: that output is captured via command substitution, so
+# it does NOT touch the real terminal while it's being captured — but the
+# moment we printf/box_line it back out to show the user, any raw escape
+# codes inside it become live again. Without this, a command as simple as
+# `clear` (or anything emitting cursor/screen control codes) would act on
+# our actual terminal at print time and wipe the visible session, instead
+# of just being inert text describing what the command printed. Applied
+# before display AND before the text is handed back to the model, so the
+# model isn't fed binary control noise either.
+strip_ansi_escapes() {
+  local esc=$'\033'
+  printf '%s' "$1" | sed -E "
+    s/${esc}\[[0-9;?]*[a-zA-Z]//g
+    s/${esc}\][^${esc}]*(${esc}\\\\)?//g
+    s/${esc}[()][A-Za-z0-9]//g
+    s/${esc}.//g
+  " | tr -d '\r'
 }
 
 # FILE_READ — read-only, no confirmation. Appends result to AGENT_TOOL_OUTPUT
@@ -2381,6 +3069,165 @@ handle_zip_read_action() {
   printf '%s\n' "$content" | sed -n '1,20p' | while IFS= read -r pl; do box_line "$pl"; done
   box_bottom "$C_ACCENT2"
   AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_READ $rel :: $entry]:"$'\n'"$content"
+}
+
+# ZIP_CREATE — requires confirmation. Zips one or more existing sandboxed
+# files/folders (one relative source path per line in the body) into a new
+# archive. Creating/overwriting the archive is undo-tracked like FILE_WRITE.
+handle_zip_create_action() {
+  local rel="$1" sources_file="$2" abs parent_dir src abs_src rel_norm
+  local -a good_sources=()
+
+  if [[ "$HAVE_ZIP" -ne 1 ]]; then
+    warn "ZIP_CREATE requested but 'zip' isn't installed."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_CREATE $rel]: 'zip' is not installed on this system."
+    return
+  fi
+
+  abs="$(resolve_safe_path "$rel")" || {
+    warn "Skipped unsafe zip create proposal: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_CREATE $rel]: rejected, path escapes the sandbox."
+    return
+  }
+
+  box_top "ZIP CREATE" "$ICON_ZIP" "$C_WARN"
+  box_line "archive: $abs"
+  [[ -e "$abs" ]] && box_line "${C_WARN}this overwrites an existing file${C_RESET}"
+  while IFS= read -r src; do
+    [[ -z "$src" ]] && continue
+    abs_src="$(resolve_safe_path "$src")"
+    if [[ -z "$abs_src" || ! -e "$abs_src" ]]; then
+      box_line "${C_ERR}(skipped, missing or unsafe): $src${C_RESET}"
+      continue
+    fi
+    box_line "+ $src"
+    good_sources+=("$src")
+  done < "$sources_file"
+  box_bottom "$C_WARN"
+
+  if [[ "${#good_sources[@]}" -eq 0 ]]; then
+    warn "No valid source paths, nothing to zip."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_CREATE $rel]: no valid source paths given."
+    return
+  fi
+
+  if ! confirm_action "Create this archive?"; then
+    warn "Skipped zip create: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_CREATE $rel]: user declined."
+    return
+  fi
+
+  parent_dir="$(dirname "$abs")"
+  mkdir -p "$parent_dir" 2>/dev/null
+  undo_group_begin
+  snapshot_before_change "$abs" "zip create ${abs#"$WORKSPACE_DIR"/}"
+  undo_group_end
+
+  local zip_out
+  zip_out="$(cd "$WORKSPACE_DIR" && zip -r -y "$abs" "${good_sources[@]}" 2>&1)"
+  if [[ $? -eq 0 ]]; then
+    ok "Created $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_CREATE $rel]: archive created from ${#good_sources[@]} source(s)."
+  else
+    err "Failed to create archive: $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_CREATE $rel]: failed:"$'\n'"$(cap_preview "$zip_out")"
+  fi
+}
+
+# ZIP_EXTRACT — requires confirmation. Extracts every entry of a sandboxed
+# archive into a sandboxed destination folder. conflict="overwrite" replaces
+# existing files (each one snapshotted first so it can be undone);
+# conflict="skip" (default) leaves any existing file untouched and only
+# extracts entries that don't already exist there.
+handle_zip_extract_action() {
+  local rel="$1" to_rel="$2" conflict="${3:-skip}" abs_zip abs_dest entry target new_count=0 skip_count=0
+
+  if [[ "$HAVE_UNZIP" -ne 1 ]]; then
+    warn "ZIP_EXTRACT requested but 'unzip' isn't installed."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: 'unzip' is not installed on this system."
+    return
+  fi
+
+  abs_zip="$(resolve_safe_path "$rel")" || {
+    warn "Skipped unsafe zip extract proposal: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: rejected, path escapes the sandbox."
+    return
+  }
+  abs_dest="$(resolve_safe_path "$to_rel")" || {
+    warn "Skipped unsafe zip extract destination: $to_rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: rejected destination, escapes the sandbox."
+    return
+  }
+
+  if [[ ! -f "$abs_zip" ]]; then
+    warn "Archive does not exist: $abs_zip"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: archive does not exist."
+    return
+  fi
+
+  local -a entries=()
+  mapfile -t entries < <(unzip -Z1 "$abs_zip" 2>/dev/null)
+  if [[ "${#entries[@]}" -eq 0 ]]; then
+    warn "Archive is empty or unreadable: $abs_zip"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: archive is empty or unreadable."
+    return
+  fi
+
+  box_top "ZIP EXTRACT" "$ICON_ZIP" "$C_WARN"
+  box_line "archive: $abs_zip"
+  box_line "into:    $abs_dest ${C_DIM}(conflict=$conflict)${C_RESET}"
+  box_line "${C_DIM}${#entries[@]} entr$([[ ${#entries[@]} -eq 1 ]] && printf y || printf ies) in archive${C_RESET}"
+  box_bottom "$C_WARN"
+
+  if ! confirm_action "Extract this archive?"; then
+    warn "Skipped zip extract: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: user declined."
+    return
+  fi
+
+  mkdir -p "$abs_dest" 2>/dev/null
+  undo_group_begin
+  for entry in "${entries[@]}"; do
+    [[ "$entry" == */ || -z "$entry" ]] && continue   # skip directory entries
+    case "$entry" in
+      /*|*..*)
+        warn "Skipped unsafe entry path in archive: $entry"
+        continue
+        ;;
+    esac
+    target="$(resolve_safe_path "$to_rel/$entry")" || { warn "Skipped unsafe entry path: $entry"; continue; }
+    if [[ -e "$target" ]]; then
+      if [[ "$conflict" == "overwrite" ]]; then
+        snapshot_before_change "$target" "zip extract ${target#"$WORKSPACE_DIR"/}"
+      else
+        skip_count=$((skip_count + 1))
+        continue
+      fi
+    else
+      push_undo "file" "$target" "" "zip extract ${target#"$WORKSPACE_DIR"/}"
+    fi
+    new_count=$((new_count + 1))
+  done
+
+  local unzip_out unzip_exit
+  if [[ "$conflict" == "overwrite" ]]; then
+    unzip_out="$(unzip -o "$abs_zip" -d "$abs_dest" 2>&1)"
+  else
+    unzip_out="$(unzip -n "$abs_zip" -d "$abs_dest" 2>&1)"
+  fi
+  unzip_exit=$?
+  undo_group_end
+
+  if [[ "$unzip_exit" -eq 0 || "$unzip_exit" -eq 1 ]]; then
+    # unzip exits 1 for benign warnings (e.g. entries skipped by -n), which
+    # is expected and not a real failure here.
+    ok "Extracted $new_count entr$([[ $new_count -eq 1 ]] && printf y || printf ies) to $abs_dest"
+    [[ "$skip_count" -gt 0 ]] && warn "$skip_count entr$([[ $skip_count -eq 1 ]] && printf y || printf ies) already existed and $([[ $skip_count -eq 1 ]] && printf was || printf were) skipped (conflict=skip)."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: extracted $new_count entries, skipped $skip_count existing."
+  else
+    err "Failed to extract archive: $abs_zip"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[ZIP_EXTRACT $rel -> $to_rel]: failed:"$'\n'"$(cap_preview "$unzip_out")"
+  fi
 }
 
 # Percent-decodes a URL-encoded string using only bash/printf built-ins (no
@@ -3739,6 +4586,14 @@ handle_shell_run_action() {
     exit_code=$?
   fi
 
+  # The command ran with its output captured into a variable, so control
+  # codes (e.g. from `clear`, or any tool coloring/repositioning its own
+  # output) never touched the real terminal yet — but printing $output
+  # verbatim below would replay them against OUR terminal right now, which
+  # is what actually wipes the visible chat. Strip them first so the box
+  # only ever shows/relays plain text.
+  output="$(strip_ansi_escapes "$output")"
+
   exit_color="$C_OK"
   [[ "$exit_code" -ne 0 ]] && exit_color="$C_ERR"
   box_top "OUTPUT (exit $exit_code)" "" "$exit_color"
@@ -3749,8 +4604,138 @@ handle_shell_run_action() {
   AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN exit=$exit_code]:"$'\n'"$output"
 }
 
+# ── Network actions ──────────────────────────────────────────────────────
+# NET_GET / NET_POST / NET_DOWNLOAD all require explicit confirmation, same
+# tier as SHELL_RUN: the URL can be anything reachable from this device, not
+# just something inside the sandbox, so the same "not sandboxed" warning
+# applies. NET_DOWNLOAD additionally writes into the sandbox and so is also
+# undo-tracked like a file write.
+NET_TIMEOUT_SECS=30
+MAX_NET_RESPONSE_BYTES=200000
+MAX_NET_DOWNLOAD_BYTES=104857600   # 100MB hard cap; curl aborts past this
+
+handle_net_get_action() {
+  local url="$1" body http_code output exit_color
+
+  box_top "HTTP GET" "$ICON_NET" "$C_ERR"
+  box_line "$url"
+  box_bottom "$C_ERR"
+  warn "This reaches out to the real internet — not sandboxed to the workspace."
+
+  if ! confirm_action "Send this GET request?"; then
+    warn "Skipped GET request."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_GET $url]: user declined."
+    return
+  fi
+
+  body="$(curl -sS -L --max-time "$NET_TIMEOUT_SECS" --max-filesize "$MAX_NET_DOWNLOAD_BYTES" \
+    -w $'\n---HTTP_STATUS:%{http_code}---' "$url" 2>&1)"
+  http_code="${body##*---HTTP_STATUS:}"; http_code="${http_code%%---*}"
+  body="${body%$'\n'---HTTP_STATUS:*---}"
+  body="$(strip_ansi_escapes "$body" | head -c "$MAX_NET_RESPONSE_BYTES")"
+
+  [[ "$http_code" =~ ^2 ]] && exit_color="$C_OK" || exit_color="$C_ERR"
+  box_top "RESPONSE (status ${http_code:-?})" "" "$exit_color"
+  printf '%s\n' "$body" | sed -n '1,40p' | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$exit_color"
+
+  body="$(cap_preview "$body")"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_GET $url status=${http_code:-?}]:"$'\n'"$body"
+}
+
+# NET_POST — body comes from a temp file (multi-line, like FILE_WRITE),
+# content_type defaults to application/json when not given.
+handle_net_post_action() {
+  local url="$1" content_type="${2:-application/json}" body_file="$3" body http_code output exit_color
+
+  box_top "HTTP POST" "$ICON_NET" "$C_ERR"
+  box_line "$url"
+  box_line "${C_DIM}content-type: $content_type${C_RESET}"
+  box_line "${C_DIM}body:${C_RESET}"
+  sed -n '1,20p' "$body_file" | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$C_ERR"
+  warn "This reaches out to the real internet — not sandboxed to the workspace."
+
+  if ! confirm_action "Send this POST request?"; then
+    warn "Skipped POST request."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_POST $url]: user declined."
+    return
+  fi
+
+  body="$(curl -sS -L --max-time "$NET_TIMEOUT_SECS" --max-filesize "$MAX_NET_DOWNLOAD_BYTES" \
+    -X POST -H "Content-Type: $content_type" --data-binary @"$body_file" \
+    -w $'\n---HTTP_STATUS:%{http_code}---' "$url" 2>&1)"
+  http_code="${body##*---HTTP_STATUS:}"; http_code="${http_code%%---*}"
+  body="${body%$'\n'---HTTP_STATUS:*---}"
+  body="$(strip_ansi_escapes "$body" | head -c "$MAX_NET_RESPONSE_BYTES")"
+
+  [[ "$http_code" =~ ^2 ]] && exit_color="$C_OK" || exit_color="$C_ERR"
+  box_top "RESPONSE (status ${http_code:-?})" "" "$exit_color"
+  printf '%s\n' "$body" | sed -n '1,40p' | while IFS= read -r pl; do box_line "$pl"; done
+  box_bottom "$exit_color"
+
+  body="$(cap_preview "$body")"
+  AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_POST $url status=${http_code:-?}]:"$'\n'"$body"
+}
+
+# NET_DOWNLOAD — saves a URL's response body to a sandboxed path. Writes to
+# disk, so this is undo-tracked exactly like FILE_WRITE.
+handle_net_download_action() {
+  local url="$1" rel="$2" abs parent_dir tmpfile http_code curl_err
+
+  abs="$(resolve_safe_path "$rel")" || {
+    warn "Skipped unsafe download destination: $rel"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_DOWNLOAD $url -> $rel]: rejected, destination escapes the sandbox."
+    return
+  }
+
+  box_top "HTTP DOWNLOAD" "$ICON_NET" "$C_ERR"
+  box_line "from: $url"
+  box_line "to:   $abs"
+  [[ -e "$abs" ]] && box_line "${C_WARN}this overwrites an existing file${C_RESET}"
+  box_bottom "$C_ERR"
+  warn "This reaches out to the real internet — not sandboxed to the workspace."
+
+  if ! confirm_action "Download this file?"; then
+    warn "Skipped download."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_DOWNLOAD $url -> $rel]: user declined."
+    return
+  fi
+
+  parent_dir="$(dirname "$abs")"
+  mkdir -p "$parent_dir" 2>/dev/null
+  tmpfile="$(mktemp)"
+
+  http_code="$(curl -sS -L --max-time "$NET_TIMEOUT_SECS" --max-filesize "$MAX_NET_DOWNLOAD_BYTES" \
+    -o "$tmpfile" -w '%{http_code}' "$url" 2>"$tmpfile.err")"
+  curl_err="$(cat "$tmpfile.err" 2>/dev/null)"
+  rm -f "$tmpfile.err"
+
+  if [[ ! -s "$tmpfile" ]]; then
+    rm -f "$tmpfile"
+    err "Download failed or returned empty content: $url"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_DOWNLOAD $url -> $rel]: failed (status ${http_code:-?}):"$'\n'"$(cap_preview "$curl_err")"
+    return
+  fi
+
+  local size
+  size="$(wc -c < "$tmpfile" | tr -d ' ')"
+
+  undo_group_begin
+  snapshot_before_change "$abs" "download ${abs#"$WORKSPACE_DIR"/}"
+  undo_group_end
+  if cp "$tmpfile" "$abs"; then
+    ok "Downloaded $size bytes to $abs (status ${http_code:-?})"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_DOWNLOAD $url -> $rel]: saved $size bytes, status ${http_code:-?}."
+  else
+    err "Failed to save downloaded file to $abs"
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[NET_DOWNLOAD $url -> $rel]: download succeeded but saving to sandbox failed."
+  fi
+  rm -f "$tmpfile"
+}
+
 # Scans an assistant reply for FILE_WRITE / FILE_EDIT / FILE_DELETE /
-# FOLDER_CREATE markers, strips them out of what's shown as plain chat text,
+# FOLDER_CREATE / FILE_MOVE / FOLDER_MOVE markers, strips them out of what's shown as plain chat text,
 # and runs each proposed action through the sandboxed, confirmation-gated
 # handlers above.
 process_agent_reply() {
@@ -3762,12 +4747,31 @@ process_agent_reply() {
   local -a zipread_paths=() zipread_entries=() shell_files=()
   local -a edit_paths=() edit_ops=() edit_starts=() edit_ends=() edit_files=()
   local -a bulk_write_paths=() bulk_write_files=() bulk_folder_paths=() bulk_delete_paths=()
+  local -a move_from_paths=() move_to_paths=() move_kinds=() move_conflicts=()
+  local -a bulk_move_from_paths=() bulk_move_to_paths=() bulk_move_kinds=() bulk_move_conflicts=()
   local -a mcp_call_servers=() mcp_call_tools=() mcp_call_files=()
+  local -a zipcreate_paths=() zipcreate_files=() zipextract_paths=() zipextract_to=() zipextract_conflicts=()
+  local -a netget_urls=() netdownload_urls=() netdownload_paths=()
+  local -a netpost_urls=() netpost_ctypes=() netpost_files=()
   local edit_file="" edit_idx=0 bulk_item_file="" bulk_idx=0 mcp_call_file="" mcp_call_idx=0
+  local zipcreate_file="" zipcreate_idx=0 netpost_file="" netpost_idx=0
   local tmpdir
   tmpdir="$(mktemp -d)"
 
   while IFS= read -r line; do
+    # Strip a lone trailing CR (CRLF line endings, which some providers/models
+    # emit). Every marker regex below is anchored with a literal "$", and a
+    # stray \r left on the end makes that anchor fail to match even though
+    # the line is visually identical. For single-item markers (FILE_MOVE,
+    # FILE_READ, etc.) there's a tolerant shim further down that catches
+    # this — but BULK_MOVE/BULK_WRITE/BULK_DELETE/BULK_FOLDER_CREATE have no
+    # such fallback: a CR-mangled ITEM line is silently dropped, and worse,
+    # a CR-mangled END_BULK_* line (matched with plain "==", not regex) never
+    # matches at all, so the parser stays stuck in that bulk mode and
+    # silently swallows every line for the rest of the reply. Normalizing
+    # here, once, fixes bulk move (and everything else) at the source
+    # instead of special-casing every marker.
+    line="${line%$'\r'}"
     if [[ "$mode" == "text" ]]; then
       if [[ "$line" =~ ^\<\<\<THINKING\>\>\>$ ]]; then
         mode="thinking"
@@ -3830,6 +4834,22 @@ process_agent_reply() {
         cleaned+="${C_ERR}${ICON_DELETE} delete folder: $path${C_RESET}"$'\n'
         continue
       fi
+      if [[ "$line" =~ ^\<\<\<FILE_MOVE\ path=\"([^\"]*)\"\ to=\"([^\"]*)\"(\ conflict=\"(overwrite|skip|rename)\")?\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        local move_to="${BASH_REMATCH[2]}"
+        local move_conflict="${BASH_REMATCH[4]:-skip}"
+        move_from_paths+=("$path"); move_to_paths+=("$move_to"); move_kinds+=("file"); move_conflicts+=("$move_conflict")
+        cleaned+="${C_WARN}${ICON_MOVE} move file: $path -> $move_to${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<FOLDER_MOVE\ path=\"([^\"]*)\"\ to=\"([^\"]*)\"(\ conflict=\"(overwrite|skip|rename)\")?\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        local move_to="${BASH_REMATCH[2]}"
+        local move_conflict="${BASH_REMATCH[4]:-skip}"
+        move_from_paths+=("$path"); move_to_paths+=("$move_to"); move_kinds+=("folder"); move_conflicts+=("$move_conflict")
+        cleaned+="${C_WARN}${ICON_MOVE} move folder: $path -> $move_to${C_RESET}"$'\n'
+        continue
+      fi
       if [[ "$line" =~ ^\<\<\<BULK_WRITE\>\>\>$ ]]; then
         mode="bulkwrite"
         cleaned+="${C_WARN}${ICON_WRITE} bulk write:${C_RESET}"$'\n'
@@ -3843,6 +4863,11 @@ process_agent_reply() {
       if [[ "$line" =~ ^\<\<\<BULK_DELETE\>\>\>$ ]]; then
         mode="bulkdelete"
         cleaned+="${C_ERR}${ICON_DELETE} bulk delete:${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<BULK_MOVE\>\>\>$ ]]; then
+        mode="bulkmove"
+        cleaned+="${C_WARN}${ICON_MOVE} bulk move:${C_RESET}"$'\n'
         continue
       fi
       if [[ "$line" =~ ^\<\<\<FILE_READ\ path=\"(.*)\"\>\>\>$ ]]; then
@@ -3871,10 +4896,49 @@ process_agent_reply() {
         cleaned+="${C_ACCENT2}${ICON_ZIP} zip list: $path${C_RESET}"$'\n'
         continue
       fi
+      if [[ "$line" =~ ^\<\<\<ZIP_EXTRACT\ path=\"([^\"]*)\"\ to=\"([^\"]*)\"(\ conflict=\"(overwrite|skip)\")?\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        local zx_to="${BASH_REMATCH[2]}" zx_conflict="${BASH_REMATCH[4]:-skip}"
+        zipextract_paths+=("$path"); zipextract_to+=("$zx_to"); zipextract_conflicts+=("$zx_conflict")
+        cleaned+="${C_WARN}${ICON_ZIP} zip extract: $path -> $zx_to${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<ZIP_CREATE\ path=\"(.*)\"\>\>\>$ ]]; then
+        path="${BASH_REMATCH[1]}"
+        zipcreate_idx=$((zipcreate_idx + 1))
+        zipcreate_file="$tmpdir/zipcreate_$zipcreate_idx"
+        : > "$zipcreate_file"
+        mode="zipcreate"
+        zipcreate_paths+=("$path")
+        cleaned+="${C_WARN}${ICON_ZIP} zip create: $path${C_RESET}"$'\n'
+        continue
+      fi
       if [[ "$line" =~ ^\<\<\<WEB_SEARCH\ query=\"(.*)\"\>\>\>$ ]]; then
         local search_q="${BASH_REMATCH[1]}"
         search_queries+=("$search_q")
         cleaned+="${C_ACCENT2}${ICON_SEARCH} search: $search_q${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<NET_GET\ url=\"(.*)\"\>\>\>$ ]]; then
+        local ng_url="${BASH_REMATCH[1]}"
+        netget_urls+=("$ng_url")
+        cleaned+="${C_WARN}${ICON_NET} GET: $ng_url${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<NET_DOWNLOAD\ url=\"([^\"]*)\"\ path=\"([^\"]*)\"\>\>\>$ ]]; then
+        local nd_url="${BASH_REMATCH[1]}" nd_path="${BASH_REMATCH[2]}"
+        netdownload_urls+=("$nd_url"); netdownload_paths+=("$nd_path")
+        cleaned+="${C_WARN}${ICON_NET} download: $nd_url -> $nd_path${C_RESET}"$'\n'
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<NET_POST\ url=\"([^\"]*)\"(\ content_type=\"([^\"]*)\")?\>\>\>$ ]]; then
+        local np_url="${BASH_REMATCH[1]}" np_ctype="${BASH_REMATCH[3]:-application/json}"
+        netpost_idx=$((netpost_idx + 1))
+        netpost_file="$tmpdir/netpost_$netpost_idx"
+        : > "$netpost_file"
+        mode="netpost"
+        netpost_urls+=("$np_url"); netpost_ctypes+=("$np_ctype")
+        cleaned+="${C_WARN}${ICON_NET} POST: $np_url${C_RESET}"$'\n'
         continue
       fi
       # Bracket count and quote style are tolerant here (2-4 angle brackets,
@@ -3970,12 +5034,26 @@ process_agent_reply() {
         cleaned+="${C_ACCENT2}${ICON_SEARCH} search: $alt_query${C_RESET}"$'\n'
         continue
       fi
+      # Same tolerance idea again, for FILE_MOVE/FOLDER_MOVE specifically
+      # since they take two attributes (path= and to=) rather than one.
+      if [[ "$shim_line" =~ ^\<+(tool_call\>[[:space:]]*)?(FILE_MOVE|FOLDER_MOVE)[[:space:]]+path=[\"\']([^\"\']*)[\"\'][[:space:]]+to=[\"\']([^\"\']*)[\"\'].*\>+.*$ ]]; then
+        local alt_move_action="${BASH_REMATCH[2]}" alt_move_from="${BASH_REMATCH[3]}" alt_move_to="${BASH_REMATCH[4]}"
+        warn "Accepted non-standard marker as: $alt_move_action path=\"$alt_move_from\" to=\"$alt_move_to\""
+        if [[ "$alt_move_action" == "FILE_MOVE" ]]; then
+          move_from_paths+=("$alt_move_from"); move_to_paths+=("$alt_move_to"); move_kinds+=("file"); move_conflicts+=("skip")
+          cleaned+="${C_WARN}${ICON_MOVE} move file: $alt_move_from -> $alt_move_to${C_RESET}"$'\n'
+        else
+          move_from_paths+=("$alt_move_from"); move_to_paths+=("$alt_move_to"); move_kinds+=("folder"); move_conflicts+=("skip")
+          cleaned+="${C_WARN}${ICON_MOVE} move folder: $alt_move_from -> $alt_move_to${C_RESET}"$'\n'
+        fi
+        continue
+      fi
       # Fallback: the line looks like an attempted action marker (mentions
       # one of the known action names) but didn't match any exact pattern
       # above — most likely a malformed/near-miss syntax (e.g. <tool_call>
       # instead of <<<...>>>). Don't just silently drop it: surface it to
       # the user and tell the model to retry with the exact marker syntax.
-      if [[ "$line" =~ (FILE_READ|FILE_WRITE|FILE_EDIT|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|DIR_LIST|ZIP_LIST|ZIP_READ|SHELL_RUN|WEB_SEARCH|MCP_CALL|BULK_WRITE|BULK_FOLDER_CREATE|BULK_DELETE) ]]; then
+      if [[ "$line" =~ (FILE_READ|FILE_WRITE|FILE_EDIT|FILE_DELETE|FOLDER_CREATE|FOLDER_DELETE|FILE_MOVE|FOLDER_MOVE|DIR_LIST|ZIP_LIST|ZIP_READ|ZIP_CREATE|ZIP_EXTRACT|SHELL_RUN|WEB_SEARCH|MCP_CALL|NET_GET|NET_POST|NET_DOWNLOAD|BULK_WRITE|BULK_FOLDER_CREATE|BULK_DELETE|BULK_MOVE) ]]; then
         warn "Model attempted a malformed action marker: $line"
         AGENT_TOOL_OUTPUT+=$'\n\n'"[MARKER ERROR]: The line below was not recognized as a valid action — the ONLY valid syntax is the exact <<<...>>> markers described in your instructions (e.g. <<<DIR_LIST path=\".\">>>). Reissue it using that exact syntax:"$'\n'"$line"
         AGENT_HAD_TOOL_CALLS=1
@@ -4005,6 +5083,20 @@ process_agent_reply() {
         continue
       fi
       printf '%s\n' "$line" >> "$shell_file"
+    elif [[ "$mode" == "zipcreate" ]]; then
+      if [[ "$line" == '<<<END_ZIP_CREATE>>>' ]]; then
+        zipcreate_files+=("$zipcreate_file")
+        mode="text"
+        continue
+      fi
+      printf '%s\n' "$line" >> "$zipcreate_file"
+    elif [[ "$mode" == "netpost" ]]; then
+      if [[ "$line" == '<<<END_NET_POST>>>' ]]; then
+        netpost_files+=("$netpost_file")
+        mode="text"
+        continue
+      fi
+      printf '%s\n' "$line" >> "$netpost_file"
     elif [[ "$mode" == "mcpcall" ]]; then
       if [[ "$line" == '<<<END_MCP_CALL>>>' ]] || [[ "$line" =~ ^\<{2,4}END_MCP_CALL\>{2,4}[[:space:]]*$ ]]; then
         mcp_call_files+=("$mcp_call_file")
@@ -4055,6 +5147,49 @@ process_agent_reply() {
         bulk_delete_paths+=("$line")
         cleaned+="${C_DIM}  + $line${C_RESET}"$'\n'
       fi
+    elif [[ "$mode" == "bulkmove" ]]; then
+      # Trim incidental leading/trailing whitespace before comparing the
+      # end marker — a model that indents its output (e.g. inside a
+      # markdown list or code block) shouldn't silently strand the parser
+      # in bulk-move mode forever.
+      local trimmed_line="$line"
+      trimmed_line="${trimmed_line#"${trimmed_line%%[![:space:]]*}"}"
+      trimmed_line="${trimmed_line%"${trimmed_line##*[![:space:]]}"}"
+      if [[ "$trimmed_line" == '<<<END_BULK_MOVE>>>' ]]; then
+        mode="text"
+        continue
+      fi
+      if [[ "$line" =~ ^\<\<\<ITEM\ path=\"([^\"]*)\"\ to=\"([^\"]*)\"\ kind=\"(file|folder)\"(\ conflict=\"(overwrite|skip|rename)\")?\>\>\>$ ]]; then
+        bulk_move_from_paths+=("${BASH_REMATCH[1]}")
+        bulk_move_to_paths+=("${BASH_REMATCH[2]}")
+        bulk_move_kinds+=("${BASH_REMATCH[3]}")
+        bulk_move_conflicts+=("${BASH_REMATCH[5]:-skip}")
+        cleaned+="${C_DIM}  + ${BASH_REMATCH[1]} -> ${BASH_REMATCH[2]}${C_RESET}"$'\n'
+      elif [[ "$trimmed_line" == *ITEM* && "$trimmed_line" == *path=* ]]; then
+        # Near-miss ITEM line: attributes present but in a different order,
+        # single-quoted, or with extra whitespace — the exact match above
+        # missed it. Pull each attribute out independently instead of
+        # silently dropping the whole item (the previous behavior here was
+        # to just ignore anything that didn't match perfectly, with zero
+        # feedback — that's precisely what made bulk moves fail invisibly).
+        local item_path="" item_to="" item_kind="file" item_conflict="skip"
+        [[ "$trimmed_line" =~ path=[\"\']([^\"\']*)[\"\'] ]] && item_path="${BASH_REMATCH[1]}"
+        [[ "$trimmed_line" =~ \ to=[\"\']([^\"\']*)[\"\'] ]] && item_to="${BASH_REMATCH[1]}"
+        [[ "$trimmed_line" =~ kind=[\"\'](file|folder)[\"\'] ]] && item_kind="${BASH_REMATCH[1]}"
+        [[ "$trimmed_line" =~ conflict=[\"\'](overwrite|skip|rename)[\"\'] ]] && item_conflict="${BASH_REMATCH[1]}"
+        if [[ -n "$item_path" && -n "$item_to" ]]; then
+          bulk_move_from_paths+=("$item_path")
+          bulk_move_to_paths+=("$item_to")
+          bulk_move_kinds+=("$item_kind")
+          bulk_move_conflicts+=("$item_conflict")
+          cleaned+="${C_DIM}  + $item_path -> $item_to${C_RESET}"$'\n'
+        else
+          warn "Malformed BULK_MOVE item, skipped: $line"
+          cleaned+="${C_WARN}${ICON_WARN} malformed bulk move item, skipped: $line${C_RESET}"$'\n'
+        fi
+      fi
+      # Blank lines / other stray text are still ignored — only a line that
+      # actually looks like an attempted ITEM gets a warning above.
     elif [[ "$mode" == "thinking" ]]; then
       if [[ "$line" == '<<<END_THINKING>>>' ]]; then
         mode="text"
@@ -4083,6 +5218,9 @@ process_agent_reply() {
   for path in "${folder_delete_paths[@]}"; do
     handle_folder_delete_action "$path"
   done
+  for i in "${!move_from_paths[@]}"; do
+    handle_move_action "${move_from_paths[$i]}" "${move_to_paths[$i]}" "${move_kinds[$i]}" "${move_conflicts[$i]}"
+  done
   if [[ "${#bulk_write_paths[@]}" -gt 0 ]]; then
     handle_bulk_write_action bulk_write_paths bulk_write_files
   fi
@@ -4092,6 +5230,17 @@ process_agent_reply() {
   if [[ "${#bulk_delete_paths[@]}" -gt 0 ]]; then
     handle_bulk_delete_action bulk_delete_paths
   fi
+  if [[ "${#bulk_move_from_paths[@]}" -gt 0 ]]; then
+    handle_bulk_move_action bulk_move_from_paths bulk_move_to_paths bulk_move_kinds bulk_move_conflicts
+  fi
+  for i in "${!zipcreate_paths[@]}"; do
+    handle_zip_create_action "${zipcreate_paths[$i]}" "${zipcreate_files[$i]}"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for i in "${!zipextract_paths[@]}"; do
+    handle_zip_extract_action "${zipextract_paths[$i]}" "${zipextract_to[$i]}" "${zipextract_conflicts[$i]}"
+    AGENT_HAD_TOOL_CALLS=1
+  done
 
   # Read-only inspection + shell execution: results are accumulated into
   # AGENT_TOOL_OUTPUT (reset by the caller each turn) so the caller can send
@@ -4122,6 +5271,18 @@ process_agent_reply() {
   done
   for i in "${!mcp_call_servers[@]}"; do
     handle_mcp_call_action "${mcp_call_servers[$i]}" "${mcp_call_tools[$i]}" "${mcp_call_files[$i]}"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for i in "${!netget_urls[@]}"; do
+    handle_net_get_action "${netget_urls[$i]}"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for i in "${!netpost_urls[@]}"; do
+    handle_net_post_action "${netpost_urls[$i]}" "${netpost_ctypes[$i]}" "${netpost_files[$i]}"
+    AGENT_HAD_TOOL_CALLS=1
+  done
+  for i in "${!netdownload_urls[@]}"; do
+    handle_net_download_action "${netdownload_urls[$i]}" "${netdownload_paths[$i]}"
     AGENT_HAD_TOOL_CALLS=1
   done
 
@@ -4679,61 +5840,68 @@ extract_reasoning_text() {
 # Runs a single completion round against the current $messages_json, with the
 # existing empty-content retry and reasoning-trace fallback. Prints the reply
 # text to stdout (nothing on total failure, having already printed errors).
+#
+# Ctrl+T ("cancel thinking") and Ctrl+S ("stop prompt") both abort the
+# in-flight network call, but they mean different things afterward: Ctrl+S
+# really does stop — the whole turn ends here, same as any other failure.
+# Ctrl+T is lighter — the user just wants a fresh attempt right now (e.g. the
+# call seems stuck), not to give up on the turn — so it loops straight back
+# into another attempt instantly instead of falling through to the same
+# "stop" ending. THINKING_CANCEL_LIMIT is just a sanity backstop against a
+# runaway loop; a person mashing Ctrl+T that many times in a row wants Ctrl+S.
+THINKING_CANCEL_LIMIT=20
 get_completion() {
-  local body http_code reply retry_messages reasoning code_tmp
+  local body http_code reply reasoning code_tmp cur_messages="$messages_json"
+  local thinking_cancels=0 tried_empty_retry=0
   code_tmp="$(mktemp)"
 
-  body="$(call_provider_with_retry "$messages_json" "$code_tmp")"
-  http_code="$(cat "$code_tmp" 2>/dev/null)"
-
-  if [[ "$http_code" == CANCELLED:* ]]; then
-    rm -f "$code_tmp"
-    if [[ "${http_code#CANCELLED:}" == "prompt" ]]; then
-      warn "Prompt stopped (Ctrl+S)."
-    else
-      warn "Thinking cancelled (Ctrl+T)."
-    fi
-    return 1
-  fi
-
-  if [[ "$http_code" != "200" ]]; then
-    err "$(provider_label) request failed (HTTP $http_code)."
-    if [[ -n "$body" ]]; then
-      echo "$body" | jq -r '.error.message // .message // .error // empty' 2>/dev/null || true
-      echo "$body" | jq '.' 2>/dev/null || echo "$body"
-    fi
-    rm -f "$code_tmp"
-    return 1
-  fi
-
-  reply="$(jq -r '.choices[0].message.content // empty' <<< "$body" 2>/dev/null)"
-
-  if [[ -z "$reply" ]]; then
-    # Some free reasoning models occasionally return finish_reason: stop with
-    # an empty message.content, having dumped everything into an internal
-    # "reasoning" field instead. Give it one retry with an explicit nudge
-    # before giving up.
-    warn "Model returned no final answer. Retrying once..."
-    retry_messages="$(jq -c \
-      '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any action or tool blocks if applicable."}]' \
-      <<< "$messages_json")"
-    body="$(call_provider_with_retry "$retry_messages" "$code_tmp")"
+  while true; do
+    body="$(call_provider_with_retry "$cur_messages" "$code_tmp")"
     http_code="$(cat "$code_tmp" 2>/dev/null)"
 
     if [[ "$http_code" == CANCELLED:* ]]; then
-      rm -f "$code_tmp"
       if [[ "${http_code#CANCELLED:}" == "prompt" ]]; then
         warn "Prompt stopped (Ctrl+S)."
-      else
-        warn "Thinking cancelled (Ctrl+T)."
+        rm -f "$code_tmp"
+        return 1
       fi
+      thinking_cancels=$((thinking_cancels + 1))
+      if (( thinking_cancels >= THINKING_CANCEL_LIMIT )); then
+        warn "Thinking cancelled (Ctrl+T) too many times in a row — stopping instead. Use Ctrl+S to stop directly."
+        rm -f "$code_tmp"
+        return 1
+      fi
+      muted "Thinking cancelled (Ctrl+T) — retrying instantly..."
+      continue
+    fi
+
+    if [[ "$http_code" != "200" ]]; then
+      err "$(provider_label) request failed (HTTP $http_code)."
+      if [[ -n "$body" ]]; then
+        echo "$body" | jq -r '.error.message // .message // .error // empty' 2>/dev/null || true
+        echo "$body" | jq '.' 2>/dev/null || echo "$body"
+      fi
+      rm -f "$code_tmp"
       return 1
     fi
 
-    if [[ "$http_code" == "200" ]]; then
-      reply="$(jq -r '.choices[0].message.content // empty' <<< "$body" 2>/dev/null)"
+    reply="$(jq -r '.choices[0].message.content // empty' <<< "$body" 2>/dev/null)"
+
+    if [[ -z "$reply" && "$tried_empty_retry" -eq 0 ]]; then
+      # Some free reasoning models occasionally return finish_reason: stop
+      # with an empty message.content, having dumped everything into an
+      # internal "reasoning" field instead. Give it one retry with an
+      # explicit nudge before giving up.
+      tried_empty_retry=1
+      warn "Model returned no final answer. Retrying once..."
+      cur_messages="$(jq -c \
+        '. + [{role:"user", content:"Your previous response contained no final answer, only internal reasoning. Reply again with your actual final answer as plain text, including any action or tool blocks if applicable."}]' \
+        <<< "$messages_json")"
+      continue
     fi
-  fi
+
+    break
+  done
 
   rm -f "$code_tmp"
 
@@ -4918,6 +6086,12 @@ command_router() {
     confirm\ *)
       warn "Unknown confirm subcommand. Usage: t> confirm [on | off]"
       ;;
+    undo)
+      run_undo
+      ;;
+    redo)
+      run_redo
+      ;;
     clear)
       run_clear_screen
       ;;
@@ -4938,11 +6112,11 @@ command_router() {
 }
 
 main() {
+  clear
+  banner
   check_deps
   setup_tty_for_cancel
 
-  clear
-  banner
   pick_provider_startup
   ask_api_key
 
