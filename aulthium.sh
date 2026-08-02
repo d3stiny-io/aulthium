@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -u
 
+# Resolved once, up front, before anything else touches $0 — this is the
+# real on-disk path auto-update will eventually overwrite (via `mv`, see
+# the "AUTO-UPDATE" section below). If Aulthium was piped straight into
+# bash (curl ... | bash) instead of run from a saved file, this comes back
+# empty/unusable and auto-update quietly disables itself — there's nothing
+# on disk to replace.
+SELF_SCRIPT_PATH="$(realpath -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
+
 # AULTHIUM
 # Single-file Bash terminal AI client for Termux / Linux
 # Talks to either OpenRouter or Google AI Studio, chosen via 't> provider'.
@@ -81,6 +89,28 @@ MCP_RPC_NEXT_ID=1
 # with an optional per-server bearer key picked up from
 # MCP_<NAME>_KEY (name uppercased, non-alphanumeric chars turned into "_").
 # Anything beyond that is managed at runtime with 't> mcp add/remove/list/refresh'.
+
+# ── Auto-update ──────────────────────────────────────────────────────────
+# Point AULTHIUM_UPDATE_URL at a raw copy of this same script (e.g. a
+# GitHub "raw" URL) to turn this on. Design goal: never interrupt a live
+# session. Checks and downloads always happen in a detached background
+# job — the chat loop is never blocked waiting on them. When a newer
+# version is confirmed (version compare + syntax check + a sanity check
+# that it's actually an Aulthium script), it's swapped onto disk via an
+# atomic same-directory `mv`. That's the trick that makes it non-disruptive:
+# this process still has the OLD file open, so it keeps running the old
+# code uninterrupted no matter when the swap happens — the new file is
+# just what's there the next time Aulthium is launched. See the
+# "AUTO-UPDATE" functions below (autoupdate_worker and friends).
+AUTOUPDATE_URL="${AULTHIUM_UPDATE_URL:-}"
+AUTOUPDATE_ENABLED=1                                    # session toggle — 't> update on/off'
+AUTOUPDATE_INTERVAL_SECS="${AULTHIUM_UPDATE_INTERVAL:-21600}"  # 6h between automatic checks
+AUTOUPDATE_STATE_DIR=""       # session-scoped scratch dir (lock/ready/error markers)
+AUTOUPDATE_LOCK_FILE=""
+AUTOUPDATE_READY_FILE=""      # holds the new version string once a swap has been applied
+AUTOUPDATE_ERROR_FILE=""      # holds the last check's failure reason, if any
+AUTOUPDATE_LAST_CHECK_FILE="" # persists across runs so restarts don't re-check every launch
+AUTOUPDATE_NOTIFIED=0         # so the "update is ready" notice only prints once per session
 
 CURRENT_MODEL="$DEFAULT_MODEL"
 CURRENT_MODEL_LABEL="$DEFAULT_MODEL"
@@ -573,6 +603,7 @@ cleanup_exit() {
   restore_tty
   rm -f "${OPENROUTER_MODELS_CACHE_FILE:-}"
   [[ -n "${UNDO_DIR:-}" ]] && rm -rf "$UNDO_DIR" 2>/dev/null
+  [[ -n "${AUTOUPDATE_STATE_DIR:-}" ]] && rm -rf "$AUTOUPDATE_STATE_DIR" 2>/dev/null
   printf '\n'
   printf "${C_OK}%s${C_RESET}\n" "Aulthium has been closed." >&2
   exit 0
@@ -670,6 +701,194 @@ check_deps() {
   printf 'x' | grep -Pzo 'x' >/dev/null 2>&1 || HAVE_GREP_PCRE=0
   if [[ "$HAVE_GREP_PCRE" -eq 0 ]]; then
     warn "This system's grep lacks PCRE (-P) support — web search will use a simpler fallback parser."
+  fi
+}
+
+# ── AUTO-UPDATE ──────────────────────────────────────────────────────────
+# Everything here follows one rule: nothing in this section is ever allowed
+# to block the chat loop. Network calls only ever happen inside a detached
+# background job (autoupdate_worker); everything called from the main loop
+# (autoupdate_poll, autoupdate_check_async) only ever touches small local
+# marker files and returns instantly.
+
+# autoupdate_version_gt A B — true (0) if version A is strictly newer than
+# B. Both are compared as dot-separated numeric components ("v1.2.10" vs
+# "1.9.0"); a leading "v" and any non-digit noise in a component is
+# stripped, missing trailing components count as 0.
+autoupdate_version_gt() {
+  local a="${1#v}" b="${2#v}"
+  local -a A B
+  IFS='.' read -r -a A <<< "$a"
+  IFS='.' read -r -a B <<< "$b"
+  local n=${#A[@]}
+  (( ${#B[@]} > n )) && n=${#B[@]}
+  local i x y
+  for (( i = 0; i < n; i++ )); do
+    x="${A[i]:-0}"; x="${x//[^0-9]/}"; x="${x:-0}"
+    y="${B[i]:-0}"; y="${y//[^0-9]/}"; y="${y:-0}"
+    if (( 10#$x > 10#$y )); then return 0; fi
+    if (( 10#$x < 10#$y )); then return 1; fi
+  done
+  return 1
+}
+
+# Whether auto-update is actually usable right now: a source URL is
+# configured, the session toggle is on, and this process can tell where it
+# actually lives on disk (not the case for e.g. `curl ... | bash`).
+autoupdate_available() {
+  [[ -n "$AUTOUPDATE_URL" ]] || return 1
+  [[ "$AUTOUPDATE_ENABLED" -eq 1 ]] || return 1
+  [[ -n "$SELF_SCRIPT_PATH" && -f "$SELF_SCRIPT_PATH" ]] || return 1
+  return 0
+}
+
+# One-time setup: scratch dir for this session's lock/ready/error markers,
+# plus a small persistent file under $HOME so a burst of quick restarts
+# doesn't re-hit the update URL every single launch.
+autoupdate_init() {
+  [[ -n "$AUTOUPDATE_URL" ]] || return 0
+
+  AUTOUPDATE_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aulthium_update.XXXXXX" 2>/dev/null)" || AUTOUPDATE_STATE_DIR=""
+  if [[ -z "$AUTOUPDATE_STATE_DIR" ]]; then
+    AUTOUPDATE_ENABLED=0
+    return 0
+  fi
+  AUTOUPDATE_LOCK_FILE="$AUTOUPDATE_STATE_DIR/lock.pid"
+  AUTOUPDATE_READY_FILE="$AUTOUPDATE_STATE_DIR/ready"
+  AUTOUPDATE_ERROR_FILE="$AUTOUPDATE_STATE_DIR/error"
+
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/aulthium"
+  mkdir -p "$cache_dir" 2>/dev/null
+  AUTOUPDATE_LAST_CHECK_FILE="$cache_dir/last_update_check"
+}
+
+# Does the actual work. ALWAYS run in a detached background subshell — see
+# autoupdate_check_async — never call this directly from the foreground.
+# Downloads the candidate straight into a temp file inside the SAME
+# directory as the running script (not /tmp), so the final `mv` below is
+# a same-filesystem rename: atomic, and safe to do at any moment because
+# any process with the old file already open (this one included) just
+# keeps reading the old inode until it exits.
+autoupdate_worker() {
+  local dir tmp new_version
+  dir="$(dirname -- "$SELF_SCRIPT_PATH")"
+
+  date +%s > "$AUTOUPDATE_LAST_CHECK_FILE" 2>/dev/null
+
+  tmp="$(mktemp "$dir/.aulthium_update.XXXXXX" 2>/dev/null)" || {
+    printf '%s' "can't stage an update in $dir (not writable) — grab it manually from $AUTOUPDATE_URL" \
+      > "$AUTOUPDATE_ERROR_FILE"
+    return 0
+  }
+
+  if ! curl -fsSL --max-time 25 "$AUTOUPDATE_URL" -o "$tmp" 2>/dev/null; then
+    printf '%s' "couldn't reach the update URL" > "$AUTOUPDATE_ERROR_FILE"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  # Sanity checks before we trust this enough to become the real script:
+  # non-trivial size, looks like an Aulthium script, and valid bash syntax.
+  if [[ ! -s "$tmp" ]] \
+     || (( $(wc -c < "$tmp" 2>/dev/null || echo 0) < 2000 )) \
+     || ! grep -q '^APP_NAME="AULTHIUM"' "$tmp" \
+     || ! bash -n "$tmp" 2>/dev/null; then
+    printf '%s' "the download didn't look like a valid Aulthium script — skipped it" \
+      > "$AUTOUPDATE_ERROR_FILE"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  new_version="$(grep -m1 '^APP_VERSION=' "$tmp" | sed -E 's/^APP_VERSION="?([^"]*)"?.*/\1/')"
+  if [[ -z "$new_version" ]] || ! autoupdate_version_gt "$new_version" "$APP_VERSION"; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  chmod --reference="$SELF_SCRIPT_PATH" "$tmp" 2>/dev/null || chmod 755 "$tmp" 2>/dev/null
+
+  if mv -f "$tmp" "$SELF_SCRIPT_PATH" 2>/dev/null; then
+    printf '%s' "$new_version" > "$AUTOUPDATE_READY_FILE"
+  else
+    printf '%s' "downloaded v$new_version but couldn't move it into place" > "$AUTOUPDATE_ERROR_FILE"
+    rm -f "$tmp"
+  fi
+}
+
+# Fires autoupdate_worker in the background if it's worth doing right now.
+# force=1 (from 't> update check') skips the time-based throttle; anything
+# else respects it. Never blocks: the network call happens entirely inside
+# the backgrounded subshell.
+autoupdate_check_async() {
+  local force="${1:-0}"
+  autoupdate_available || return 0
+
+  if [[ -f "$AUTOUPDATE_LOCK_FILE" ]]; then
+    local lpid; lpid="$(cat "$AUTOUPDATE_LOCK_FILE" 2>/dev/null)"
+    [[ -n "$lpid" ]] && kill -0 "$lpid" 2>/dev/null && return 0
+  fi
+
+  # Already have a verified update sitting on disk — no point re-checking.
+  [[ -s "$AUTOUPDATE_READY_FILE" ]] && return 0
+
+  if [[ "$force" -ne 1 && -f "$AUTOUPDATE_LAST_CHECK_FILE" ]]; then
+    local last now
+    last="$(cat "$AUTOUPDATE_LAST_CHECK_FILE" 2>/dev/null)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    now="$(date +%s)"
+    (( now - last < AUTOUPDATE_INTERVAL_SECS )) && return 0
+  fi
+
+  rm -f "$AUTOUPDATE_ERROR_FILE"
+  ( autoupdate_worker ) &
+  local wpid=$!
+  echo "$wpid" > "$AUTOUPDATE_LOCK_FILE"
+  disown "$wpid" 2>/dev/null
+}
+
+# Cheap, called every loop iteration: just checks whether the background
+# worker already dropped a "ready" marker, and if so prints one unobtrusive
+# one-line notice (once) — the update is already applied to disk at this
+# point, so this is purely informational, never a prompt or a blocker.
+autoupdate_poll() {
+  [[ "$AUTOUPDATE_NOTIFIED" -eq 1 ]] && return 0
+  [[ -n "$AUTOUPDATE_STATE_DIR" && -s "$AUTOUPDATE_READY_FILE" ]] || return 0
+  local v; v="$(cat "$AUTOUPDATE_READY_FILE" 2>/dev/null)"
+  AUTOUPDATE_NOTIFIED=1
+  echo
+  ok "Update v$v is downloaded and already in place — this session keeps running $APP_VERSION, untouched."
+  muted "Pick it up anytime: t> exit, then start Aulthium again."
+}
+
+# 't> update' with no argument.
+autoupdate_status_cmd() {
+  if [[ -z "$AUTOUPDATE_URL" ]]; then
+    muted "Auto-update isn't configured — set AULTHIUM_UPDATE_URL to a raw URL of this"
+    muted "script (e.g. a GitHub raw link) and restart to enable it."
+    return 0
+  fi
+  if [[ -z "$SELF_SCRIPT_PATH" || ! -f "$SELF_SCRIPT_PATH" ]]; then
+    warn "Auto-update is unavailable — Aulthium doesn't appear to be running from a saved"
+    warn "file on disk (e.g. it was piped straight into bash)."
+    return 0
+  fi
+  if [[ "$AUTOUPDATE_ENABLED" -eq 0 ]]; then
+    warn "Auto-update is OFF for this session. Run 't> update on' to re-enable it."
+    return 0
+  fi
+
+  ok "Auto-update is ON — checks quietly in the background every $(( AUTOUPDATE_INTERVAL_SECS / 3600 ))h, never interrupting chat."
+  printf "${C_MUTED}│${C_RESET} %-10s %s\n" "source" "$AUTOUPDATE_URL"
+  printf "${C_MUTED}│${C_RESET} %-10s %s\n" "running" "$APP_VERSION"
+
+  if [[ -s "$AUTOUPDATE_READY_FILE" ]]; then
+    ok "v$(cat "$AUTOUPDATE_READY_FILE") is already downloaded and in place — restart to pick it up."
+  elif [[ -f "$AUTOUPDATE_LOCK_FILE" ]] && kill -0 "$(cat "$AUTOUPDATE_LOCK_FILE" 2>/dev/null)" 2>/dev/null; then
+    muted "A check is running in the background right now — keep chatting, it won't get in the way."
+  elif [[ -s "$AUTOUPDATE_ERROR_FILE" ]]; then
+    warn "Last check: $(cat "$AUTOUPDATE_ERROR_FILE")"
+  else
+    muted "Up to date (or no check has run yet this session)."
   fi
 }
 
@@ -1123,6 +1342,9 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> clear" "clear the terminal"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> reset" "start a new conversation"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> history" "show chat history"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> update" "show auto-update status"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> update check" "check for an update now (runs in background, non-blocking)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> update on|off" "toggle background auto-update checks for this session"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> exit" "exit Aulthium"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
@@ -6086,6 +6308,32 @@ command_router() {
     confirm\ *)
       warn "Unknown confirm subcommand. Usage: t> confirm [on | off]"
       ;;
+    update)
+      autoupdate_status_cmd
+      ;;
+    update\ check)
+      if ! autoupdate_available; then
+        autoupdate_status_cmd
+      else
+        say "Checking for an update in the background — keep chatting, I'll let you know if one lands."
+        autoupdate_check_async 1
+      fi
+      ;;
+    update\ on)
+      if [[ -z "$AUTOUPDATE_URL" ]]; then
+        warn "Set AULTHIUM_UPDATE_URL first — there's no update source configured."
+      else
+        AUTOUPDATE_ENABLED=1
+        ok "Auto-update enabled."
+      fi
+      ;;
+    update\ off)
+      AUTOUPDATE_ENABLED=0
+      warn "Auto-update disabled for this session."
+      ;;
+    update\ *)
+      warn "Unknown update subcommand. Usage: t> update [check | on | off]"
+      ;;
     undo)
       run_undo
       ;;
@@ -6136,9 +6384,15 @@ main() {
 
   init_history
 
+  autoupdate_init
+  autoupdate_check_async 0
+
   status_panel
 
   while true; do
+    autoupdate_poll
+    autoupdate_check_async 0
+
     local input=""
     if ! read -r -p "$(printf "${C_ACCENT}User>${C_RESET} ")" input; then
       cleanup_exit
