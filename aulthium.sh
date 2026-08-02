@@ -5421,6 +5421,46 @@ process_agent_reply() {
     fi
   done <<< "$reply"
 
+  # The reply can end while we're still inside a body-collecting mode —
+  # the model's output got cut off (token limit, cancelled generation,
+  # or it just forgot the closing marker) before the matching END_* line
+  # arrived. For most modes that's harmless (nothing was recorded yet),
+  # but FILE_EDIT/ZIP_CREATE/NET_POST/MCP_CALL/BULK_WRITE-item all push
+  # their metadata (path/op/url/...) into an array the moment the OPENING
+  # marker is seen, and only push the matching *_files entry once the
+  # CLOSING marker is seen. If the closing marker never came, the two
+  # arrays end up different lengths — and every "${..._files[$i]}" lookup
+  # below runs under `set -u`, so that mismatch used to crash the whole
+  # script with "unbound variable" instead of failing gracefully. Roll
+  # back whatever dangling metadata was recorded for the unterminated
+  # block so every array pair stays the same length, and tell the model
+  # plainly so it can resend that one action in full.
+  if [[ "$mode" != "text" ]]; then
+    warn "Reply was cut off mid-action (inside an unterminated $mode block) — that last action was dropped, not applied."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[TRUNCATED]: Your reply ended before the block you opened was closed (missing its END_* marker, or the output was cut off). That last action was NOT applied. Reissue it completely, in one uninterrupted block, with its closing marker."
+    AGENT_HAD_TOOL_CALLS=1
+    case "$mode" in
+      editbody)
+        [[ "${#edit_paths[@]}" -gt 0 ]] && unset 'edit_paths[-1]' 'edit_ops[-1]' 'edit_starts[-1]' 'edit_ends[-1]'
+        ;;
+      zipcreate)
+        [[ "${#zipcreate_paths[@]}" -gt 0 ]] && unset 'zipcreate_paths[-1]'
+        ;;
+      netpost)
+        [[ "${#netpost_urls[@]}" -gt 0 ]] && unset 'netpost_urls[-1]' 'netpost_ctypes[-1]'
+        ;;
+      mcpcall)
+        [[ "${#mcp_call_servers[@]}" -gt 0 ]] && unset 'mcp_call_servers[-1]' 'mcp_call_tools[-1]'
+        ;;
+      bulkwriteitem)
+        [[ "${#bulk_write_paths[@]}" -gt 0 ]] && unset 'bulk_write_paths[-1]'
+        ;;
+      # write/shell/bulkfoldercreate/bulkdelete/bulkmove/thinking only ever
+      # commit to their arrays at the closing marker (or per whole line),
+      # so an unterminated block there already leaves nothing dangling.
+    esac
+  fi
+
   printf "\n${C_ACCENT}${C_BOLD}Aulthium>${C_RESET} %s\n" "$cleaned"
 
   local i
