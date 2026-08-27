@@ -241,9 +241,11 @@ For example:
 Aulthium> ❯ shell command
 
 
-┌─ ❯ SHELL RUN ────────────────────────────────────────────────                                             │ cwd: /storage/emulated/0/Download/aulthium-workspace
+┌─ ❯ SHELL RUN ────────────────────────────────────────────────
+│ cwd: /storage/emulated/0/Download/aulthium-workspace
 │ npm install express
-└────────────────────────────────────────────────     ⚠ This is NOT sandboxed to the workspace folder — it runs with your normal shell privileges.
+└────────────────────────────────────────────────────────────
+⚠ This is NOT sandboxed to the workspace folder — it runs with your normal shell privileges.
 ? Run this command? [y/N] 
 ```
 

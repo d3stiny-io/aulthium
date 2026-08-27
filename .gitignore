@@ -1,1 +1,571 @@
-trace.log
+# ============================================================
+# UNIVERSAL GITIGNORE
+# ============================================================
+
+# ------------------------------------------------------------
+# Environment / Secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.env.local
+*.env.development
+*.env.production
+*.env.test
+
+# Secret / credential files
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+credentials.json
+service-account.json
+secrets.json
+secrets.yaml
+secrets.yml
+
+# ------------------------------------------------------------
+# Operating System Files
+# ------------------------------------------------------------
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+
+# Linux
+.directory
+.Trash-*
+.nfs*
+
+# ------------------------------------------------------------
+# Editors / IDEs
+# ------------------------------------------------------------
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Visual Studio
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+
+# Eclipse
+.classpath
+.project
+.settings/
+
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/.nb-gradle/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pydantic / FastAPI generated
+*.log
+
+# ------------------------------------------------------------
+# Node.js / JavaScript / TypeScript
+# ------------------------------------------------------------
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Package manager caches
+.npm/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/install-state.gz
+.pnpm-store/
+
+# Build outputs
+.next/
+.nuxt/
+.output/
+.svelte-kit/
+dist/
+build/
+out/
+coverage/
+
+# Vite
+.vite/
+
+# TypeScript
+*.tsbuildinfo
+
+# Parcel
+.cache/
+.parcel-cache/
+
+# Turbo
+.turbo/
+
+# Astro
+.astro/
+
+# ------------------------------------------------------------
+# React / Next.js
+# ------------------------------------------------------------
+
+.next/
+.vercel/
+.next/cache/
+
+# ------------------------------------------------------------
+# Angular
+# ------------------------------------------------------------
+
+.angular/
+.angular/cache/
+
+# ------------------------------------------------------------
+# Vue
+# ------------------------------------------------------------
+
+.vue/
+
+# ------------------------------------------------------------
+# Svelte
+# ------------------------------------------------------------
+
+.svelte-kit/
+
+# ------------------------------------------------------------
+# Bun
+# ------------------------------------------------------------
+
+.bun/
+bun.lockb
+
+# ------------------------------------------------------------
+# Deno
+# ------------------------------------------------------------
+
+.deno/
+
+# ------------------------------------------------------------
+# PHP
+# ------------------------------------------------------------
+
+vendor/
+composer.lock
+
+# ------------------------------------------------------------
+# Java / Kotlin / Gradle
+# ------------------------------------------------------------
+
+.gradle/
+build/
+out/
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.hprof
+
+# IntelliJ
+.idea/
+
+# ------------------------------------------------------------
+# Rust
+# ------------------------------------------------------------
+
+target/
+Cargo.lock
+
+# ------------------------------------------------------------
+# Go
+# ------------------------------------------------------------
+
+bin/
+*.exe
+*.exe~
+*.test
+*.out
+vendor/
+
+# ------------------------------------------------------------
+# C / C++
+# ------------------------------------------------------------
+
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# ------------------------------------------------------------
+# Ruby
+# ------------------------------------------------------------
+
+.bundle/
+vendor/bundle/
+*.gem
+Gemfile.lock
+
+# ------------------------------------------------------------
+# Dart / Flutter
+# ------------------------------------------------------------
+
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+
+# ------------------------------------------------------------
+# Swift / Xcode
+# ------------------------------------------------------------
+
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# ------------------------------------------------------------
+# Android
+# ------------------------------------------------------------
+
+.gradle/
+.idea/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# ------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------
+
+*.log
+logs/
+log/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ------------------------------------------------------------
+# Temporary Files
+# ------------------------------------------------------------
+
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*.swo
+*~
+
+# ------------------------------------------------------------
+# Databases
+# ------------------------------------------------------------
+
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# ------------------------------------------------------------
+# Caches
+# ------------------------------------------------------------
+
+.cache/
+.cache-loader/
+.parcel-cache/
+.eslintcache
+.stylelintcache
+*.cache
+
+# ------------------------------------------------------------
+# Coverage / Test Reports
+# ------------------------------------------------------------
+
+coverage/
+.nyc_output/
+htmlcov/
+.coverage
+.coverage.*
+test-results/
+playwright-report/
+blob-report/
+
+# ------------------------------------------------------------
+# Playwright
+# ------------------------------------------------------------
+
+playwright-report/
+test-results/
+blob-report/
+
+# ------------------------------------------------------------
+# Docker
+# ------------------------------------------------------------
+
+docker-compose.override.yml
+*.dockerfile
+.docker/
+
+# ------------------------------------------------------------
+# Terraform
+# ------------------------------------------------------------
+
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# ------------------------------------------------------------
+# Serverless / Cloud
+# ------------------------------------------------------------
+
+.serverless/
+.aws-sam/
+.sam/
+.vercel/
+.netlify/
+
+# Cloudflare
+.wrangler/
+.dev.vars
+
+# ------------------------------------------------------------
+# Firebase
+# ------------------------------------------------------------
+
+.firebase/
+.firebase-debug.log
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# ------------------------------------------------------------
+# Credentials / Cloud Config
+# ------------------------------------------------------------
+
+.aws/
+.gcloud/
+.azure/
+*.credentials.json
+
+# ------------------------------------------------------------
+# Archives / Generated Files
+# ------------------------------------------------------------
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.iso
+
+# ------------------------------------------------------------
+# Large / Generated Media
+# ------------------------------------------------------------
+
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.wav
+*.flac
+*.psd
+*.ai
+*.blend
+
+# ------------------------------------------------------------
+# Documentation Build
+# ------------------------------------------------------------
+
+_site/
+.jekyll-cache/
+.jekyll-metadata
+.sphinx/
+docs/_build/
+
+# ------------------------------------------------------------
+# Local Development
+# ------------------------------------------------------------
+
+.local/
+.local.*
+tmp/
+temp/
+uploads/
+storage/
+
+# ------------------------------------------------------------
+# PIDs / Runtime
+# ------------------------------------------------------------
+
+*.pid
+*.pid.lock
+*.seed
+*.pidfile
+
+# ------------------------------------------------------------
+# Dependency Lockfiles
+# NOTE:
+# Usually KEEP lockfiles in Git.
+# Uncomment these only if you intentionally don't want them.
+# ------------------------------------------------------------
+
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+# poetry.lock
+# Pipfile.lock
+
+# ------------------------------------------------------------
+# Generated API / OpenAPI Files
+# ------------------------------------------------------------
+
+# openapi.generated.*
+# swagger.generated.*
+
+# ------------------------------------------------------------
+# Local Configuration
+# ------------------------------------------------------------
+
+config.local.*
+config.local.*
+settings.local.*
+*.local.json
+*.local.yaml
+*.local.yml
+
+# ------------------------------------------------------------
+# AI / Local Model Files
+# ------------------------------------------------------------
+
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+models/
+model/
+.checkpoints/
+
+# ------------------------------------------------------------
+# Miscellaneous
+# ------------------------------------------------------------
+
+.DS_Store
+*.orig
+*.rej
+*.patch
