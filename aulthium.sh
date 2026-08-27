@@ -15,7 +15,7 @@ SELF_SCRIPT_PATH="$(realpath -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="AULTHIUM"
-APP_VERSION="v1.0.3"
+APP_VERSION="v1.0.4"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
@@ -127,6 +127,16 @@ WORKSPACE_DIR=""
 # either way — this only removes the "do you want to proceed?" gate, not
 # the visibility.
 SKIP_CONFIRMATIONS=0
+
+# Plugins are separate, self-contained programs (not sandboxed like the
+# file agent) that Aulthium can launch on request, pre-fed with the active
+# provider/model/key as env vars so they can talk to the AI backend on
+# their own. Installed under $PLUGINS_DIR, one subfolder per plugin, each
+# with a plugin.json manifest — see plugin_bootstrap_builtin below for the
+# built-in "webchat" plugin, and BUILD_PLUGIN.md for the format writers of
+# new plugins need. Overridable so a non-default HOME (or none at all)
+# doesn't break plugin discovery.
+PLUGINS_DIR="${AULTHIUM_PLUGINS_DIR:-$HOME/.aulthium/plugins}"
 
 # In-memory conversation history only.
 # We keep the system prompt in the history from the start.
@@ -451,6 +461,7 @@ ICON_SEARCH="⌕"   # web search
 ICON_MCP="⚡"      # MCP server tool call
 ICON_NET="↯"      # HTTP request / download
 ICON_UNDO="↺"     # undo/redo
+ICON_PLUGIN="▶"   # plugin activity
 ICON_OK="✓"
 ICON_WARN="⚠"
 ICON_ERR="✗"
@@ -1331,6 +1342,10 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp remove <name>" "disconnect an MCP server"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp refresh [name]" "re-discover tools (one server, or all)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp cloudflare" "quick-pick from Cloudflare's managed MCP servers"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin" "list installed plugins"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run <name>" "launch a plugin (needs y/N confirmation)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin info <name>" "show a plugin's manifest details"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin install <p>" "install a plugin folder from a local path"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory" "show whether a history file is connected"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory connect <p>" "connect/reconnect a history file (load or start it)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory disconnect" "stop appending turns to the connected file"
@@ -1405,6 +1420,24 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       managed MCP servers (docs, Workers bindings, Radar, AI\n"
   printf "${C_MUTED}│${C_RESET}       Gateway, ...) by name instead of typing out a URL — once\n"
   printf "${C_MUTED}│${C_RESET}       added they're ordinary MCP servers like any other.\n"
+  printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
+
+  printf "\n${C_ACCENT2}┌─ PLUGINS ─────────────────────────────────────${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_PLUGIN}${C_RESET}      plugins are separate external programs, one\n"
+  printf "${C_MUTED}│${C_RESET}       per folder under %s, each\n" "$PLUGINS_DIR"
+  printf "${C_MUTED}│${C_RESET}       with a plugin.json manifest. Unlike the file/search\n"
+  printf "${C_MUTED}│${C_RESET}       agent, they are NOT sandboxed — launching one is a\n"
+  printf "${C_MUTED}│${C_RESET}       trust decision, same tier as a shell command, and\n"
+  printf "${C_MUTED}│${C_RESET}       needs a y/N confirmation.\n"
+  printf "${C_MUTED}│${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}webchat${C_MUTED}, the built-in plugin, is a small\n"
+  printf "${C_MUTED}│${C_RESET}       stdlib-only Python web server (needs python3) that\n"
+  printf "${C_MUTED}│${C_RESET}       opens a chat page in your browser, wired to the same\n"
+  printf "${C_MUTED}│${C_RESET}       provider/model/key this session is using — chat by\n"
+  printf "${C_MUTED}│${C_RESET}       clicking instead of typing at ${C_RESET}User>${C_MUTED}.\n"
+  printf "${C_MUTED}│${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET}       Write your own by reading BUILD_PLUGIN.md, then\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> plugin install <folder>${C_MUTED}.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
 }
 
@@ -5674,6 +5707,1469 @@ change_api_key() {
   ok "$label API key updated."
 }
 
+
+# ── Plugins ──────────────────────────────────────────────────────────────
+# A plugin is an ordinary external program living under $PLUGINS_DIR/<name>/,
+# described by a plugin.json manifest ({name, description, entry, runtime}).
+# Aulthium does NOT sandbox plugin execution the way it sandboxes the file
+# agent — running one is a trust decision, same tier as a shell command, and
+# is gated by the same confirm_action prompt. What Aulthium DOES do is hand
+# the plugin the currently-selected provider/model/key as env vars (see
+# plugin_export_env) so the plugin can talk to the AI backend on its own,
+# without needing this bash process in the loop. Full format documented in
+# BUILD_PLUGIN.md for anyone writing a new one.
+
+plugins_ensure_dir() {
+  mkdir -p "$PLUGINS_DIR" 2>/dev/null
+}
+
+# Writes the built-in "webchat" plugin to disk the first time Aulthium ever
+# needs it — a small, dependency-free (stdlib-only) Python web server that
+# serves a chat page in the browser and talks to the same backend the
+# terminal session is configured with. Only writes if the folder doesn't
+# already exist, so a user's own edits to it are never clobbered by a
+# newer Aulthium version; delete the folder to get the bundled copy back.
+plugin_bootstrap_builtin() {
+  plugins_ensure_dir
+  local dir="$PLUGINS_DIR/webchat"
+  [[ -d "$dir" ]] && return 0
+  mkdir -p "$dir" 2>/dev/null || return 0
+
+  cat > "$dir/plugin.json" <<'EOF'
+{
+  "name": "webchat",
+  "description": "Chat with the AI from a page in your browser instead of typing in the terminal, with the same 429 retry-with-backoff and file/web tool use (gated by yes/no confirmation) as the terminal session",
+  "version": "1.1.0",
+  "entry": "python3 webchat.py",
+  "runtime": "python3"
+}
+EOF
+
+  cat > "$dir/webchat.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""
+Aulthium built-in plugin: webchat
+
+Serves a small local chat webpage, backed by whatever AI provider/model
+Aulthium is currently configured with, so you can chat from a browser tab
+instead of the terminal. Stdlib-only at its core — python3 itself is the
+only hard requirement (that's why "python is needed" for this particular
+plugin; other plugins are free to need nothing, or something else
+entirely) — but WEB_SEARCH prefers BeautifulSoup for parsing results when
+it's installed (`pip install beautifulsoup4` --break-system-packages on
+Termux) and falls back to the old regex-based parser automatically if
+it's not, so the plugin still works with zero extra installs either way.
+
+Two things it mirrors from the terminal session, on top of plain chat:
+
+  - HTTP 429 retry-with-backoff, same shape as call_provider_with_retry in
+    the main script: temporary throttling gets retried (Retry-After header
+    if present, otherwise exponential backoff + jitter, capped), exhausted
+    daily/monthly quota fails fast with a clear message instead of burning
+    retries. The browser sees this live (a "rate limited, retrying in Xs"
+    status) instead of just staring at a spinner.
+
+  - The same marker-based tool protocol as the terminal file agent
+    (FILE_READ / DIR_LIST / WEB_SEARCH run immediately; FILE_WRITE /
+    FILE_DELETE / SHELL_RUN are gated behind an explicit yes/no in the
+    browser, same as confirm_action does in the terminal). SHELL_RUN runs
+    with the same $WORKSPACE_DIR cwd and timeout the terminal's SHELL_RUN
+    uses, and is equally NOT sandboxed to that folder — the command itself
+    can reach anything this device's shell can. The confirm gate *starts*
+    synced to whatever 't> confirm on/off' was set to in the
+    terminal at the moment this plugin was launched
+    (AULTHIUM_SKIP_CONFIRMATIONS), and can be flipped independently from
+    the page itself after that.
+
+Launched by Aulthium via 't> plugin run webchat', which exports the
+connection details below as env vars before starting this process. See
+BUILD_PLUGIN.md for the full contract if you're writing your own plugin.
+"""
+import json
+import os
+import random
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    from bs4 import BeautifulSoup
+    HAVE_BS4 = True
+except ImportError:
+    HAVE_BS4 = False
+
+API_KIND = os.environ.get("AULTHIUM_API_KIND", "openai")
+API_URL = os.environ.get("AULTHIUM_API_URL", "")
+API_KEY = os.environ.get("AULTHIUM_API_KEY", "")
+MODEL = os.environ.get("AULTHIUM_MODEL", "")
+PROVIDER_LABEL = os.environ.get("AULTHIUM_PROVIDER_LABEL", "your AI provider")
+APP_NAME = os.environ.get("AULTHIUM_APP_NAME", "Aulthium")
+WORKSPACE_DIR = os.environ.get("AULTHIUM_WORKSPACE_DIR", "")
+HOST = "127.0.0.1"
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+MAX_RATE_LIMIT_RETRIES = _env_int("AULTHIUM_MAX_RATE_LIMIT_RETRIES", 6)
+MAX_RATE_LIMIT_WAIT = _env_int("AULTHIUM_MAX_RATE_LIMIT_WAIT", 60)
+SHELL_TIMEOUT_SECS = _env_int("AULTHIUM_SHELL_TIMEOUT_SECS", 60)
+
+if not API_URL:
+    sys.stderr.write(
+        "webchat: no AULTHIUM_API_URL in the environment — this plugin is meant to be\n"
+        "launched via 't> plugin run webchat' inside Aulthium, not run standalone.\n"
+    )
+    sys.exit(1)
+
+WORKSPACE_ABS = os.path.realpath(WORKSPACE_DIR) if WORKSPACE_DIR else None
+
+# Session-local confirm gate. Starts synced to the terminal's 't> confirm'
+# state at launch time, but from here on lives only in this webchat
+# process — flipping it in the browser does not reach back into the
+# terminal session, same as the terminal flipping it later doesn't reach
+# into an already-running webchat. Both start from the same place; each
+# then owns its own toggle.
+CONFIRM_STATE = {"on": os.environ.get("AULTHIUM_SKIP_CONFIRMATIONS", "0") != "1"}
+STATE_LOCK = threading.Lock()
+
+TOOL_SYSTEM_PROMPT = """You are """ + APP_NAME + """, a helpful AI assistant reachable through a browser chat page. Answer clearly and concisely, and be practical, friendly, and accurate.
+
+The page renders your replies as markdown (headers, **bold**, *italic*, `inline code`, fenced ``` code blocks, links, lists, blockquotes) — feel free to use it where it helps readability, but don't overdo it for short answers.
+
+You have a small set of optional tools, available only if the person's request calls for them — most replies need none of them at all.
+
+=== READING / INSPECTING (run immediately, no confirmation, results are sent back to you) ===
+
+To read a text file's contents, output a line EXACTLY like this:
+<<<FILE_READ path="relative/path.txt">>>
+
+To list the contents of a folder, output a line EXACTLY like this:
+<<<DIR_LIST path="relative/folder">>>
+(use path="." for the workspace root)
+
+To search the live web for current information you don't already know, output a line EXACTLY like this:
+<<<WEB_SEARCH query="your search terms">>>
+
+=== CHANGING FILES (shown to the user in the browser, requires an explicit yes/no click before it runs) ===
+
+To create or overwrite a file, output a block EXACTLY like this (nothing else on those marker lines):
+<<<FILE_WRITE path="relative/path.txt">>>
+the full file content goes here
+<<<END_FILE_WRITE>>>
+
+To delete a file, output a line EXACTLY like this:
+<<<FILE_DELETE path="relative/path.txt">>>
+
+To run a shell command, output a block EXACTLY like this:
+<<<SHELL_RUN>>>
+the shell command(s) go here
+<<<END_SHELL_RUN>>>
+This runs with the workspace folder as its current directory, using the user's real shell privileges — it is
+NOT confined to the sandbox the way file actions are, so only propose commands you're confident are safe,
+relevant, and non-destructive, and never target files or paths outside the workspace. The user always sees the
+exact command text and must approve it before it runs. Prefer FILE_READ / FILE_WRITE / DIR_LIST for simple
+file inspection or edits; reach for SHELL_RUN when you actually need to execute something (running a build, a
+script, git, or a CLI tool). Output is truncated if very large and sent back to you the same way as the other
+markers.
+
+Rules:
+- Every path must be relative and must stay inside your sandbox folder — never an absolute path, never "..".
+- You can issue several of the above in one reply. Their results are appended to the conversation and you'll
+  automatically be prompted again with that information, so request something, wait for the result, and then
+  give your real answer or take further action in a later turn.
+- If the person declines a FILE_WRITE/FILE_DELETE confirmation, don't repeat the same request — acknowledge it
+  and ask what they'd like instead.
+- Never show raw marker syntax to the user as if it were your answer; markers are instructions to the system,
+  not something to display or explain line-by-line unless asked.
+"""
+
+# ── HTTP helpers ────────────────────────────────────────────────────────
+
+def _do_request(url, data_bytes, headers):
+    """POST and return (status, body_text, headers_dict). status is 0 on a
+    connection-level failure (DNS, timeout, refused, etc), with the error
+    message stuffed into body_text as a JSON error object so callers can
+    treat it uniformly."""
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace"), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return e.code, body, dict(e.headers or {})
+    except Exception as e:
+        return 0, json.dumps({"error": {"message": str(e)}}), {}
+
+
+def call_openai_compatible_raw(messages):
+    payload = json.dumps({
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = "Bearer " + API_KEY
+    return _do_request(API_URL, payload, headers)
+
+
+def call_google_raw(messages):
+    contents = []
+    system_text = None
+    for m in messages:
+        role = m.get("role")
+        text = m.get("content", "")
+        if role == "system":
+            system_text = (system_text + "\n\n" + text) if system_text else text
+            continue
+        contents.append({
+            "role": "model" if role == "assistant" else "user",
+            "parts": [{"text": text}],
+        })
+    body_obj = {"contents": contents}
+    if system_text:
+        body_obj["systemInstruction"] = {"parts": [{"text": system_text}]}
+    payload = json.dumps(body_obj).encode("utf-8")
+    url = API_URL.rstrip("/") + "/models/" + MODEL + ":generateContent?key=" + urllib.parse.quote(API_KEY)
+    return _do_request(url, payload, {"Content-Type": "application/json"})
+
+
+def extract_reply(body_text):
+    obj = json.loads(body_text)
+    if API_KIND == "google":
+        parts = obj["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts)
+    return obj["choices"][0]["message"]["content"]
+
+
+QUOTA_RE = re.compile(r"per-day|per-month|daily|quota|free-models-per|RESOURCE_EXHAUSTED", re.I)
+
+
+def call_with_retry(messages, job):
+    """Same shape as call_provider_with_retry in the terminal script: retry
+    HTTP 429s with backoff + jitter (honoring Retry-After when present),
+    fail fast on an exhausted free-tier quota, give up after
+    MAX_RATE_LIMIT_RETRIES. Reports live status onto `job` as it goes.
+    Returns (reply_text, error_text) — exactly one of them is set."""
+    attempt = 0
+    wait_secs = 2
+    while True:
+        job.set_status("working", "thinking...")
+        if API_KIND == "google":
+            status, body, headers = call_google_raw(messages)
+        else:
+            status, body, headers = call_openai_compatible_raw(messages)
+
+        if job.cancelled:
+            return None, "cancelled"
+
+        if status == 0:
+            try:
+                msg = json.loads(body).get("error", {}).get("message", body)
+            except Exception:
+                msg = body
+            return None, "Connection error: %s" % msg
+
+        if status != 429:
+            if 200 <= status < 300:
+                try:
+                    return extract_reply(body), None
+                except Exception as e:
+                    return None, "Could not parse the response: %s" % e
+            return None, "HTTP %s: %s" % (status, body[:500])
+
+        # 429 — figure out which kind before deciding whether to retry
+        err_msg = ""
+        try:
+            err_msg = json.loads(body).get("error", {}).get("message", "") or ""
+        except Exception:
+            pass
+
+        if QUOTA_RE.search(err_msg or ""):
+            return None, (
+                "%s free-tier quota exhausted: %s — retrying won't help until it resets. "
+                "Switch models in the terminal (t> model), check billing, or wait for the reset."
+                % (PROVIDER_LABEL, err_msg or "rate limit exceeded")
+            )
+
+        if attempt >= MAX_RATE_LIMIT_RETRIES:
+            return None, "HTTP 429 (rate limited): %s" % (err_msg or body[:300])
+
+        attempt += 1
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        if retry_after and str(retry_after).strip().isdigit():
+            wait_secs = int(retry_after)
+        wait_secs = min(wait_secs, MAX_RATE_LIMIT_WAIT)
+        wait_secs = max(wait_secs, 1)
+        jitter = random.randint(1, 3)
+        total_wait = wait_secs + jitter
+
+        job.set_status(
+            "retrying",
+            "Rate limited by %s (HTTP 429). Retrying in %ss... (%s/%s)"
+            % (PROVIDER_LABEL, total_wait, attempt, MAX_RATE_LIMIT_RETRIES),
+        )
+        remaining = total_wait
+        while remaining > 0 and not job.cancelled:
+            time.sleep(1 if remaining > 1 else remaining)
+            remaining -= 1
+
+        wait_secs *= 2
+
+
+# ── Sandbox tools (scoped to WORKSPACE_ABS, same rule as the terminal's
+#    file agent: relative paths only, never escape the folder) ──────────
+
+def safe_path(rel):
+    if not WORKSPACE_ABS:
+        raise ValueError("no sandbox workspace is configured for this session")
+    rel = (rel or "").strip()
+    if rel in ("", "."):
+        return WORKSPACE_ABS
+    if rel.startswith("/") or rel.startswith("~") or ".." in rel.replace("\\", "/").split("/"):
+        raise ValueError("path must be relative and stay inside the workspace")
+    target = os.path.realpath(os.path.join(WORKSPACE_ABS, rel))
+    if target != WORKSPACE_ABS and not target.startswith(WORKSPACE_ABS + os.sep):
+        raise ValueError("path escapes the workspace")
+    return target
+
+
+def tool_file_read(rel):
+    path = safe_path(rel)
+    if not os.path.isfile(path):
+        return "ERROR: no such file: %s" % rel
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = f.read(200_000)
+    if len(data) >= 200_000:
+        data += "\n...[truncated]"
+    return data
+
+
+def tool_dir_list(rel):
+    path = safe_path(rel)
+    if not os.path.isdir(path):
+        return "ERROR: no such folder: %s" % rel
+    entries = sorted(os.listdir(path))
+    if not entries:
+        return "(empty folder)"
+    lines = []
+    for name in entries:
+        full = os.path.join(path, name)
+        lines.append(("dir   " if os.path.isdir(full) else "file  ") + name)
+    return "\n".join(lines)
+
+
+def tool_file_write(rel, content):
+    path = safe_path(rel)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return "OK: wrote %d bytes to %s" % (len(content.encode("utf-8")), rel)
+
+
+def tool_file_delete(rel):
+    path = safe_path(rel)
+    if not os.path.isfile(path):
+        return "ERROR: no such file: %s" % rel
+    os.remove(path)
+    return "OK: deleted %s" % rel
+
+
+def tool_shell_run(cmd_text):
+    """Mirrors the terminal's handle_shell_run_action: cwd = the workspace
+    folder (falling back to this process's cwd if none is configured),
+    NOT path-sandboxed like the file tools — the command can reach
+    anywhere this device's shell can. Capped timeout, output capped and
+    combined stdout+stderr, same shape as the terminal's cap_preview."""
+    cwd = WORKSPACE_ABS or os.getcwd()
+    try:
+        proc = subprocess.run(
+            cmd_text,
+            shell=True,
+            cwd=cwd,
+            timeout=SHELL_TIMEOUT_SECS,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        output = proc.stdout.decode("utf-8", "replace")
+        exit_code = proc.returncode
+    except subprocess.TimeoutExpired as e:
+        output = (e.stdout or b"").decode("utf-8", "replace")
+        output += "\n...[timed out after %ds]" % SHELL_TIMEOUT_SECS
+        exit_code = 124
+    except Exception as e:
+        return "ERROR: %s" % e
+    if len(output) > 8000:
+        output = output[:8000] + "\n...[truncated]"
+    return "exit=%d\n%s" % (exit_code, output or "(no output)")
+
+
+def _web_search_parse_bs4(html):
+    """Preferred parser: BeautifulSoup over DuckDuckGo lite's result markup
+    (each result is an <a class="result-link"> followed by a
+    <td class="result-snippet">). Far more forgiving of markup quirks than
+    the regex fallback below."""
+    soup = BeautifulSoup(html, "html.parser")
+    links = soup.select(".result-link")
+    snippets = soup.select(".result-snippet")
+    results = []
+    for i in range(min(len(links), len(snippets))):
+        title = " ".join(links[i].get_text(" ", strip=True).split())
+        snippet = " ".join(snippets[i].get_text(" ", strip=True).split())
+        if title:
+            results.append((title, snippet))
+    return results
+
+
+def _web_search_parse_regex(html):
+    """Fallback used when BeautifulSoup isn't installed — the original
+    regex-based scrape, kept so WEB_SEARCH still works with zero extra
+    installs."""
+    raw = re.findall(
+        r'class="result-link"[^>]*>(.*?)</a>.*?class="result-snippet">(.*?)</td>', html, re.S
+    )
+    results = []
+    for title, snippet in raw:
+        clean_title = re.sub("<[^>]+>", "", title).strip()
+        clean_snippet = re.sub("<[^>]+>", "", snippet).strip()
+        if clean_title:
+            results.append((clean_title, clean_snippet))
+    return results
+
+
+def tool_web_search(query):
+    try:
+        url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; AulthiumWebchat/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", "replace")
+    except Exception as e:
+        return "ERROR: web search failed: %s" % e
+
+    results = []
+    if HAVE_BS4:
+        try:
+            results = _web_search_parse_bs4(html)
+        except Exception:
+            results = []  # malformed markup or an unexpected bs4 error — fall through to regex
+    if not results:
+        results = _web_search_parse_regex(html)
+
+    if not results:
+        return "No results found."
+    out = []
+    for i, (title, snippet) in enumerate(results[:5], 1):
+        out.append("%d. %s\n   %s" % (i, title, snippet))
+    return "\n".join(out)
+
+
+# ── Marker protocol: parse tool calls out of a model reply, in order ────
+
+BLOCK_RE = re.compile(
+    r'<<<FILE_WRITE\s+path="([^"]*)">>>\n(.*?)\n<<<END_FILE_WRITE>>>', re.S
+)
+SHELL_BLOCK_RE = re.compile(r'<<<SHELL_RUN>>>\n(.*?)\n<<<END_SHELL_RUN>>>', re.S)
+SIMPLE_RE = re.compile(r'<<<(FILE_READ|DIR_LIST|WEB_SEARCH|FILE_DELETE)\s+(?:path|query)="([^"]*)">>>')
+
+NEEDS_CONFIRM = {"FILE_WRITE", "FILE_DELETE", "SHELL_RUN"}
+
+
+def extract_tool_calls(text):
+    calls = []
+    for m in BLOCK_RE.finditer(text):
+        calls.append({"pos": m.start(), "kind": "FILE_WRITE", "path": m.group(1), "content": m.group(2)})
+    for m in SHELL_BLOCK_RE.finditer(text):
+        calls.append({"pos": m.start(), "kind": "SHELL_RUN", "command": m.group(1)})
+    for m in SIMPLE_RE.finditer(text):
+        kind, val = m.group(1), m.group(2)
+        calls.append({"pos": m.start(), "kind": kind, "path": val, "query": val})
+    calls.sort(key=lambda c: c["pos"])
+    return calls
+
+
+def strip_markers(text):
+    text = BLOCK_RE.sub("", text)
+    text = SHELL_BLOCK_RE.sub("", text)
+    text = SIMPLE_RE.sub("", text)
+    return text
+
+
+def describe_call(call):
+    kind = call["kind"]
+    if kind == "FILE_READ":
+        return "Read %s" % call["path"]
+    if kind == "DIR_LIST":
+        return "List %s" % (call["path"] or ".")
+    if kind == "WEB_SEARCH":
+        return "Web search: %s" % call["query"]
+    if kind == "FILE_WRITE":
+        return "Write %s (%d chars)" % (call["path"], len(call.get("content", "")))
+    if kind == "FILE_DELETE":
+        return "Delete %s" % call["path"]
+    if kind == "SHELL_RUN":
+        first_line = (call.get("command") or "").strip().splitlines()[0:1]
+        return "Shell: %s" % (first_line[0] if first_line else "(empty command)")
+    return kind
+
+
+def execute_call(call):
+    try:
+        kind = call["kind"]
+        if kind == "FILE_READ":
+            return tool_file_read(call["path"])
+        if kind == "DIR_LIST":
+            return tool_dir_list(call["path"])
+        if kind == "WEB_SEARCH":
+            return tool_web_search(call["query"])
+        if kind == "FILE_WRITE":
+            return tool_file_write(call["path"], call.get("content", ""))
+        if kind == "FILE_DELETE":
+            return tool_file_delete(call["path"])
+        if kind == "SHELL_RUN":
+            return tool_shell_run(call.get("command", ""))
+        return "ERROR: unknown tool %s" % kind
+    except Exception as e:
+        return "ERROR: %s" % e
+
+
+# ── Jobs: one per in-flight chat turn, polled by the browser so it can
+#    show live rate-limit/tool status and pause for yes/no confirmation ──
+
+class Job:
+    def __init__(self, messages):
+        self.id = uuid.uuid4().hex
+        self.messages = messages
+        self.status = "working"      # working | retrying | confirm | done | error
+        self.detail = "thinking..."
+        self.reply = None
+        self.error = None
+        self.action = None
+        self.events = []
+        self.lock = threading.Lock()
+        self.confirm_event = threading.Event()
+        self.confirm_result = False
+        self.cancelled = False
+        self.created = time.time()
+
+    def set_status(self, status, detail=""):
+        with self.lock:
+            self.status = status
+            self.detail = detail
+
+    def push_event(self, etype, text):
+        with self.lock:
+            self.events.append({"type": etype, "text": text})
+
+    def snapshot(self, since=0):
+        with self.lock:
+            return {
+                "status": self.status,
+                "detail": self.detail,
+                "reply": self.reply,
+                "error": self.error,
+                "action": self.action,
+                "events": self.events[since:],
+                "event_count": len(self.events),
+            }
+
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def _gc_jobs():
+    cutoff = time.time() - 3600
+    with JOBS_LOCK:
+        stale = [jid for jid, j in JOBS.items() if j.created < cutoff]
+        for jid in stale:
+            JOBS.pop(jid, None)
+
+
+def need_confirm_and_wait(job, call):
+    with STATE_LOCK:
+        confirm_on = CONFIRM_STATE["on"]
+    if not confirm_on:
+        job.push_event("auto", describe_call(call) + " (auto-approved, confirmations off)")
+        return True
+
+    with job.lock:
+        job.action = {
+            "kind": call["kind"],
+            "path": call.get("path"),
+            "content": call.get("content") or call.get("command", ""),
+        }
+        job.status = "confirm"
+        job.detail = "Waiting for confirmation..."
+    job.confirm_event.clear()
+    job.confirm_event.wait(timeout=600)  # don't hang forever if the tab is closed
+    approved = job.confirm_result
+    with job.lock:
+        job.action = None
+    return approved
+
+
+def run_job(job):
+    messages = job.messages
+    if not messages or messages[0].get("role") != "system":
+        messages = [{"role": "system", "content": TOOL_SYSTEM_PROMPT}] + messages
+
+    for _round in range(6):
+        reply_text, err = call_with_retry(messages, job)
+        if job.cancelled:
+            return
+        if err:
+            with job.lock:
+                job.status, job.error = "error", err
+            return
+
+        calls = extract_tool_calls(reply_text)
+        if not calls:
+            clean = strip_markers(reply_text).strip()
+            with job.lock:
+                job.status, job.reply = "done", (clean or reply_text)
+            return
+
+        messages.append({"role": "assistant", "content": reply_text})
+        results = []
+        for call in calls:
+            if call["kind"] in NEEDS_CONFIRM:
+                approved = need_confirm_and_wait(job, call)
+                if not approved:
+                    target = call.get("path") or call.get("command", "")
+                    results.append("%s on '%s' was declined by the user." % (call["kind"], target))
+                    continue
+            else:
+                job.push_event("tool", describe_call(call))
+            out = execute_call(call) if (call["kind"] not in NEEDS_CONFIRM or approved) else None
+            if out is not None:
+                label = call.get("path") or call.get("query") or call.get("command", "")
+                results.append("Result of %s(%s):\n%s" % (call["kind"], label, out))
+        messages.append({"role": "user", "content": "\n\n".join(results) if results else "(no tool output)"})
+
+    with job.lock:
+        job.status = "done"
+        job.reply = "(stopped after several tool rounds without a final answer — try rephrasing, or ask for one step at a time)"
+
+
+# ── Page ──────────────────────────────────────────────────────────────
+
+PAGE_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__APP_NAME__ webchat</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0c11;
+    --bg-glow: radial-gradient(1200px 600px at 15% -10%, #1b1440 0%, transparent 60%),
+               radial-gradient(900px 500px at 110% 10%, #10263a 0%, transparent 55%);
+    --panel: #14151d;
+    --panel-2: #1a1c26;
+    --border: #262838;
+    --text: #e9e9f0;
+    --muted: #8b8fa3;
+    --accent: #7c6cff;
+    --accent-2: #4f9cf9;
+    --accent-grad: linear-gradient(135deg, #7c6cff, #4f9cf9);
+    --warn: #f6b93b;
+    --warn-bg: #2b2312;
+    --warn-border: #5c4a17;
+    --danger: #ff6b7a;
+    --danger-bg: #2b1418;
+    --danger-border: #5c2229;
+    --ok: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; display: flex; flex-direction: column;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg-glow), var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 14px 18px 12px; border-bottom: 1px solid var(--border);
+    background: rgba(20, 21, 29, 0.7); backdrop-filter: blur(8px);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .header-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .brand h1 { font-size: 15px; margin: 0; font-weight: 700; letter-spacing: 0.2px; white-space: nowrap; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%; flex: none;
+    background: var(--ok); box-shadow: 0 0 8px var(--ok);
+  }
+  .header-actions { display: flex; gap: 8px; flex: none; }
+  .pill {
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+    border-radius: 999px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+    transition: background 0.15s, border-color 0.15s; white-space: nowrap;
+  }
+  .pill:hover { border-color: var(--accent); }
+  .pill.off { color: var(--warn); border-color: var(--warn-border); background: var(--warn-bg); }
+  .pill.ghost { background: transparent; }
+  .subtitle { margin-top: 6px; font-size: 12px; color: var(--muted); }
+  #log {
+    flex: 1; overflow-y: auto; padding: 18px 16px 8px; display: flex;
+    flex-direction: column; gap: 10px; max-width: 820px; width: 100%;
+    margin: 0 auto;
+  }
+  .msg {
+    max-width: 82%; padding: 11px 14px; border-radius: 14px; line-height: 1.5;
+    white-space: pre-wrap; word-wrap: break-word; font-size: 14.5px;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.15);
+    animation: rise 0.18s ease-out;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  .user { align-self: flex-end; background: var(--accent-grad); color: white; border-bottom-right-radius: 4px; }
+  .assistant {
+    align-self: flex-start; background: var(--panel); border: 1px solid var(--border);
+    border-bottom-left-radius: 4px;
+  }
+  .assistant.pending { color: var(--muted); font-style: italic; }
+  .assistant.pending.retrying { color: var(--warn); }
+  .error {
+    align-self: flex-start; background: var(--danger-bg); border: 1px solid var(--danger-border);
+    color: var(--danger); border-bottom-left-radius: 4px;
+  }
+  .tool-note {
+    align-self: flex-start; max-width: 82%; font-size: 12px; color: var(--muted);
+    padding: 5px 12px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .tool-note.auto { color: var(--ok); }
+  .msg.markdown { white-space: normal; }
+  .msg.markdown > *:first-child { margin-top: 0; }
+  .msg.markdown > *:last-child { margin-bottom: 0; }
+  .msg.markdown p { margin: 0 0 8px; }
+  .msg.markdown h1, .msg.markdown h2, .msg.markdown h3 {
+    margin: 12px 0 6px; line-height: 1.3; font-weight: 700;
+  }
+  .msg.markdown h1 { font-size: 1.25em; }
+  .msg.markdown h2 { font-size: 1.15em; }
+  .msg.markdown h3 { font-size: 1.05em; }
+  .msg.markdown ul, .msg.markdown ol { margin: 0 0 8px; padding-left: 22px; }
+  .msg.markdown li { margin: 2px 0; }
+  .msg.markdown blockquote {
+    margin: 0 0 8px; padding: 2px 12px; border-left: 3px solid var(--border); color: var(--muted);
+  }
+  .msg.markdown code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em;
+    background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px;
+  }
+  .msg.markdown pre.code-block {
+    margin: 0 0 8px; padding: 10px 12px; background: #0d0e13; border: 1px solid var(--border);
+    border-radius: 8px; overflow-x: auto;
+  }
+  .msg.markdown pre.code-block code { background: none; padding: 0; font-size: 0.85em; }
+  .msg.markdown a { color: var(--accent-2); }
+  .confirm-card {
+    align-self: flex-start; max-width: 90%; width: 100%;
+    background: var(--warn-bg); border: 1px solid var(--warn-border);
+    border-radius: 14px; padding: 12px 14px; animation: rise 0.18s ease-out;
+  }
+  .confirm-title { font-size: 13.5px; font-weight: 600; color: var(--warn); margin-bottom: 6px; }
+  .confirm-path { font-size: 12.5px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .confirm-preview {
+    margin: 6px 0 10px; max-height: 220px; overflow: auto; padding: 10px;
+    background: #0d0e13; border: 1px solid var(--border); border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .confirm-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .confirm-actions button {
+    border: none; border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+    font-weight: 600;
+  }
+  .confirm-yes { background: var(--ok); color: #06240f; }
+  .confirm-no { background: var(--panel-2); color: var(--text); border: 1px solid var(--border) !important; }
+  .confirm-actions button:disabled { opacity: 0.5; cursor: default; }
+  form {
+    display: flex; gap: 8px; padding: 12px 16px 16px; border-top: 1px solid var(--border);
+    max-width: 820px; width: 100%; margin: 0 auto; box-sizing: border-box;
+  }
+  textarea {
+    flex: 1; resize: none; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); padding: 11px 13px; font-size: 14.5px;
+    font-family: inherit; height: 46px; outline: none; transition: border-color 0.15s;
+  }
+  textarea:focus { border-color: var(--accent); }
+  button#send {
+    border: none; border-radius: 10px; background: var(--accent-grad); color: white;
+    padding: 0 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button#send:disabled { opacity: 0.5; cursor: default; }
+  #log::-webkit-scrollbar { width: 8px; }
+  #log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="header-top">
+    <div class="brand"><span class="dot"></span><h1>__APP_NAME__ webchat</h1></div>
+    <div class="header-actions">
+      <button id="confirmToggle" class="pill">Confirmations: ON</button>
+      <button id="newChat" class="pill ghost">New chat</button>
+    </div>
+  </div>
+  <div class="subtitle">__PROVIDER_LABEL__ &middot; __MODEL__</div>
+</header>
+<div id="log"></div>
+<form id="form">
+  <textarea id="input" placeholder="Message..." autofocus></textarea>
+  <button type="submit" id="send">Send</button>
+</form>
+<script>
+  const log = document.getElementById("log");
+  const form = document.getElementById("form");
+  const input = document.getElementById("input");
+  const sendBtn = document.getElementById("send");
+  const confirmToggle = document.getElementById("confirmToggle");
+  const newChatBtn = document.getElementById("newChat");
+  let messages = [];
+  let confirmOn = true;
+
+  function make(cls, text) {
+    const d = document.createElement("div");
+    d.className = cls;
+    if (text !== undefined) d.textContent = text;
+    return d;
+  }
+
+  // ── Minimal, dependency-free markdown → HTML (no CDN, stays offline like
+  //    the rest of this plugin). Covers what model replies actually use:
+  //    fenced/inline code, bold/italic, headers, links, lists, blockquotes,
+  //    paragraphs. Escapes HTML first so nothing in the text (or a tool
+  //    result echoed back) can inject markup. ──────────────────────────
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function renderMarkdown(text) {
+    const blocks = [];
+    let src = text.replace(/```(\\w*)\\n?([\\s\\S]*?)```/g, (m, lang, code) => {
+      blocks.push('<pre class="code-block"><code>' + escapeHtml(code.replace(/\\n$/, "")) + '</code></pre>');
+      return "\\x00BLOCK" + (blocks.length - 1) + "\\x00";
+    });
+
+    src = escapeHtml(src);
+
+    src = src.replace(/`([^`\\n]+)`/g, (m, code) => '<code>' + code + '</code>');
+    src = src.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    src = src.replace(/\\*\\*([^*\\n]+)\\*\\*/g, '<strong>$1</strong>');
+    src = src.replace(/__([^_\\n]+)__/g, '<strong>$1</strong>');
+    src = src.replace(/(^|[^*])\\*([^*\\n]+)\\*(?!\\*)/g, '$1<em>$2</em>');
+    src = src.replace(/(^|[^\\w_])_([^_\\n]+)_(?!\\w)/g, '$1<em>$2</em>');
+    src = src.replace(/^### (.*)$/gm, '<h3>$1</h3>');
+    src = src.replace(/^## (.*)$/gm, '<h2>$1</h2>');
+    src = src.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+    src = src.replace(/^&gt; ?(.*)$/gm, '<blockquote>$1</blockquote>');
+
+    src = src.replace(/(^|\\n)((?:[-*] .*(?:\\n|$))+)/g, (m, lead, block) => {
+      const items = block.trim().split("\\n").map(l => l.replace(/^[-*] /, ""));
+      return lead + "<ul>" + items.map(i => "<li>" + i + "</li>").join("") + "</ul>\\n";
+    });
+    src = src.replace(/(^|\\n)((?:\\d+\\. .*(?:\\n|$))+)/g, (m, lead, block) => {
+      const items = block.trim().split("\\n").map(l => l.replace(/^\\d+\\.\\s/, ""));
+      return lead + "<ol>" + items.map(i => "<li>" + i + "</li>").join("") + "</ol>\\n";
+    });
+
+    const blockTagRe = /^<(h1|h2|h3|ul|ol|li|blockquote|pre)/;
+    const out = [];
+    let para = [];
+    const flush = () => {
+      if (para.length) { out.push("<p>" + para.join("<br>") + "</p>"); para = []; }
+    };
+    for (const line of src.split("\\n")) {
+      if (line.trim() === "") { flush(); continue; }
+      if (blockTagRe.test(line.trim())) { flush(); out.push(line); continue; }
+      para.push(line);
+    }
+    flush();
+
+    return out.join("\\n").replace(/\\x00BLOCK(\\d+)\\x00/g, (m, i) => blocks[parseInt(i, 10)]);
+  }
+
+  function addBubble(role, text) {
+    const div = make("msg " + role, text);
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    return div;
+  }
+
+  function setBubbleMarkdown(el, text) {
+    el.classList.add("markdown");
+    el.innerHTML = renderMarkdown(text);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function addToolNote(text, extraCls) {
+    log.appendChild(make("tool-note " + (extraCls || ""), text));
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function actionTitle(action) {
+    if (action.kind === "FILE_WRITE") return "✏️ Write to " + action.path + "?";
+    if (action.kind === "FILE_DELETE") return "🗑️ Delete " + action.path + "?";
+    if (action.kind === "SHELL_RUN") return "⚠️ Run this shell command? (not sandboxed)";
+    return "Proceed with " + action.kind + "?";
+  }
+
+  function addConfirmCard(action, onDecide) {
+    const card = make("confirm-card");
+    const title = make("confirm-title", actionTitle(action));
+    card.appendChild(title);
+    if (action.content) {
+      const pre = document.createElement("pre");
+      pre.className = "confirm-preview";
+      pre.textContent = action.content;
+      card.appendChild(pre);
+    } else if (action.path) {
+      card.appendChild(make("confirm-path", action.path));
+    }
+    const row = make("confirm-actions");
+    const yes = document.createElement("button");
+    yes.textContent = "Yes, proceed"; yes.className = "confirm-yes";
+    const no = document.createElement("button");
+    no.textContent = "No, decline"; no.className = "confirm-no";
+    yes.onclick = () => { row.querySelectorAll("button").forEach(b => b.disabled = true); title.textContent += "  ✓ approved"; onDecide(true); };
+    no.onclick = () => { row.querySelectorAll("button").forEach(b => b.disabled = true); title.textContent += "  ✕ declined"; onDecide(false); };
+    row.appendChild(yes); row.appendChild(no);
+    card.appendChild(row);
+    log.appendChild(card);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function applyConfirmState(on) {
+    confirmOn = on;
+    confirmToggle.textContent = "Confirmations: " + (on ? "ON" : "OFF");
+    confirmToggle.classList.toggle("off", !on);
+  }
+
+  async function refreshStatus() {
+    try {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      applyConfirmState(!!data.confirm);
+    } catch (e) {}
+  }
+
+  confirmToggle.addEventListener("click", async () => {
+    try {
+      const res = await fetch("/api/confirm-toggle", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: !confirmOn }),
+      });
+      const data = await res.json();
+      applyConfirmState(!!data.confirm);
+    } catch (e) {}
+  });
+
+  newChatBtn.addEventListener("click", () => {
+    messages = [];
+    log.innerHTML = "";
+  });
+
+  function pollJob(jobId, pending) {
+    return new Promise((resolve) => {
+      let since = 0;
+      const tick = async () => {
+        let data;
+        try {
+          const res = await fetch("/api/chat/poll?id=" + jobId + "&since=" + since);
+          data = await res.json();
+        } catch (e) {
+          setTimeout(tick, 800);
+          return;
+        }
+        since = data.event_count;
+        (data.events || []).forEach((ev) => {
+          if (ev.type === "tool") addToolNote("⚙️ " + ev.text);
+          else if (ev.type === "auto") addToolNote("✓ " + ev.text, "auto");
+        });
+
+        if (data.status === "working" || data.status === "retrying") {
+          pending.className = "msg assistant pending" + (data.status === "retrying" ? " retrying" : "");
+          pending.textContent = data.detail || "thinking...";
+          setTimeout(tick, 500);
+          return;
+        }
+
+        if (data.status === "confirm" && data.action) {
+          pending.remove();
+          addConfirmCard(data.action, async (approved) => {
+            try {
+              await fetch("/api/chat/confirm", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: jobId, approved }),
+              });
+            } catch (e) {}
+            pending = addBubble("assistant pending", "thinking...");
+            setTimeout(tick, 300);
+          });
+          return;
+        }
+
+        if (data.status === "done") {
+          pending.classList.remove("pending", "retrying");
+          setBubbleMarkdown(pending, data.reply);
+          messages.push({ role: "assistant", content: data.reply });
+          resolve();
+          return;
+        }
+
+        if (data.status === "error") {
+          pending.className = "msg error";
+          pending.textContent = "Error: " + data.error;
+          resolve();
+          return;
+        }
+
+        setTimeout(tick, 500);
+      };
+      tick();
+    });
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    input.style.height = "46px";
+    addBubble("user", text);
+    messages.push({ role: "user", content: text });
+    sendBtn.disabled = true;
+    const pending = addBubble("assistant pending", "thinking...");
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages }),
+      });
+      const started = await res.json();
+      if (started.error) throw new Error(started.error);
+      await pollJob(started.job_id, pending);
+    } catch (err) {
+      pending.className = "msg error";
+      pending.textContent = "Error: " + err;
+    } finally {
+      sendBtn.disabled = false;
+      log.scrollTop = log.scrollHeight;
+      input.focus();
+    }
+  });
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "46px";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  });
+
+  refreshStatus();
+</script>
+</body>
+</html>
+"""
+
+PAGE = (
+    PAGE_TEMPLATE
+    .replace("__APP_NAME__", APP_NAME)
+    .replace("__PROVIDER_LABEL__", PROVIDER_LABEL)
+    .replace("__MODEL__", MODEL or "(no model set)")
+).encode("utf-8")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass  # quiet — keep Aulthium's terminal free of per-request noise
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send(self, code, body_bytes, content_type="text/html; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            self._send(200, PAGE)
+            return
+        if parsed.path == "/api/status":
+            with STATE_LOCK:
+                confirm_on = CONFIRM_STATE["on"]
+            self._send_json(200, {
+                "provider": PROVIDER_LABEL, "model": MODEL, "confirm": confirm_on,
+            })
+            return
+        if parsed.path == "/api/chat/poll":
+            qs = urllib.parse.parse_qs(parsed.query)
+            job_id = (qs.get("id") or [""])[0]
+            since = int((qs.get("since") or ["0"])[0] or 0)
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            if not job:
+                self._send_json(404, {"status": "error", "error": "unknown job", "events": [], "event_count": 0})
+                return
+            self._send_json(200, job.snapshot(since))
+            return
+        self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/chat":
+            try:
+                data = self._read_json()
+                messages = data.get("messages", [])
+            except Exception:
+                self._send_json(400, {"error": "bad request"})
+                return
+            _gc_jobs()
+            job = Job(list(messages))
+            with JOBS_LOCK:
+                JOBS[job.id] = job
+            threading.Thread(target=run_job, args=(job,), daemon=True).start()
+            self._send_json(200, {"job_id": job.id})
+            return
+
+        if parsed.path == "/api/chat/confirm":
+            try:
+                data = self._read_json()
+                job_id = data.get("id", "")
+                approved = bool(data.get("approved"))
+            except Exception:
+                self._send_json(400, {"error": "bad request"})
+                return
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            if not job:
+                self._send_json(404, {"error": "unknown job"})
+                return
+            job.confirm_result = approved
+            job.confirm_event.set()
+            self._send_json(200, {"ok": True})
+            return
+
+        if parsed.path == "/api/confirm-toggle":
+            try:
+                data = self._read_json()
+                value = bool(data.get("value"))
+            except Exception:
+                self._send_json(400, {"error": "bad request"})
+                return
+            with STATE_LOCK:
+                CONFIRM_STATE["on"] = value
+            self._send_json(200, {"confirm": value})
+            return
+
+        self._send(404, b"not found", "text/plain")
+
+
+def find_free_port(start):
+    port = start
+    for _ in range(30):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((HOST, port))
+                return port
+            except OSError:
+                port += 1
+    return start
+
+
+def main():
+    start_port = int(os.environ.get("AULTHIUM_WEBCHAT_PORT", "8420"))
+    port = find_free_port(start_port)
+    server = ThreadingHTTPServer((HOST, port), Handler)
+    url = "http://%s:%d/" % (HOST, port)
+    print("webchat: serving at %s (model: %s via %s)" % (url, MODEL or "?", PROVIDER_LABEL))
+    print("webchat: confirmations start %s (matches this terminal's 't> confirm' setting)"
+          % ("ON" if CONFIRM_STATE["on"] else "OFF"))
+    print("webchat: WEB_SEARCH parser: %s" % ("BeautifulSoup" if HAVE_BS4 else "regex fallback (pip install beautifulsoup4 for a more robust parser)"))
+    print("webchat: Ctrl+C here to stop.")
+    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nwebchat: stopped.")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+  chmod +x "$dir/webchat.py" 2>/dev/null || true
+}
+
+plugin_list() {
+  plugins_ensure_dir
+  local found=0 dir name desc entry
+  box_top "PLUGINS" "$ICON_PLUGIN" "$C_ACCENT2"
+  for dir in "$PLUGINS_DIR"/*/; do
+    [[ -f "${dir}plugin.json" ]] || continue
+    found=1
+    name="$(basename "$dir")"
+    desc="$(jq -r '.description // "(no description)"' "${dir}plugin.json" 2>/dev/null)"
+    entry="$(jq -r '.entry // "?"' "${dir}plugin.json" 2>/dev/null)"
+    box_line "${C_BOLD}${name}${C_RESET}${C_MUTED} — ${desc}${C_RESET}"
+    box_line "  ${C_MUTED}entry: ${entry}${C_RESET}"
+  done
+  if [[ "$found" -eq 0 ]]; then
+    box_line "${C_MUTED}(none installed yet)${C_RESET}"
+  fi
+  box_bottom "$C_ACCENT2"
+  muted "Run one with: t> plugin run <name>   —   install one with: t> plugin install <path>"
+  muted "Plugins live in: $PLUGINS_DIR"
+}
+
+plugin_info() {
+  local name="$1" manifest
+  if [[ -z "$name" ]]; then
+    warn "Usage: t> plugin info <name>"
+    return 1
+  fi
+  manifest="$PLUGINS_DIR/$name/plugin.json"
+  if [[ ! -f "$manifest" ]]; then
+    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    return 1
+  fi
+  box_top "PLUGIN: $name" "$ICON_PLUGIN" "$C_ACCENT2"
+  while IFS= read -r line; do
+    box_line "$line"
+  done < <(jq -r 'to_entries[] | "\(.key): \(.value)"' "$manifest" 2>/dev/null)
+  box_bottom "$C_ACCENT2"
+}
+
+# Exports the connection details a plugin needs to reach the AI provider on
+# its own, mirroring the shape of call_openai_compatible / call_google
+# above so plugin authors can speak the same two request shapes:
+#   AULTHIUM_API_KIND   "openai" (Bearer-auth /chat/completions) or "google"
+#   AULTHIUM_API_URL    endpoint (openai) / API base (google — model+key
+#                        still need appending, same as call_google does)
+#   AULTHIUM_API_KEY    active provider's key (may be empty for a no-key
+#                        custom endpoint)
+#   AULTHIUM_MODEL      current model id
+# Unset again by plugin_run once the plugin exits, so the key doesn't
+# linger in this shell's exported environment for anything launched after.
+plugin_export_env() {
+  export AULTHIUM_APP_NAME="$APP_NAME"
+  export AULTHIUM_APP_VERSION="$APP_VERSION"
+  export AULTHIUM_WORKSPACE_DIR="$WORKSPACE_DIR"
+  export AULTHIUM_PROVIDER="$PROVIDER"
+  export AULTHIUM_PROVIDER_LABEL="$(provider_label)"
+  export AULTHIUM_MODEL="$CURRENT_MODEL"
+  # Lets a plugin start out matching this terminal session's current
+  # confirm-gate state and 429-retry tuning, instead of guessing/hardcoding
+  # its own. Plugins are free to offer their own toggle for this on top
+  # (webchat does), but it always *starts* synced to what's set here.
+  export AULTHIUM_SKIP_CONFIRMATIONS="$SKIP_CONFIRMATIONS"
+  export AULTHIUM_MAX_RATE_LIMIT_RETRIES="$MAX_RATE_LIMIT_RETRIES"
+  export AULTHIUM_MAX_RATE_LIMIT_WAIT="$MAX_RATE_LIMIT_WAIT"
+  # So a plugin's own SHELL_RUN (webchat has one) times out on the same
+  # schedule as the terminal's does, instead of guessing/hardcoding it.
+  export AULTHIUM_SHELL_TIMEOUT_SECS="$SHELL_TIMEOUT_SECS"
+
+  case "$PROVIDER" in
+    google)
+      export AULTHIUM_API_KIND="google"
+      export AULTHIUM_API_URL="$GOOGLE_API_BASE"
+      export AULTHIUM_API_KEY="$GOOGLE_KEY"
+      ;;
+    openrouter)
+      export AULTHIUM_API_KIND="openai"
+      export AULTHIUM_API_URL="$OPENROUTER_URL"
+      export AULTHIUM_API_KEY="$OPENROUTER_KEY"
+      ;;
+    mistral)
+      export AULTHIUM_API_KIND="openai"
+      export AULTHIUM_API_URL="$MISTRAL_URL"
+      export AULTHIUM_API_KEY="$MISTRAL_KEY"
+      ;;
+    huggingface)
+      export AULTHIUM_API_KIND="openai"
+      export AULTHIUM_API_URL="$HF_URL"
+      export AULTHIUM_API_KEY="$HF_KEY"
+      ;;
+    nvidia_nim)
+      export AULTHIUM_API_KIND="openai"
+      export AULTHIUM_API_URL="$NVIDIA_URL"
+      export AULTHIUM_API_KEY="$NVIDIA_KEY"
+      ;;
+    custom)
+      export AULTHIUM_API_KIND="openai"
+      export AULTHIUM_API_URL="$CUSTOM_URL"
+      export AULTHIUM_API_KEY="$CUSTOM_KEY"
+      ;;
+    *)
+      export AULTHIUM_API_KIND=""
+      export AULTHIUM_API_URL=""
+      export AULTHIUM_API_KEY=""
+      ;;
+  esac
+}
+
+plugin_run() {
+  local name="$1"; shift || true
+  local dir manifest entry runtime desc status
+
+  if [[ -z "$name" ]]; then
+    warn "Usage: t> plugin run <name>"
+    return 1
+  fi
+
+  dir="$PLUGINS_DIR/$name"
+  manifest="$dir/plugin.json"
+  if [[ ! -f "$manifest" ]]; then
+    err "No plugin named '$name'. Run 't> plugin list' to see what's installed."
+    return 1
+  fi
+
+  entry="$(jq -r '.entry // empty' "$manifest" 2>/dev/null)"
+  runtime="$(jq -r '.runtime // empty' "$manifest" 2>/dev/null)"
+  desc="$(jq -r '.description // ""' "$manifest" 2>/dev/null)"
+
+  if [[ -z "$entry" ]]; then
+    err "Plugin '$name' has no \"entry\" command in its plugin.json — can't run it."
+    return 1
+  fi
+  if [[ -n "$runtime" ]] && ! want_cmd "$runtime"; then
+    err "Plugin '$name' needs '$runtime', which isn't installed/available on this system."
+    return 1
+  fi
+  if [[ -z "$PROVIDER" ]]; then
+    err "No provider selected yet — run 't> provider' first, then try again."
+    return 1
+  fi
+
+  box_top "PLUGIN RUN" "$ICON_PLUGIN" "$C_ACCENT2"
+  box_line "${C_BOLD}${name}${C_RESET}${C_MUTED} — ${desc}${C_RESET}"
+  box_line "${C_MUTED}entry:${C_RESET} $entry"
+  box_line "${C_MUTED}dir:${C_RESET}   $dir"
+  box_bottom "$C_ACCENT2"
+  warn "Plugins are ordinary external programs — Aulthium does not sandbox them like the file agent."
+  warn "This one will receive your active provider, model, and API key as environment variables."
+
+  if ! confirm_action "Run plugin '$name'?"; then
+    warn "Cancelled."
+    return 1
+  fi
+
+  plugin_export_env
+  say "Starting '$name' — press Ctrl+C to stop it and return to chat."
+  # Ctrl+C while the plugin is in the foreground delivers SIGINT to this
+  # whole process group — including US, not just the plugin's child
+  # process. Without this, our own `trap cleanup_exit INT` (set way up at
+  # the top of the script) fires right alongside the plugin's own Ctrl+C
+  # handling, so we'd print "Aulthium has been closed." and exit(0) the
+  # instant the plugin merely stopped. Swap in a no-op handler for the
+  # duration of the plugin run instead: it's a *caught* signal (not
+  # SIG_IGN), so it does NOT propagate as "ignored" to the plugin's child
+  # process across fork/exec — that child still gets normal default
+  # SIGINT behavior (e.g. Python raising KeyboardInterrupt as usual) and
+  # can react to Ctrl+C on its own, same as it always could. We just stop
+  # *our* trap from also treating that same keypress as "quit the whole
+  # app". Restored to the real trap right after, whether the plugin
+  # exited cleanly, was Ctrl+C'd, or errored.
+  trap ':' INT
+  ( cd "$dir" && eval "$entry" "$@" )
+  status=$?
+  trap cleanup_exit INT
+
+  unset AULTHIUM_API_KEY AULTHIUM_API_URL AULTHIUM_API_KIND AULTHIUM_PROVIDER \
+        AULTHIUM_PROVIDER_LABEL AULTHIUM_MODEL AULTHIUM_WORKSPACE_DIR \
+        AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
+        AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
+        AULTHIUM_SHELL_TIMEOUT_SECS
+
+  if [[ $status -ne 0 ]]; then
+    warn "Plugin '$name' exited with status $status."
+  else
+    ok "Plugin '$name' finished."
+  fi
+}
+
+plugin_install() {
+  local src="$1" name dest
+  if [[ -z "$src" ]]; then
+    warn "Usage: t> plugin install <path-to-plugin-folder>"
+    return 1
+  fi
+  src="${src/#\~/$HOME}"
+  if [[ ! -d "$src" ]]; then
+    err "Not a folder: $src"
+    return 1
+  fi
+  if [[ ! -f "$src/plugin.json" ]]; then
+    err "No plugin.json found in $src — see BUILD_PLUGIN.md for the manifest format."
+    return 1
+  fi
+  name="$(jq -r '.name // empty' "$src/plugin.json" 2>/dev/null)"
+  if [[ -z "$name" ]]; then
+    err "plugin.json is missing a \"name\" field."
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    err "Plugin name must contain only letters, numbers, - or _: got '$name'."
+    return 1
+  fi
+  plugins_ensure_dir
+  dest="$PLUGINS_DIR/$name"
+  if [[ -d "$dest" ]]; then
+    if ! confirm_yes_no "Plugin '$name' already exists — overwrite it?"; then
+      warn "Cancelled."
+      return 1
+    fi
+    rm -rf -- "$dest"
+  fi
+  if cp -R "$src" "$dest" 2>/dev/null; then
+    ok "Installed plugin '$name' → $dest"
+    muted "Run it with: t> plugin run $name"
+  else
+    err "Failed to copy plugin into $dest"
+  fi
+}
+
+
 ask_api_key() {
   if ! ensure_provider_key; then
     err "No API key provided."
@@ -6348,6 +7844,39 @@ command_router() {
     confirm\ *)
       warn "Unknown confirm subcommand. Usage: t> confirm [on | off]"
       ;;
+    plugin|plugin\ list)
+      plugin_list
+      ;;
+    plugin\ run\ *)
+      rest="${cmd#plugin run }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> plugin run <name>"
+      else
+        plugin_run $rest
+      fi
+      ;;
+    plugin\ info\ *)
+      rest="${cmd#plugin info }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> plugin info <name>"
+      else
+        plugin_info "$rest"
+      fi
+      ;;
+    plugin\ install\ *)
+      rest="${cmd#plugin install }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> plugin install <path>"
+      else
+        plugin_install "$rest"
+      fi
+      ;;
+    plugin\ *)
+      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path>]"
+      ;;
     update)
       autoupdate_status_cmd
       ;;
@@ -6421,6 +7950,7 @@ main() {
   fi
 
   mcp_bootstrap_from_env
+  plugin_bootstrap_builtin
 
   init_history
 
