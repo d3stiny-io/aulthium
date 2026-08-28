@@ -163,6 +163,36 @@ BUILTIN_PLUGIN_SOURCES_FETCHED=0
 # the moment it reads it, so a stale value never leaks into an unrelated call.
 PLUGIN_INSTALL_SOURCE_REPO=""
 
+# Registry for "hook" plugins — plugins whose plugin.json sets
+# "mode": "hook" (e.g. better-websearch) instead of the default foreground
+# one (e.g. webchat). A hook plugin doesn't take over the terminal when
+# run: `t> plugin run <name>` just registers it here and hands control
+# straight back to the normal "User>" prompt. It's invoked on-demand,
+# per call, at whatever hook point its manifest names (currently only
+# "web_search" — see WEB_SEARCH_HOOK_PLUGIN / web_search_query_plugin_hook)
+# instead of running continuously as a background process.
+#
+# All five arrays are keyed by plugin name and stay in lockstep — a name
+# is "running" iff it has an entry in RUNNING_PLUGIN_ENABLED. Session-only,
+# same as everything else here: nothing here survives a restart, so a
+# hook plugin needs `t> plugin run <name>` again after one.
+declare -A RUNNING_PLUGIN_ENABLED=()      # name -> "on" | "off"
+declare -A RUNNING_PLUGIN_HOOK=()         # name -> hook point, e.g. "web_search"
+declare -A RUNNING_PLUGIN_ENTRY=()        # name -> manifest "entry" command
+declare -A RUNNING_PLUGIN_DIR=()          # name -> plugin's install dir
+declare -A RUNNING_PLUGIN_TOGGLE_PREFIX=()# name -> its "<prefix>>" shorthand, if any
+
+# Reverse lookup for the REPL: "<prefix>>" input text -> plugin name, so
+# typing e.g. "bws> on" at the main prompt is recognized without scanning
+# all of RUNNING_PLUGIN_TOGGLE_PREFIX on every keystroke loop.
+declare -A TOGGLE_PREFIX_TO_PLUGIN=()
+
+# Which registered hook plugin (if any) currently owns the "web_search"
+# hook point. Only one plugin can own a given hook point at a time —
+# running a second one for the same point replaces the first (with a
+# warning), rather than trying to chain/merge two search backends.
+WEB_SEARCH_HOOK_PLUGIN=""
+
 # In-memory conversation history only.
 # We keep the system prompt in the history from the start.
 build_system_prompt() {
@@ -1369,6 +1399,8 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp cloudflare" "quick-pick from Cloudflare's managed MCP servers"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin" "list installed plugins"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run <name>" "launch a plugin (needs y/N confirmation)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run --stoprun <n>" "fully stop/de-register a running hook plugin"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin toggle <n> <s>" "turn a running hook plugin on/off without stopping it"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin info <name>" "show a plugin's manifest details"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin install <p>" "install from a folder, github:owner/repo, or a zip URL"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin update [name]" "check (and confirm) GitHub-sourced plugins for updates"
@@ -4219,16 +4251,68 @@ web_search_query_scrape_ddglite() {
   format_search_results titles urls snippets
 }
 
-# Dispatcher: SearXNG #1 -> #2 -> #3, falling through to DuckDuckGo Lite
-# only if all three are unreachable/blocked/unparsable. DDG Lite is
-# skipped outright while it's in cooldown (ddg_in_cooldown / the check
-# inside web_search_query_scrape_ddglite) rather than being retried. Stops
-# at the first provider that returns real results; if every provider
-# fails, WEB_SEARCH_LAST_ERROR is set to a combined summary of why.
+# If a "web_search" hook plugin (e.g. better-websearch) is currently
+# registered AND toggled on, shells out to its entry command with the
+# query as its argument and uses whatever it prints as the result body
+# instead of the built-in SearXNG/DDG chain. Returns 1 (with
+# WEB_SEARCH_LAST_ERROR set) if no such plugin is active, it's toggled
+# off, or it ran but failed/returned nothing — either way the caller
+# (web_search_query) falls through to the normal providers, so a flaky or
+# disabled hook plugin never blocks search outright.
+web_search_query_plugin_hook() {
+  local query="$1" name dir entry output status
+  name="$WEB_SEARCH_HOOK_PLUGIN"
+  [[ -n "$name" ]] || return 1
+  [[ "${RUNNING_PLUGIN_ENABLED[$name]:-off}" == "on" ]] || {
+    WEB_SEARCH_LAST_ERROR="hook plugin '$name' is installed but toggled off (t> plugin toggle $name on to re-enable)."
+    return 1
+  }
+
+  dir="${RUNNING_PLUGIN_DIR[$name]}"
+  entry="${RUNNING_PLUGIN_ENTRY[$name]}"
+  # Same env a foreground plugin_run gets (provider/model/key etc) — a
+  # hook plugin is invoked fresh on every call, not left running, so this
+  # has to happen (and be cleaned up) around each individual call rather
+  # than once at 't> plugin run' time.
+  plugin_export_env
+  output="$(cd "$dir" && eval "$entry" "$(printf '%q' "$query")" 2>/dev/null)"
+  status=$?
+  unset AULTHIUM_API_KEY AULTHIUM_API_URL AULTHIUM_API_KIND AULTHIUM_PROVIDER \
+        AULTHIUM_PROVIDER_LABEL AULTHIUM_MODEL AULTHIUM_WORKSPACE_DIR \
+        AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
+        AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
+        AULTHIUM_SHELL_TIMEOUT_SECS
+
+  if [[ $status -ne 0 || -z "$output" ]]; then
+    WEB_SEARCH_LAST_ERROR="hook plugin '$name' failed or returned nothing (exit $status)."
+    return 1
+  fi
+
+  # Drop the plugin's own "Searching for: ..." preamble line (and the
+  # blank line after it) if present — handle_web_search_action already
+  # shows the query above the results box, so it'd just be repeated.
+  output="$(printf '%s\n' "$output" | sed '/^Searching for: /d' | sed '/./,$!d')"
+
+  FORMAT_SEARCH_RESULT="SEARCH RESULTS (via plugin '$name')"$'\n\n'"$output"
+  return 0
+}
+
+# Dispatcher: the active "web_search" hook plugin (if any) gets first
+# shot, then SearXNG #1 -> #2 -> #3, falling through to DuckDuckGo Lite
+# only if all of those are unreachable/blocked/unparsable/inactive. DDG
+# Lite is skipped outright while it's in cooldown (ddg_in_cooldown / the
+# check inside web_search_query_scrape_ddglite) rather than being
+# retried. Stops at the first source that returns real results; if every
+# source fails, WEB_SEARCH_LAST_ERROR is set to a combined summary of why.
 web_search_query() {
   local query="$1"
   local -a errs=()
   local instance
+
+  if web_search_query_plugin_hook "$query"; then
+    return 0
+  fi
+  [[ -n "${WEB_SEARCH_LAST_ERROR:-}" ]] && errs+=("$WEB_SEARCH_LAST_ERROR")
 
   for instance in "${SEARXNG_INSTANCES[@]}"; do
     if web_search_query_searxng "$instance" "$query"; then
@@ -6162,6 +6246,27 @@ plugin_list() {
     box_line "${C_MUTED}(none installed yet)${C_RESET}"
   fi
 
+  # Hook plugins currently registered (mode:"hook", e.g. better-websearch)
+  # — these run silently alongside normal chat rather than blocking the
+  # terminal, so t> plugin/plugin list is the only place their live
+  # on/off state is otherwise visible.
+  if [[ "${#RUNNING_PLUGIN_ENABLED[@]}" -gt 0 ]]; then
+    local rname rstate rhook rprefix
+    box_line ""
+    box_line "${C_MUTED}Running:${C_RESET}"
+    for rname in "${!RUNNING_PLUGIN_ENABLED[@]}"; do
+      rstate="${RUNNING_PLUGIN_ENABLED[$rname]}"
+      rhook="${RUNNING_PLUGIN_HOOK[$rname]}"
+      rprefix="${RUNNING_PLUGIN_TOGGLE_PREFIX[$rname]:-}"
+      box_line "  ${C_BOLD}${rname}${C_RESET}${C_MUTED} — hook: ${rhook}, state: ${rstate}${C_RESET}"
+      if [[ -n "$rprefix" ]]; then
+        box_line "    ${C_MUTED}toggle: ${rprefix}> on|off   or   t> plugin toggle ${rname} on|off${C_RESET}"
+      else
+        box_line "    ${C_MUTED}toggle: t> plugin toggle ${rname} on|off${C_RESET}"
+      fi
+    done
+  fi
+
   # Built-ins the user hasn't installed yet — a new user has no other way
   # to discover these exist short of already knowing the exact
   # "github:owner/repo/path" coordinate, so surface them here every time,
@@ -6277,9 +6382,73 @@ plugin_export_env() {
   esac
 }
 
+# `t> plugin run --stoprun <name>` — the counterpart to registering a hook
+# plugin. Unlike `t> plugin toggle <name> off` (which just flips it
+# inactive but keeps it registered, so turning it back on is instant),
+# this fully de-registers it: clears its RUNNING_PLUGIN_* entries, frees
+# its toggle prefix, and releases whichever hook point it owned. A plugin
+# stopped this way needs a fresh `t> plugin run <name>` (and re-confirmation)
+# to become active again — same as a foreground plugin needing to be
+# started over after Ctrl+C.
+plugin_stoprun() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    warn "Usage: t> plugin run --stoprun <name>"
+    return 1
+  fi
+  if [[ -z "${RUNNING_PLUGIN_ENABLED[$name]:-}" ]]; then
+    warn "'$name' isn't currently running as a hook plugin — nothing to stop."
+    return 1
+  fi
+
+  local prefix="${RUNNING_PLUGIN_TOGGLE_PREFIX[$name]:-}"
+  [[ -n "$prefix" ]] && unset "TOGGLE_PREFIX_TO_PLUGIN[$prefix]"
+  [[ "$WEB_SEARCH_HOOK_PLUGIN" == "$name" ]] && WEB_SEARCH_HOOK_PLUGIN=""
+  unset "RUNNING_PLUGIN_ENABLED[$name]" "RUNNING_PLUGIN_HOOK[$name]" \
+        "RUNNING_PLUGIN_ENTRY[$name]" "RUNNING_PLUGIN_DIR[$name]" \
+        "RUNNING_PLUGIN_TOGGLE_PREFIX[$name]"
+
+  ok "Stopped '$name' — it's fully de-registered now (run it again with t> plugin run $name)."
+}
+
+# `t> plugin toggle <name> <on|off>` — flips an already-*running* hook
+# plugin's active/inactive state without de-registering it. This is the
+# generic version of a plugin's own "<prefix>> on/off" shorthand (see
+# RUNNING_PLUGIN_TOGGLE_PREFIX / the main loop's prefix dispatch below) —
+# every hook plugin supports this, whether or not it also defines its own
+# short prefix.
+plugin_toggle() {
+  local name="$1" state="$2"
+  if [[ -z "$name" || -z "$state" ]]; then
+    warn "Usage: t> plugin toggle <name> <on|off>"
+    return 1
+  fi
+  state="${state,,}"
+  if [[ "$state" != "on" && "$state" != "off" ]]; then
+    warn "Usage: t> plugin toggle <name> <on|off>"
+    return 1
+  fi
+  if [[ -z "${RUNNING_PLUGIN_ENABLED[$name]:-}" ]]; then
+    warn "'$name' isn't running yet — start it with 't> plugin run $name' first."
+    return 1
+  fi
+
+  RUNNING_PLUGIN_ENABLED[$name]="$state"
+  if [[ "$state" == "on" ]]; then
+    ok "'$name' is now active."
+  else
+    warn "'$name' is now toggled off (still running — its hook just falls through to the built-in behavior)."
+  fi
+}
+
 plugin_run() {
+  if [[ "$1" == "--stoprun" ]]; then
+    plugin_stoprun "$2"
+    return $?
+  fi
+
   local name="$1"; shift || true
-  local dir manifest entry runtime desc status
+  local dir manifest entry runtime desc mode hook toggle_prefix status
 
   if [[ -z "$name" ]]; then
     warn "Usage: t> plugin run <name>"
@@ -6307,6 +6476,9 @@ plugin_run() {
   entry="$(jq -r '.entry // empty' "$manifest" 2>/dev/null)"
   runtime="$(jq -r '.runtime // empty' "$manifest" 2>/dev/null)"
   desc="$(jq -r '.description // ""' "$manifest" 2>/dev/null)"
+  mode="$(jq -r '.mode // "foreground"' "$manifest" 2>/dev/null)"
+  hook="$(jq -r '.hook // empty' "$manifest" 2>/dev/null)"
+  toggle_prefix="$(jq -r '.toggle_prefix // empty' "$manifest" 2>/dev/null)"
 
   if [[ -z "$entry" ]]; then
     err "Plugin '$name' has no \"entry\" command in its plugin.json — can't run it."
@@ -6325,6 +6497,7 @@ plugin_run() {
   box_line "${C_BOLD}${name}${C_RESET}${C_MUTED} — ${desc}${C_RESET}"
   box_line "${C_MUTED}entry:${C_RESET} $entry"
   box_line "${C_MUTED}dir:${C_RESET}   $dir"
+  [[ "$mode" == "hook" ]] && box_line "${C_MUTED}mode:${C_RESET}  hook (${hook:-?}) — stays in chat, no separate prompt"
   box_bottom "$C_ACCENT2"
   warn "Plugins are ordinary external programs — Aulthium does not sandbox them like the file agent."
   warn "This one will receive your active provider, model, and API key as environment variables."
@@ -6332,6 +6505,54 @@ plugin_run() {
   if ! confirm_action "Run plugin '$name'?"; then
     warn "Cancelled."
     return 1
+  fi
+
+  # Hook plugins (mode:"hook" in their manifest, e.g. better-websearch)
+  # don't take over the terminal — they just register here and get
+  # invoked on-demand at whatever hook point they declared. Chat keeps
+  # going at "User>" immediately; no Ctrl+C dance, no foreground eval.
+  if [[ "$mode" == "hook" ]]; then
+    if [[ -z "$hook" ]]; then
+      err "Plugin '$name' has \"mode\": \"hook\" but no \"hook\" field naming what it hooks — can't register it."
+      return 1
+    fi
+
+    case "$hook" in
+      web_search)
+        if [[ -n "$WEB_SEARCH_HOOK_PLUGIN" && "$WEB_SEARCH_HOOK_PLUGIN" != "$name" ]]; then
+          warn "Replacing '$WEB_SEARCH_HOOK_PLUGIN' as the active web_search hook with '$name'."
+          plugin_stoprun "$WEB_SEARCH_HOOK_PLUGIN"
+        fi
+        WEB_SEARCH_HOOK_PLUGIN="$name"
+        ;;
+      *)
+        err "Plugin '$name' declares an unknown hook point '$hook' — this version of Aulthium only knows: web_search."
+        return 1
+        ;;
+    esac
+
+    if [[ -n "$toggle_prefix" ]]; then
+      if [[ -n "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]:-}" && "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]}" != "$name" ]]; then
+        warn "Toggle prefix '${toggle_prefix}>' is already claimed by '${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]}' — '$name' will only be toggleable via t> plugin toggle."
+        toggle_prefix=""
+      else
+        TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]="$name"
+      fi
+    fi
+
+    RUNNING_PLUGIN_ENABLED[$name]="on"
+    RUNNING_PLUGIN_HOOK[$name]="$hook"
+    RUNNING_PLUGIN_ENTRY[$name]="$entry"
+    RUNNING_PLUGIN_DIR[$name]="$dir"
+    RUNNING_PLUGIN_TOGGLE_PREFIX[$name]="$toggle_prefix"
+
+    ok "'$name' is active — it'll now handle $hook automatically. Keep chatting at User>."
+    if [[ -n "$toggle_prefix" ]]; then
+      muted "Toggle it with: ${toggle_prefix}> on|off   —   or: t> plugin toggle $name on|off   —   stop it fully with: t> plugin run --stoprun $name"
+    else
+      muted "Toggle it with: t> plugin toggle $name on|off   —   stop it fully with: t> plugin run --stoprun $name"
+    fi
+    return 0
   fi
 
   plugin_export_env
@@ -7099,7 +7320,7 @@ command_router() {
       rest="${cmd#plugin run }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin run <name>"
+        warn "Usage: t> plugin run <name>  (or: t> plugin run --stoprun <name>)"
       else
         plugin_run $rest
       fi
@@ -7144,8 +7365,17 @@ command_router() {
         plugin_remove "$rest"
       fi
       ;;
+    plugin\ toggle\ *)
+      rest="${cmd#plugin toggle }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> plugin toggle <name> <on|off>"
+      else
+        plugin_toggle $rest
+      fi
+      ;;
     plugin\ *)
-      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name] | remove <name>]"
+      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name] | remove <name> | toggle <name> <on|off> | run --stoprun <name>]"
       ;;
     update)
       autoupdate_status_cmd
@@ -7198,6 +7428,37 @@ command_router() {
   esac
 }
 
+# Anything that isn't a "t> ..." command lands here. Ordinarily that's
+# just a chat message, but a running hook plugin with a "toggle_prefix"
+# (e.g. better-websearch's "bws") gets first look — typing "bws> on" or
+# "bws> off" at the normal chat prompt is recognized as that plugin's
+# shorthand toggle instead of being sent to the AI as a message, so
+# switching it on/off never requires leaving the chat flow at User> at
+# all. Anything that doesn't match a registered prefix falls straight
+# through to send_chat, same as before this existed.
+handle_repl_input() {
+  local input="$1" prefix rest
+  for prefix in "${!TOGGLE_PREFIX_TO_PLUGIN[@]}"; do
+    case "$input" in
+      "${prefix}>"*)
+        rest="${input#"${prefix}>"}"
+        rest="${rest# }"
+        rest="${rest,,}"
+        case "$rest" in
+          on|off)
+            plugin_toggle "${TOGGLE_PREFIX_TO_PLUGIN[$prefix]}" "$rest"
+            ;;
+          *)
+            warn "Usage: ${prefix}> <on|off>"
+            ;;
+        esac
+        return 0
+        ;;
+    esac
+  done
+  send_chat "$input"
+}
+
 main() {
   clear
   banner
@@ -7248,7 +7509,7 @@ main() {
         command_router "$input"
         ;;
       *)
-        send_chat "$input"
+        handle_repl_input "$input"
         ;;
     esac
   done
