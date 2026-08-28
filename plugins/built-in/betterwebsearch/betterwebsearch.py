@@ -1,8 +1,7 @@
 """
 Aulthium plugin: better-websearch
 
-Upgrades the stock WEB_SEARCH tool. The built-in version (see
-plugins/built-in/webchat/webchat.py -> tool_web_search) only scrapes
+Upgrades the stock WEB_SEARCH tool. The built-in version that only scrapes
 DuckDuckGo's *results page* and hands the AI a title + one-line snippet
 per hit. That's often not enough for the AI to actually answer a
 real-time question correctly — snippets get cut mid-sentence, miss the
