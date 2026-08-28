@@ -52,4 +52,5 @@
                                                                                                     
                                                                                                     
                                                                                                     
-                                                                                                    
+                                            
+Aulthium is an open-source AI agent designed to give users control over their models, tools, and extensions.​                                                        
