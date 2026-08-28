@@ -1,0 +1,7 @@
+{
+  "name": "better-websearch",
+  "description": "Drop-in upgrade for WEB_SEARCH: fetches the top result pages (not just DuckDuckGo's snippet) and uses BeautifulSoup to strip nav/ads/scripts and pull the real article text, so the AI reasons over actual page content instead of a two-line blurb.",
+  "version": "1.0.0",
+  "entry": "python3 betterwebsearch.py",
+  "runtime": "python3"
+}
