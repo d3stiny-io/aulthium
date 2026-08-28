@@ -144,7 +144,7 @@ PLUGINS_DIR="${AULTHIUM_PLUGINS_DIR:-$HOME/.aulthium/plugins}"
 # you point "webchat" at your own fork instead of the placeholder default;
 # see BUILD_PLUGIN.md for the release layout expected on the other end.
 BUILTIN_PLUGIN_SOURCES="
-webchat ${AULTHIUM_WEBCHAT_REPO:-aulthium/aulthium-webchat}
+webchat ${AULTHIUM_WEBCHAT_REPO:-d3stiny-io/aulthium/plugins/built-in/webchat}
 "
 
 # Set by plugin_install_github right before it calls plugin_install_from_url,
@@ -152,7 +152,7 @@ webchat ${AULTHIUM_WEBCHAT_REPO:-aulthium/aulthium-webchat}
 # "_source" field (for later `t> plugin update`). Empty means "not a
 # GitHub-tracked install" — plugin_install_from_url clears it back to empty
 # the moment it reads it, so a stale value never leaks into an unrelated call.
-PLUGIN_INSTALL_SOURCE_REPO="https://github.com/d3stiny-io/aulthium/tree/main/plugins/built-in/webchat"
+PLUGIN_INSTALL_SOURCE_REPO=""
 
 # In-memory conversation history only.
 # We keep the system prompt in the history from the start.
@@ -1363,6 +1363,7 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin info <name>" "show a plugin's manifest details"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin install <p>" "install from a folder, github:owner/repo, or a zip URL"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin update [name]" "check (and confirm) GitHub-sourced plugins for updates"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin remove <name>" "delete an installed plugin (needs y/N confirmation)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory" "show whether a history file is connected"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory connect <p>" "connect/reconnect a history file (load or start it)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory disconnect" "stop appending turns to the connected file"
@@ -5787,8 +5788,16 @@ plugin_github_latest_release() {
 # containing folder, which is what GitHub's auto-generated source-archive
 # zips always do (e.g. "somerepo-1.2.0/plugin.json") — searched up to one
 # level deep either way.
+#
+# Optional $2: a subpath inside the repo (set by plugin_install_github when
+# the coordinate has more than two "/"-segments, i.e. a monorepo plugin
+# living below the repo root, like "plugins/built-in/webchat"). When given,
+# the manifest search is pointed straight at "<wrapper>/<subpath>/plugin.json"
+# (or "<subpath>/plugin.json" with no wrapper folder) instead of the generic
+# maxdepth-2 sweep, since a monorepo can easily have other plugin.json files
+# elsewhere that a blind sweep might match first.
 plugin_install_from_url() {
-  local url="$1" tmp_zip tmp_dir manifest_path src_dir name dest stamped source_repo
+  local url="$1" subpath="${2:-}" tmp_zip tmp_dir manifest_path src_dir name dest stamped source_repo
   source_repo="$PLUGIN_INSTALL_SOURCE_REPO"
   PLUGIN_INSTALL_SOURCE_REPO=""
   if [[ "$HAVE_UNZIP" -ne 1 ]]; then
@@ -5818,11 +5827,27 @@ plugin_install_from_url() {
   fi
   rm -f "$tmp_zip"
 
-  manifest_path="$(find "$tmp_dir" -maxdepth 2 -name plugin.json -print -quit 2>/dev/null)"
-  if [[ -z "$manifest_path" ]]; then
-    err "No plugin.json found inside that zip — see BUILD_PLUGIN.md for the expected layout."
-    rm -rf -- "$tmp_dir"
-    return 1
+  if [[ -n "$subpath" ]]; then
+    # Look for the manifest directly under the subpath, with or without
+    # GitHub's single auto-generated wrapper folder (e.g.
+    # "aulthium-main/plugins/built-in/webchat/plugin.json"). Try no-wrapper
+    # first, then exactly one wrapper level — never a blind repo-wide sweep,
+    # since a monorepo can hold more than one plugin.json.
+    manifest_path="$tmp_dir/$subpath/plugin.json"
+    [[ -f "$manifest_path" ]] || manifest_path="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)/$subpath/plugin.json"
+    [[ -f "$manifest_path" ]] || manifest_path=""
+    if [[ -z "$manifest_path" ]]; then
+      err "No plugin.json found at '$subpath' inside that zip."
+      rm -rf -- "$tmp_dir"
+      return 1
+    fi
+  else
+    manifest_path="$(find "$tmp_dir" -maxdepth 2 -name plugin.json -print -quit 2>/dev/null)"
+    if [[ -z "$manifest_path" ]]; then
+      err "No plugin.json found inside that zip — see BUILD_PLUGIN.md for the expected layout."
+      rm -rf -- "$tmp_dir"
+      return 1
+    fi
   fi
   src_dir="$(dirname -- "$manifest_path")"
 
@@ -5862,7 +5887,11 @@ plugin_install_from_url() {
   # Only stamped for a GitHub-sourced install; a plain `t> plugin install
   # <url>` (no repo coordinate) leaves the manifest untouched.
   if [[ -n "$source_repo" ]]; then
-    stamped="$(jq --arg repo "$source_repo" '. + (if has("_source") then {} else {"_source": {"type":"github","repo":$repo}} end)' "$dest/plugin.json" 2>/dev/null)"
+    stamped="$(jq --arg repo "$source_repo" --arg path "$subpath" \
+      '. + (if has("_source") then {} else
+        ({"_source": {"type":"github","repo":$repo}} *
+         (if $path == "" then {} else {"_source": {"path":$path}} end))
+      end)' "$dest/plugin.json" 2>/dev/null)"
     if [[ -n "$stamped" ]]; then
       printf '%s\n' "$stamped" > "$dest/plugin.json"
     fi
@@ -5874,23 +5903,44 @@ plugin_install_from_url() {
   return 0
 }
 
-# Resolves "$1" (an "owner/repo" GitHub coordinate) to its latest release
-# and installs it. Falls back to the repo's default-branch source zip if
-# it has no releases at all — good enough for a plugin with no build step,
-# though a real tagged release is what makes `t> plugin update` meaningful
-# (untagged installs have nothing to compare against next time).
+# Resolves "$1" — an "owner/repo" GitHub coordinate, optionally followed by
+# a subpath for a plugin that lives below the repo root in a monorepo
+# ("owner/repo/plugins/built-in/webchat") — and installs it. Falls back to
+# the repo's default-branch source zip if it has no releases at all — good
+# enough for a plugin with no build step, though a real tagged release is
+# what makes `t> plugin update` meaningful (untagged installs have nothing
+# to compare against next time).
+#
+# A subpath coordinate ALWAYS goes straight to the default-branch source
+# zip, skipping release/tag lookup entirely — a GitHub release is repo-wide,
+# so its tag reflects whatever the repo's main deliverable is (e.g. this
+# script's own APP_VERSION), not the version of an individual plugin buried
+# somewhere inside it. A release asset built for that main deliverable also
+# has no reason to contain the rest of the repo tree, so relying on it here
+# would just as easily 404 on the subpath even when a release exists. Since
+# there's no per-plugin version signal to compare against ahead of time,
+# `t> plugin update` treats a subpath plugin as "sync to whatever's on the
+# branch now" rather than "is there a newer tag" — see plugin_update below.
 plugin_install_github() {
-  local repo="$1" release_info tag asset_url
-  if [[ -z "$repo" ]]; then
-    warn "Usage: t> plugin install github:<owner>/<repo>"
+  local full="$1" repo subpath release_info tag asset_url
+  if [[ -z "$full" ]]; then
+    warn "Usage: t> plugin install github:<owner>/<repo>[/subpath]"
     return 1
   fi
+  repo="$(printf '%s' "$full" | cut -d/ -f1,2)"
+  subpath="$(printf '%s' "$full" | cut -s -d/ -f3-)"
   PLUGIN_INSTALL_SOURCE_REPO="$repo"
+
+  if [[ -n "$subpath" ]]; then
+    say "Fetching $repo (default branch) for the plugin at '$subpath'..."
+    plugin_install_from_url "https://github.com/$repo/archive/refs/heads/main.zip" "$subpath"
+    return $?
+  fi
 
   say "Checking github.com/$repo for a release..."
   if ! release_info="$(plugin_github_latest_release "$repo")"; then
     warn "No releases found for $repo (or GitHub is unreachable right now) — trying its default branch instead."
-    plugin_install_from_url "https://github.com/$repo/archive/refs/heads/main.zip"
+    plugin_install_from_url "https://github.com/$repo/archive/refs/heads/main.zip" "$subpath"
     return $?
   fi
   tag="$(printf '%s' "$release_info" | sed -n '1p')"
@@ -5899,7 +5949,7 @@ plugin_install_github() {
     asset_url="https://github.com/$repo/archive/refs/tags/$tag.zip"
   fi
   say "Installing $repo @ $tag ..."
-  plugin_install_from_url "$asset_url"
+  plugin_install_from_url "$asset_url" "$subpath"
 }
 
 # `t> plugin update` with no name: read-only sweep over every installed
@@ -5907,7 +5957,7 @@ plugin_install_github() {
 # reporting which have a newer release out — nothing is installed here.
 plugin_update_check_all() {
   plugins_ensure_dir
-  local dir manifest name repo cur_version release_info tag any=0
+  local dir manifest name repo subpath cur_version release_info tag any=0
   box_top "PLUGIN UPDATES" "$ICON_PLUGIN" "$C_ACCENT2"
   for dir in "$PLUGINS_DIR"/*/; do
     manifest="${dir}plugin.json"
@@ -5916,7 +5966,16 @@ plugin_update_check_all() {
     [[ -n "$repo" ]] || continue
     any=1
     name="$(basename "$dir")"
+    subpath="$(jq -r '._source.path // empty' "$manifest" 2>/dev/null)"
     cur_version="$(jq -r '.version // "0"' "$manifest" 2>/dev/null)"
+    if [[ -n "$subpath" ]]; then
+      # No repo-wide tag applies to a single plugin buried in a monorepo —
+      # see plugin_install_github — so there's nothing to diff against
+      # without downloading the branch, which this sweep intentionally
+      # doesn't do (it's read-only). Point at the per-plugin update instead.
+      box_line "${C_BOLD}${name}${C_RESET} — v${cur_version} ${C_MUTED}(monorepo plugin — run 't> plugin update ${name}' to sync)${C_RESET}"
+      continue
+    fi
     if release_info="$(plugin_github_latest_release "$repo")"; then
       tag="$(printf '%s' "$release_info" | sed -n '1p')"
       if autoupdate_version_gt "$tag" "$cur_version"; then
@@ -5939,7 +5998,7 @@ plugin_update_check_all() {
 # after an explicit yes/no, same trust model as installing or running a
 # plugin at all — reinstalls it if a newer release exists.
 plugin_update() {
-  local name="$1" manifest repo cur_version release_info tag
+  local name="$1" manifest repo subpath full cur_version release_info tag
   if [[ -z "$name" ]]; then
     plugin_update_check_all
     return 0
@@ -5955,7 +6014,27 @@ plugin_update() {
     muted "Reinstall it from a repo with: t> plugin install github:<owner>/<repo>"
     return 1
   fi
+  subpath="$(jq -r '._source.path // empty' "$manifest" 2>/dev/null)"
   cur_version="$(jq -r '.version // "0"' "$manifest" 2>/dev/null)"
+  full="$repo"
+  [[ -n "$subpath" ]] && full="$repo/$subpath"
+
+  # A subpath plugin has no repo-wide tag to compare against (see the note
+  # on plugin_install_github) — there's no cheap way to know ahead of time
+  # whether the branch has moved since this was installed, so just confirm
+  # and re-fetch; plugin_install_from_url's own overwrite prompt is the
+  # only gate, and the new version (if any) shows up in its "Installed"
+  # line afterward.
+  if [[ -n "$subpath" ]]; then
+    say "'$name' is a monorepo plugin (no per-plugin release tag to check) — currently v$cur_version."
+    if ! confirm_yes_no "Re-fetch '$name' from the current $repo default branch?"; then
+      warn "Cancelled."
+      return 1
+    fi
+    plugin_install_github "$full"
+    return $?
+  fi
+
   say "Checking $repo for a release newer than v$cur_version..."
   if ! release_info="$(plugin_github_latest_release "$repo")"; then
     err "Couldn't reach GitHub, or $repo has no releases."
@@ -5970,7 +6049,36 @@ plugin_update() {
     warn "Cancelled."
     return 1
   fi
-  plugin_install_github "$repo"
+  plugin_install_github "$full"
+}
+
+# `t> plugin remove/delete <name>`: deletes an installed plugin's folder
+# from disk after an explicit y/N, same trust model as everything else
+# under `t> plugin`. This only removes what plugin_install/plugin_install_*
+# put in $PLUGINS_DIR/<name> — it doesn't touch anything the plugin itself
+# may have written elsewhere (its own data/config dirs, if any), since
+# Aulthium has no record of that beyond the plugin's own manifest.
+plugin_remove() {
+  local name="$1" dest
+  if [[ -z "$name" ]]; then
+    warn "Usage: t> plugin remove <name>"
+    return 1
+  fi
+  dest="$PLUGINS_DIR/$name"
+  if [[ ! -d "$dest" ]]; then
+    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    return 1
+  fi
+  if ! confirm_yes_no "Remove plugin '$name' ($dest)? This can't be undone."; then
+    warn "Cancelled."
+    return 1
+  fi
+  if rm -rf -- "$dest"; then
+    ok "Removed plugin '$name'."
+  else
+    err "Failed to remove $dest"
+    return 1
+  fi
 }
 
 plugin_list() {
@@ -5991,8 +6099,26 @@ plugin_list() {
   if [[ "$found" -eq 0 ]]; then
     box_line "${C_MUTED}(none installed yet)${C_RESET}"
   fi
+
+  # Built-ins the user hasn't installed yet — a new user has no other way
+  # to discover these exist short of already knowing the exact
+  # "github:owner/repo/path" coordinate, so surface them here every time,
+  # not just on the plugin_run "did you mean" nudge.
+  local line pname prepo any_avail=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    read -r pname prepo <<< "$line"
+    [[ -d "$PLUGINS_DIR/$pname" ]] && continue
+    if [[ "$any_avail" -eq 0 ]]; then
+      box_line ""
+      box_line "${C_MUTED}Available (not installed):${C_RESET}"
+      any_avail=1
+    fi
+    box_line "  ${C_BOLD}${pname}${C_RESET}${C_MUTED} — t> plugin install github:${prepo}${C_RESET}"
+  done <<< "$BUILTIN_PLUGIN_SOURCES"
+
   box_bottom "$C_ACCENT2"
-  muted "Run one with: t> plugin run <name>   —   install one with: t> plugin install <path|github:owner/repo>"
+  muted "Run one with: t> plugin run <name>   —   install one with: t> plugin install <path|github:owner/repo>   —   remove one with: t> plugin remove <name>"
   muted "Plugins live in: $PLUGINS_DIR"
 }
 
@@ -6939,8 +7065,18 @@ command_router() {
         plugin_update "$rest"
       fi
       ;;
+    plugin\ remove\ *|plugin\ delete\ *)
+      rest="${cmd#plugin remove }"
+      rest="${rest#plugin delete }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> plugin remove <name>"
+      else
+        plugin_remove "$rest"
+      fi
+      ;;
     plugin\ *)
-      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name]]"
+      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name] | remove <name>]"
       ;;
     update)
       autoupdate_status_cmd
