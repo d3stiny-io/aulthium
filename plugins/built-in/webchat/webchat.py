@@ -141,10 +141,6 @@ Rules:
 """
 
 def _do_request(url, data_bytes, headers):
-    """POST and return (status, body_text, headers_dict). status is 0 on a
-    connection-level failure (DNS, timeout, refused, etc), with the error
-    message stuffed into body_text as a JSON error object so callers can
-    treat it uniformly."""
     req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -199,11 +195,6 @@ def extract_reply(body_text):
 QUOTA_RE = re.compile(r"per-day|per-month|daily|quota|free-models-per|RESOURCE_EXHAUSTED", re.I)
 
 def call_with_retry(messages, job):
-    """Same shape as call_provider_with_retry in the terminal script: retry
-    HTTP 429s with backoff + jitter (honoring Retry-After when present),
-    fail fast on an exhausted free-tier quota, give up after
-    MAX_RATE_LIMIT_RETRIES. Reports live status onto `job` as it goes.
-    Returns (reply_text, error_text) — exactly one of them is set."""
     attempt = 0
     wait_secs = 2
     while True:
@@ -321,11 +312,6 @@ def tool_file_delete(rel):
     return "OK: deleted %s" % rel
 
 def tool_shell_run(cmd_text):
-    """Mirrors the terminal's handle_shell_run_action: cwd = the workspace
-    folder (falling back to this process's cwd if none is configured),
-    NOT path-sandboxed like the file tools — the command can reach
-    anywhere this device's shell can. Capped timeout, output capped and
-    combined stdout+stderr, same shape as the terminal's cap_preview."""
     cwd = WORKSPACE_ABS or os.getcwd()
     try:
         proc = subprocess.run(
@@ -349,10 +335,6 @@ def tool_shell_run(cmd_text):
     return "exit=%d\n%s" % (exit_code, output or "(no output)")
 
 def _web_search_parse_bs4(html):
-    """Preferred parser: BeautifulSoup over DuckDuckGo lite's result markup
-    (each result is an <a class="result-link"> followed by a
-    <td class="result-snippet">). Far more forgiving of markup quirks than
-    the regex fallback below."""
     soup = BeautifulSoup(html, "html.parser")
     links = soup.select(".result-link")
     snippets = soup.select(".result-snippet")
@@ -365,9 +347,6 @@ def _web_search_parse_bs4(html):
     return results
 
 def _web_search_parse_regex(html):
-    """Fallback used when BeautifulSoup isn't installed — the original
-    regex-based scrape, kept so WEB_SEARCH still works with zero extra
-    installs."""
     raw = re.findall(
         r'class="result-link"[^>]*>(.*?)</a>.*?class="result-snippet">(.*?)</td>', html, re.S
     )
@@ -579,7 +558,7 @@ def run_job(job):
         job.status = "done"
         job.reply = "(stopped after several tool rounds without a final answer — try rephrasing, or ask for one step at a time)"
 
-PAGE_TEMPLATE = """<!doctype html>
+PAGE_TEMPLATE = r"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -588,32 +567,32 @@ PAGE_TEMPLATE = """<!doctype html>
 <style>
   :root {
     color-scheme: dark;
-    --bg: #0c0d14;
-    --bg-elevated: #13141f;
-    --panel: #181926;
-    --panel-2: #1e1f2e;
-    --border: #2a2c3d;
-    --border-subtle: #1f2130;
-    --text: #ececf3;
-    --text-secondary: #a0a3b8;
-    --text-tertiary: #6b6f85;
-    --accent: #8b7cf7;
-    --accent-2: #5aa8ff;
-    --accent-grad: linear-gradient(135deg, #8b7cf7, #5aa8ff);
-    --accent-glow: rgba(139,124,247,0.15);
-    --warn: #f0c040;
-    --warn-bg: #2a2210;
-    --warn-border: #5c4a18;
-    --danger: #ff7a85;
-    --danger-bg: #2b1418;
-    --danger-border: #5c2229;
-    --ok: #5ee090;
-    --ok-bg: #0f2a18;
-    --shadow: 0 2px 12px rgba(0,0,0,0.35);
-    --shadow-lg: 0 8px 32px rgba(0,0,0,0.45);
-    --radius: 16px;
-    --radius-sm: 10px;
-    --radius-xs: 6px;
+    --bg: #050505;
+    --bg-elevated: #0b0b0b;
+    --panel: rgba(255,255,255,0.055);
+    --panel-2: rgba(255,255,255,0.09);
+    --border: rgba(255,255,255,0.14);
+    --border-subtle: rgba(255,255,255,0.08);
+    --text: #f7f7f7;
+    --text-secondary: #adadad;
+    --text-tertiary: #707070;
+    --accent: #ffffff;
+    --accent-2: #d8d8d8;
+    --accent-glow: rgba(255,255,255,0.14);
+    --warn: #ffffff;
+    --warn-bg: rgba(255,255,255,0.05);
+    --warn-border: rgba(255,255,255,0.28);
+    --danger: #ffffff;
+    --danger-bg: rgba(255,255,255,0.05);
+    --danger-border: rgba(255,255,255,0.32);
+    --ok: #ffffff;
+    --ok-bg: rgba(255,255,255,0.05);
+    --shadow: 0 2px 14px rgba(0,0,0,0.5);
+    --shadow-lg: 0 10px 36px rgba(0,0,0,0.6);
+    --radius: 24px;
+    --radius-sm: 18px;
+    --radius-xs: 10px;
+    --glass-blur: blur(18px) saturate(1.4);
     --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -627,33 +606,34 @@ PAGE_TEMPLATE = """<!doctype html>
   }
   header {
     padding: 14px 18px 12px; border-bottom: 1px solid var(--border-subtle);
-    background: rgba(19, 20, 31, 0.85); backdrop-filter: blur(16px) saturate(1.2);
+    background: rgba(255,255,255,0.04); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     position: sticky; top: 0; z-index: 10;
     transition: box-shadow var(--transition);
   }
-  header.scrolled { box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+  header.scrolled { box-shadow: 0 4px 24px rgba(0,0,0,0.4); }
   .header-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
   .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .brand h1 { font-size: 16px; margin: 0; font-weight: 700; letter-spacing: 0.3px; white-space: nowrap; }
   .dot {
     width: 9px; height: 9px; border-radius: 50%; flex: none;
-    background: var(--ok); box-shadow: 0 0 0 0 rgba(94,224,144,0.4);
+    background: var(--text); box-shadow: 0 0 0 0 rgba(255,255,255,0.35);
     animation: pulse-dot 2.5s ease-in-out infinite;
   }
   @keyframes pulse-dot {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(94,224,144,0.4); }
-    50% { box-shadow: 0 0 0 6px rgba(94,224,144,0); }
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0.35); }
+    50% { box-shadow: 0 0 0 6px rgba(255,255,255,0); }
   }
   .header-actions { display: flex; gap: 8px; flex: none; }
   .pill {
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+    backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     border-radius: 999px; padding: 7px 14px; font-size: 12.5px; cursor: pointer;
     transition: all var(--transition); white-space: nowrap; font-weight: 500;
     touch-action: manipulation;
   }
-  .pill:hover { border-color: var(--accent); background: var(--panel); }
+  .pill:hover { border-color: var(--accent); background: rgba(255,255,255,0.14); }
   .pill:active { transform: scale(0.96); }
-  .pill.off { color: var(--warn); border-color: var(--warn-border); background: var(--warn-bg); }
+  .pill.off { color: var(--text); border-color: var(--border); background: rgba(255,255,255,0.03); font-weight: 400; opacity: 0.6; }
   .pill.ghost { background: transparent; }
   .subtitle { margin-top: 6px; font-size: 12px; color: var(--text-tertiary); font-weight: 400; }
   #log {
@@ -674,11 +654,12 @@ PAGE_TEMPLATE = """<!doctype html>
     to { opacity: 1; transform: translateY(0) scale(1); }
   }
   .user {
-    align-self: flex-end; background: var(--accent-grad); color: white;
-    border-bottom-right-radius: var(--radius-xs); font-weight: 450;
+    align-self: flex-end; background: #ffffff; color: #050505;
+    border-bottom-right-radius: var(--radius-xs); font-weight: 500;
   }
   .assistant {
     align-self: flex-start; background: var(--panel); border: 1px solid var(--border);
+    backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     border-bottom-left-radius: var(--radius-xs);
   }
   .assistant.pending {
@@ -714,10 +695,11 @@ PAGE_TEMPLATE = """<!doctype html>
     align-self: flex-start; max-width: 84%; font-size: 12px; color: var(--text-tertiary);
     padding: 6px 14px; border-radius: 999px; background: var(--panel-2);
     border: 1px solid var(--border-subtle);
+    backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     animation: fade-in 0.3s ease-out;
   }
-  .tool-note.auto { color: var(--ok); border-color: rgba(94,224,144,0.2); background: var(--ok-bg); }
+  .tool-note.auto { color: var(--text-secondary); border-color: var(--border-subtle); background: rgba(255,255,255,0.03); }
   @keyframes fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   .msg.markdown { white-space: normal; }
   .msg.markdown > *:first-child { margin-top: 0; }
@@ -733,7 +715,7 @@ PAGE_TEMPLATE = """<!doctype html>
   .msg.markdown li { margin: 4px 0; }
   .msg.markdown blockquote {
     margin: 0 0 10px; padding: 4px 14px; border-left: 3px solid var(--accent);
-    color: var(--text-secondary); background: rgba(139,124,247,0.06);
+    color: var(--text-secondary); background: rgba(255,255,255,0.05);
     border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
   }
   .msg.markdown code {
@@ -746,11 +728,12 @@ PAGE_TEMPLATE = """<!doctype html>
     overflow-x: auto; position: relative;
   }
   .msg.markdown pre.code-block code { background: none; padding: 0; font-size: 0.84em; line-height: 1.6; }
-  .msg.markdown a { color: var(--accent-2); text-decoration: none; transition: opacity 0.15s; }
-  .msg.markdown a:hover { opacity: 0.8; text-decoration: underline; }
+  .msg.markdown a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; transition: opacity 0.15s; }
+  .msg.markdown a:hover { opacity: 0.7; }
   .confirm-card {
     align-self: flex-start; max-width: 92%; width: 100%;
     background: var(--warn-bg); border: 1px solid var(--warn-border);
+    backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     border-radius: var(--radius); padding: 16px 18px;
     animation: slide-up 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
     box-shadow: var(--shadow-lg);
@@ -774,33 +757,40 @@ PAGE_TEMPLATE = """<!doctype html>
   }
   .confirm-actions button:hover { transform: translateY(-1px); }
   .confirm-actions button:active { transform: scale(0.97); }
-  .confirm-yes { background: var(--ok); color: #0a2a14; }
-  .confirm-no { background: var(--panel-2); color: var(--text); border: 1px solid var(--border) !important; }
+  .confirm-yes { background: #ffffff; color: #050505; }
+  .confirm-no { background: transparent; color: var(--text); border: 1px solid var(--border) !important; }
   .confirm-actions button:disabled { opacity: 0.45; cursor: default; transform: none !important; }
   form {
-    display: flex; gap: 10px; padding: 12px 16px 20px; border-top: 1px solid var(--border-subtle);
+    display: flex; align-items: flex-end; gap: 10px; padding: 12px 16px 20px; border-top: 1px solid var(--border-subtle);
     max-width: 840px; width: 100%; margin: 0 auto; box-sizing: border-box;
-    background: rgba(12, 13, 20, 0.8); backdrop-filter: blur(12px);
+    background: rgba(5, 5, 5, 0.7); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     position: sticky; bottom: 0;
   }
   textarea {
-    flex: 1; resize: none; border-radius: var(--radius-sm); border: 1px solid var(--border);
-    background: var(--panel-2); color: var(--text); padding: 12px 14px; font-size: 15px;
+    flex: 1; resize: none; border-radius: 24px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); padding: 13px 18px; font-size: 15px;
     font-family: inherit; min-height: 48px; max-height: 140px; outline: none;
     transition: all var(--transition); line-height: 1.5;
     -webkit-appearance: none; appearance: none;
   }
-  textarea:focus { border-color: var(--accent); background: var(--panel); box-shadow: 0 0 0 3px var(--accent-glow); }
+  textarea:focus { border-color: var(--accent); background: rgba(255,255,255,0.11); box-shadow: 0 0 0 3px var(--accent-glow); }
   textarea::placeholder { color: var(--text-tertiary); }
   button#send {
-    border: none; border-radius: var(--radius-sm); background: var(--accent-grad); color: white;
-    padding: 0 22px; font-size: 14.5px; font-weight: 600; cursor: pointer;
-    transition: all 0.2s; touch-action: manipulation; min-height: 48px;
-    box-shadow: 0 2px 8px rgba(139,124,247,0.25);
+    border: none; border-radius: 50%; background: #ffffff; color: #050505;
+    width: 48px; height: 48px; min-width: 48px; padding: 0; font-size: 0;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    transition: all 0.2s; touch-action: manipulation;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.4); flex: none;
   }
-  button#send:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(139,124,247,0.35); }
-  button#send:active { transform: scale(0.96); }
-  button#send:disabled { opacity: 0.4; cursor: default; transform: none !important; box-shadow: none; }
+  button#send::before {
+    content: ""; width: 16px; height: 16px;
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='12' y1='19' x2='12' y2='5'/%3E%3Cpolyline points='5 12 12 5 19 12'/%3E%3C/svg%3E") no-repeat center / contain;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='12' y1='19' x2='12' y2='5'/%3E%3Cpolyline points='5 12 12 5 19 12'/%3E%3C/svg%3E") no-repeat center / contain;
+    background: #050505;
+  }
+  button#send:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+  button#send:active { transform: scale(0.94); }
+  button#send:disabled { opacity: 0.35; cursor: default; transform: none !important; box-shadow: none; }
   #log::-webkit-scrollbar { width: 6px; }
   #log::-webkit-scrollbar-track { background: transparent; }
   #log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -816,8 +806,8 @@ PAGE_TEMPLATE = """<!doctype html>
     .confirm-card { max-width: 95%; padding: 14px; }
     .confirm-preview { max-height: 180px; padding: 10px 12px; font-size: 12px; }
     form { padding: 10px 12px 18px; gap: 8px; }
-    textarea { padding: 11px 12px; font-size: 16px; min-height: 46px; }
-    button#send { padding: 0 18px; font-size: 14px; min-height: 46px; }
+    textarea { padding: 11px 16px; font-size: 16px; min-height: 46px; }
+    button#send { width: 46px; height: 46px; min-width: 46px; }
   }
   @media (max-width: 380px) {
     .brand h1 { font-size: 14px; }
@@ -846,7 +836,7 @@ PAGE_TEMPLATE = """<!doctype html>
 <div id="log"></div>
 <form id="form">
   <textarea id="input" placeholder="Message..." autofocus></textarea>
-  <button type="submit" id="send">Send</button>
+  <button type="submit" id="send" aria-label="Send"></button>
 </form>
 <script>
   const log = document.getElementById("log");
