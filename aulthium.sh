@@ -137,15 +137,24 @@ SKIP_CONFIRMATIONS=0
 # doesn't break plugin discovery.
 PLUGINS_DIR="${AULTHIUM_PLUGINS_DIR:-$HOME/.aulthium/plugins}"
 
-# "Built-in" plugins are no longer bundled as source inside this script —
-# they're ordinary GitHub repos Aulthium knows the coordinates of, fetched
-# (and later updated) on request via plugin_install_github. This is that
-# lookup table: one "name repo" pair per line. AULTHIUM_WEBCHAT_REPO lets
-# you point "webchat" at your own fork instead of the placeholder default;
-# see BUILD_PLUGIN.md for the release layout expected on the other end.
-BUILTIN_PLUGIN_SOURCES="
-webchat ${AULTHIUM_WEBCHAT_REPO:-d3stiny-io/aulthium/plugins/built-in/webchat}
-"
+# "Built-in" plugins are no longer bundled as source inside this script,
+# and their names are no longer hardcoded here either — they're discovered
+# live by scanning a folder in a GitHub repo Aulthium knows the coordinates
+# of (one subfolder per plugin, each installable via plugin_install_github).
+# AULTHIUM_BUILTIN_PLUGINS_REPO / AULTHIUM_BUILTIN_PLUGINS_PATH let you
+# point discovery at your own fork/folder instead of the upstream default;
+# see BUILD_PLUGIN.md for the layout expected under that path.
+BUILTIN_PLUGINS_REPO="${AULTHIUM_BUILTIN_PLUGINS_REPO:-d3stiny-io/aulthium}"
+BUILTIN_PLUGINS_PATH="${AULTHIUM_BUILTIN_PLUGINS_PATH:-plugins/built-in}"
+
+# Session-scoped cache for the discovered "name repo/path" pairs (same
+# shape BUILTIN_PLUGIN_SOURCES used to be hardcoded as) so a listing or
+# lookup mid-session never hits the GitHub API more than once. Populated
+# lazily by builtin_plugin_sources() on first use.
+# FETCHED distinguishes "not checked yet" from "checked, found nothing /
+# offline" (an empty cache is a valid result of the latter).
+BUILTIN_PLUGIN_SOURCES_CACHE=""
+BUILTIN_PLUGIN_SOURCES_FETCHED=0
 
 # Set by plugin_install_github right before it calls plugin_install_from_url,
 # so the latter knows which repo to stamp into the installed plugin.json's
@@ -1448,14 +1457,13 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       trust decision, same tier as a shell command, and\n"
   printf "${C_MUTED}│${C_RESET}       needs a y/N confirmation.\n"
   printf "${C_MUTED}│${C_RESET}\n"
-  printf "${C_MUTED}│${C_RESET}       ${C_RESET}webchat${C_MUTED}, the built-in plugin, is a small\n"
-  printf "${C_MUTED}│${C_RESET}       stdlib-only Python web server (needs python3) that\n"
-  printf "${C_MUTED}│${C_RESET}       opens a chat page in your browser, wired to the same\n"
-  printf "${C_MUTED}│${C_RESET}       provider/model/key this session is using — chat by\n"
-  printf "${C_MUTED}│${C_RESET}       clicking instead of typing at ${C_RESET}User>${C_MUTED}. It's not\n"
-  printf "${C_MUTED}│${C_RESET}       bundled in this script — ${C_RESET}t> plugin run webchat${C_MUTED}\n"
-  printf "${C_MUTED}│${C_RESET}       fetches it from GitHub the first time, and\n"
-  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> plugin update webchat${C_MUTED} checks for a newer release.\n"
+  printf "${C_MUTED}│${C_RESET}       Built-in plugins aren't bundled in this script — they're\n"
+  printf "${C_MUTED}│${C_RESET}       discovered live from github.com/%s\n" "$BUILTIN_PLUGINS_REPO"
+  printf "${C_MUTED}│${C_RESET}       (path: %s), so what's available can\n" "$BUILTIN_PLUGINS_PATH"
+  printf "${C_MUTED}│${C_RESET}       change without a script update. See ${C_RESET}t> plugin list${C_MUTED}\n"
+  printf "${C_MUTED}│${C_RESET}       for the current set — ${C_RESET}t> plugin run <name>${C_MUTED} fetches\n"
+  printf "${C_MUTED}│${C_RESET}       one from GitHub the first time, and\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> plugin update <name>${C_MUTED} checks for a newer release.\n"
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET}       Write your own by reading BUILD_PLUGIN.md, then\n"
   printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> plugin install <folder|github:owner/repo|url>${C_MUTED}.\n"
@@ -5744,9 +5752,63 @@ plugins_ensure_dir() {
   mkdir -p "$PLUGINS_DIR" 2>/dev/null
 }
 
-# Looks up a name in BUILTIN_PLUGIN_SOURCES, echoing its "owner/repo"
-# coordinate on a match. Used by plugin_run to offer an install when a
-# known built-in name is referenced but nothing is on disk for it yet.
+# Scans $BUILTIN_PLUGINS_PATH inside $BUILTIN_PLUGINS_REPO via GitHub's
+# "contents" API and prints one "name owner/repo/path/to/name" pair per
+# line — the same shape BUILTIN_PLUGIN_SOURCES used to be hardcoded as,
+# just discovered live instead of typed in. Only entries the API reports
+# as type=="dir" count as plugins (a stray README.md, LICENSE, etc sitting
+# alongside them in that folder is silently skipped). Returns non-zero on
+# any failure (offline, repo/path doesn't exist, rate-limited) with
+# nothing printed — deliberately undifferentiated, same as
+# plugin_github_latest_release, since every caller treats "couldn't
+# determine built-ins" the same way regardless of why.
+builtin_plugin_sources_fetch() {
+  local api_url json
+  api_url="https://api.github.com/repos/$BUILTIN_PLUGINS_REPO/contents/$BUILTIN_PLUGINS_PATH"
+  json="$(curl -fsSL --max-time 15 -H "Accept: application/vnd.github+json" "$api_url" 2>/dev/null)" || return 1
+  [[ -n "$json" ]] || return 1
+  printf '%s' "$json" | jq -r --arg repo "$BUILTIN_PLUGINS_REPO" --arg path "$BUILTIN_PLUGINS_PATH" \
+    'if type == "array" then
+       (.[]? | select(.type == "dir") | "\(.name) \($repo)/\($path)/\(.name)")
+     else empty end' 2>/dev/null
+}
+
+# Cache-aware wrapper around builtin_plugin_sources_fetch — the thing
+# every other call site should actually use. Fetches once per session
+# (see BUILTIN_PLUGIN_SOURCES_FETCHED above) and hands back the cached
+# result on every call after that. Use builtin_plugin_sources_refresh
+# instead when the caller specifically wants a fresh live check
+# (e.g. 't> plugin list --refresh' or similar).
+builtin_plugin_sources() {
+  if [[ "$BUILTIN_PLUGIN_SOURCES_FETCHED" -eq 1 ]]; then
+    printf '%s' "$BUILTIN_PLUGIN_SOURCES_CACHE"
+    return 0
+  fi
+  builtin_plugin_sources_refresh
+}
+
+# Forces a live re-fetch of the built-in plugin listing, replacing
+# whatever was cached. Echoes the fresh result and returns non-zero if
+# the fetch itself failed (network down, bad repo/path, GitHub rate
+# limit) — callers that only care about the listing can ignore the
+# return code, since BUILTIN_PLUGIN_SOURCES_CACHE is left empty (not
+# stale) on failure either way.
+builtin_plugin_sources_refresh() {
+  local out
+  BUILTIN_PLUGIN_SOURCES_FETCHED=1
+  if out="$(builtin_plugin_sources_fetch)"; then
+    BUILTIN_PLUGIN_SOURCES_CACHE="$out"
+    printf '%s' "$out"
+    return 0
+  fi
+  BUILTIN_PLUGIN_SOURCES_CACHE=""
+  return 1
+}
+
+# Looks up a name among the discovered built-ins, echoing its
+# "owner/repo/path" coordinate on a match. Used by plugin_run to offer an
+# install when a known built-in name is referenced but nothing is on disk
+# for it yet.
 builtin_plugin_repo_for() {
   local target="$1" line pname prepo
   while IFS= read -r line; do
@@ -5756,7 +5818,7 @@ builtin_plugin_repo_for() {
       printf '%s' "$prepo"
       return 0
     fi
-  done <<< "$BUILTIN_PLUGIN_SOURCES"
+  done <<< "$(builtin_plugin_sources)"
   return 1
 }
 
@@ -6103,19 +6165,26 @@ plugin_list() {
   # Built-ins the user hasn't installed yet — a new user has no other way
   # to discover these exist short of already knowing the exact
   # "github:owner/repo/path" coordinate, so surface them here every time,
-  # not just on the plugin_run "did you mean" nudge.
-  local line pname prepo any_avail=0
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    read -r pname prepo <<< "$line"
-    [[ -d "$PLUGINS_DIR/$pname" ]] && continue
-    if [[ "$any_avail" -eq 0 ]]; then
-      box_line ""
-      box_line "${C_MUTED}Available (not installed):${C_RESET}"
-      any_avail=1
-    fi
-    box_line "  ${C_BOLD}${pname}${C_RESET}${C_MUTED} — t> plugin install github:${prepo}${C_RESET}"
-  done <<< "$BUILTIN_PLUGIN_SOURCES"
+  # not just on the plugin_run "did you mean" nudge. The list itself comes
+  # from a live GitHub scan (see builtin_plugin_sources), not anything
+  # hardcoded in this script.
+  local builtin_sources line pname prepo any_avail=0
+  if ! builtin_sources="$(builtin_plugin_sources)"; then
+    box_line ""
+    box_line "${C_MUTED}(couldn't check github.com/${BUILTIN_PLUGINS_REPO} for built-ins — offline or rate-limited)${C_RESET}"
+  else
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      read -r pname prepo <<< "$line"
+      [[ -d "$PLUGINS_DIR/$pname" ]] && continue
+      if [[ "$any_avail" -eq 0 ]]; then
+        box_line ""
+        box_line "${C_MUTED}Available (not installed):${C_RESET}"
+        any_avail=1
+      fi
+      box_line "  ${C_BOLD}${pname}${C_RESET}${C_MUTED} — t> plugin install github:${prepo}${C_RESET}"
+    done <<< "$builtin_sources"
+  fi
 
   box_bottom "$C_ACCENT2"
   muted "Run one with: t> plugin run <name>   —   install one with: t> plugin install <path|github:owner/repo>   —   remove one with: t> plugin remove <name>"
