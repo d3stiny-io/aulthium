@@ -1,7 +1,10 @@
 {
-  "name": "better-websearch",
-  "description": "Upgrades WEB_SEARCH for the A.I to learn more real-time information from the internet",
+  "name": "betterwebsearch",
+  "description": "Upgrades WEB_SEARCH: fetches each top result's actual page and extracts real article text instead of DuckDuckGo snippets.",
   "version": "1.0.0",
   "runtime": "python3",
-  "entry": "python3 betterwebsearch.py"
+  "entry": "python3 betterwebsearch.py",
+  "mode": "hook",
+  "hook": "web_search",
+  "toggle_prefix": "bws"
 }

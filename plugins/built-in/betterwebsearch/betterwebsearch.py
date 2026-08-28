@@ -242,18 +242,19 @@ def format_for_ai(results):
 
 
 def main():
-    if len(sys.argv) > 1:
-        query = " ".join(sys.argv[1:])
-    else:
-        try:
-            query = input("better-websearch> search for: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return
+    # This plugin is registered as a "hook" (see plugin.json) — Aulthium
+    # calls it once per web search, passing the query as argv, and stays
+    # in normal chat the whole time ("User>", not a plugin-owned prompt).
+    # It never prompts interactively; run with no query and it just prints
+    # usage and exits, same as any other one-shot CLI tool would.
+    if len(sys.argv) <= 1:
+        sys.stderr.write("usage: betterwebsearch.py <query>\n")
+        sys.exit(1)
+    query = " ".join(sys.argv[1:]).strip()
     if not query:
-        print("no query given.")
-        return
+        sys.stderr.write("usage: betterwebsearch.py <query>\n")
+        sys.exit(1)
 
-    print("Searching for: %s\n" % query)
     try:
         results = better_web_search(query)
     except RuntimeError as e:
