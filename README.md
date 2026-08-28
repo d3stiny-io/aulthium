@@ -1,74 +1,228 @@
 <p align="center">
-  <img src="assets/src/public/icon.png" alt="Aulthium Logo" width="240">
+  <img src="assets/src/public/icon.png" width="180" alt="Aulthium">
 </p>
 
 <h1 align="center">Aulthium</h1>
 
 <p align="center">
-  <strong>Your open-source AI agent for the terminal.</strong>
+  <strong>Your open-source AI agent, built for the terminal.</strong>
 </p>
 
 <p align="center">
-  Code, automate, search, and extend your workflow with plugins.
+  Code • Search • Automate • Extend
 </p>
 
 <p align="center">
   <a href="https://github.com/d3stiny-io/aulthium/stargazers">
-    <img src="https://img.shields.io/github/stars/d3stiny-io/aulthium?style=flat-square" alt="Stars">
+    <img src="https://img.shields.io/github/stars/d3stiny-io/aulthium?style=for-the-badge&logo=github&label=Stars" alt="GitHub Stars">
+  </a>
+  <a href="https://github.com/d3stiny-io/aulthium/network/members">
+    <img src="https://img.shields.io/github/forks/d3stiny-io/aulthium?style=for-the-badge&logo=github&label=Forks" alt="GitHub Forks">
   </a>
   <a href="https://github.com/d3stiny-io/aulthium/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/d3stiny-io/aulthium?style=flat-square" alt="License">
+    <img src="https://img.shields.io/github/license/d3stiny-io/aulthium?style=for-the-badge&label=License" alt="License">
   </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/d3stiny-io/aulthium/issues">
+    <img src="https://img.shields.io/github/issues/d3stiny-io/aulthium?style=for-the-badge&label=Issues" alt="Issues">
+  </a>
+  <a href="https://github.com/d3stiny-io/aulthium/commits/main">
+    <img src="https://img.shields.io/github/last-commit/d3stiny-io/aulthium?style=for-the-badge&label=Updated" alt="Last Commit">
+  </a>
+  <a href="https://github.com/d3stiny-io/aulthium">
+    <img src="https://img.shields.io/github/repo-size/d3stiny-io/aulthium?style=for-the-badge&label=Size" alt="Repository Size">
+  </a>
+</p>
+
+---
+
+<p align="center">
+  <img src="assets/src/public/banner.gif" alt="Aulthium Demo">
+</p>
+
+<p align="center">
+  <em>The terminal is your workspace. Aulthium is your agent.</em>
 </p>
 
 ---
 
 ## ⚡ What is Aulthium?
 
-**Aulthium** is a free and open-source AI agent designed for terminal environments.
+**Aulthium** is a free and open-source AI agent designed to work directly from your terminal.
 
-It can work with your files, execute shell commands, search the web, connect to MCP servers, and extend its capabilities through plugins.
+It can understand your project, work with files, execute commands, search the web, connect to MCP servers, and now **extend itself through plugins**.
 
-Aulthium is designed to be useful on both traditional computers and mobile devices running **Termux**.
+Whether you're on a desktop, a server, or **Termux on Android**, Aulthium gives you an AI agent that stays close to your environment.
 
-> 🛡️ AI proposes. You stay in control.
-
----
-
-## ✨ Features
-
-- 🤖 **AI Agent** — Work with your projects using natural language.
-- 📝 **File Operations** — Read, create, modify, and inspect files.
-- ⚡ **Shell Execution** — Execute commands with your approval.
-- 🔍 **Web Search** — Search for current information and documentation.
-- 🔗 **HTTPS MCP** — Connect to compatible MCP servers.
-- 🧩 **Plugin System** — Extend Aulthium with your own plugins.
-- 🌐 **WebChat** — Use Aulthium through a local browser interface.
-- 🔌 **BYOK** — Bring your own AI provider and API key.
-- 📱 **Termux Support** — Run Aulthium directly on Android.
-- 🆓 **Open Source** — Licensed under GPL-3.0.
+> **AI proposes. You stay in control.**
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Why Aulthium?
 
-Run Aulthium with:
+Most AI coding tools are built around a specific editor, platform, or subscription.
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/aulthium/main/aulthium.sh)
+Aulthium takes a different approach:
+
+```text
+                 ┌──────────────────────┐
+                 │      AULTHIUM        │
+                 │      AI AGENT        │
+                 └──────────┬───────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+    Your Code          Your Terminal        The Web
+        │                   │                   │
+        └───────────────────┼───────────────────┘
+                            │
+                       Your Plugins
 ```
 
-Configure your AI provider and start using the agent.
+Bring your own provider.
+
+Bring your own tools.
+
+Bring your own plugins.
+
+**Make the agent yours.**
 
 ---
 
-## 🧩 Plugins
+# ✨ Features
 
-One of Aulthium's biggest features is its **extensible plugin system**.
+<table>
+<tr>
+<td width="50%">
 
-Plugins allow you to add new functionality without modifying the Aulthium core.
+### 🤖 AI Agent
 
-A plugin is stored inside:
+Work with your projects using natural language.
+
+- Understand code
+- Modify files
+- Debug problems
+- Plan changes
+- Execute tasks
+
+</td>
+<td width="50%">
+
+### 📝 File Operations
+
+Aulthium can work directly with your project files.
+
+- Read files
+- Create files
+- Edit files
+- Inspect directories
+- Refactor code
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+### ⚡ Shell Commands
+
+Run terminal commands through the agent with user approval.
+
+You remain in control of what actually executes.
+
+</td>
+<td>
+
+### 🔍 Web Search
+
+Give the agent access to current information when its existing knowledge isn't enough.
+
+Useful for:
+
+- Documentation
+- APIs
+- Packages
+- Debugging
+- Recent changes
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+### 🧩 Plugin System
+
+Don't wait for a feature to be added to the core.
+
+**Build it yourself.**
+
+Create plugins that add new tools, workflows, integrations, and interfaces.
+
+</td>
+<td>
+
+### 🔗 MCP
+
+Connect Aulthium to compatible **Model Context Protocol** servers over HTTPS.
+
+Extend the agent beyond its built-in capabilities.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+### 🌐 WebChat
+
+Use Aulthium through a local browser-based interface.
+
+Perfect when you want the agent's capabilities without staying inside the terminal UI.
+
+</td>
+<td>
+
+### 📱 Termux
+
+Run your AI agent directly on Android.
+
+No desktop required.
+
+Your phone can be your development environment.
+
+</td>
+</tr>
+</table>
+
+---
+
+# 🧩 Plugins
+
+## Aulthium is extensible.
+
+The new plugin system lets developers create functionality **outside of the Aulthium core**.
+
+That means the community can build features without waiting for every idea to become a core feature.
+
+```text
+Aulthium
+│
+├── Core Agent
+│
+├── Web Search
+│
+├── HTTPS MCP
+│
+└── Plugins
+    ├── Built-in Plugins
+    ├── Community Plugins
+    └── Your Plugins
+```
+
+### 📦 Plugin structure
 
 ```text
 ~/.aulthium/plugins/<plugin-name>/
@@ -76,9 +230,7 @@ A plugin is stored inside:
 └── ...
 ```
 
-A plugin manifest can define information such as its name, description, version, runtime, and entry point.
-
-Example:
+### 🛠️ Example manifest
 
 ```json
 {
@@ -90,9 +242,7 @@ Example:
 }
 ```
 
-### Plugin Commands
-
-Plugins can be managed from inside Aulthium:
+### 🎮 Plugin commands
 
 ```text
 t> plugin list
@@ -101,110 +251,81 @@ t> plugin install /path/to/plugin
 t> plugin run <name>
 ```
 
-### 🛠️ Create Your Own Plugin
+### 💡 What can plugins do?
 
-Anyone can build plugins for Aulthium.
+Your imagination is the limit.
 
-This makes it possible to create:
+Plugins can be used for:
 
-- Custom tools
-- Automation plugins
-- Web interfaces
-- Developer utilities
-- API integrations
-- Personal workflows
-- Experimental features
+- 🔧 Developer tools
+- 🌐 Web interfaces
+- 🤖 Custom AI tools
+- 📡 API integrations
+- ⚙️ Automation
+- 📁 File utilities
+- 🎮 Experiments
+- 🧪 New agent capabilities
 
-Read the plugin development guide:
+Want something that Aulthium doesn't have?
 
-[Build Your Own Plugin](docs/guides/plugin/BUILD_PLUGIN.md)
+**Build a plugin.**
 
-> ⚠️ **Security:** Plugins are trusted programs. They may run with your normal user permissions, so only install plugins you trust.
+📚 **[Read the Plugin Development Guide](docs/guides/plugin/BUILD_PLUGIN.md)**
+
+> ⚠️ Plugins are trusted programs and may run with your normal user permissions. Only install plugins you trust.
 
 ---
 
-## 🌐 WebChat
+# 🌐 WebChat
 
-Aulthium includes a built-in **WebChat plugin**.
+Aulthium ships with a built-in **WebChat plugin**.
 
-WebChat provides a local browser-based interface for interacting with your Aulthium agent.
-
-Run it using:
+Instead of interacting with the agent entirely through the terminal, you can open a local browser interface.
 
 ```text
 t> plugin run webchat
 ```
 
-The WebChat plugin is designed to:
+WebChat is designed to be:
 
-- 🌐 Provide a browser-based chat interface
-- 🔌 Use your configured AI provider
-- 🧠 Use your configured model
-- 📱 Work well on mobile devices
-- 🔒 Run locally
+- 📱 Mobile-friendly
+- 🌐 Browser-based
+- 🔌 Connected to your configured provider
+- 🧠 Connected to your configured model
+- 🔒 Local
 
----
-
-## 🔍 Web Search
-
-Aulthium can search the web when the agent needs current information.
-
-This can be useful for:
-
-- Documentation
-- API references
-- Package information
-- Debugging
-- Recent changes
-- Unfamiliar errors
-
-Instead of relying only on the model's existing knowledge, Aulthium can retrieve information from the web and provide it to the agent.
+**Terminal when you want it.  
+WebChat when you don't.**
 
 ---
 
-## 🔗 MCP Support
+# 🔌 Bring Your Own AI
 
-Aulthium supports **Model Context Protocol (MCP) over HTTPS**.
+Aulthium doesn't force you into one AI provider.
 
-MCP allows Aulthium to connect to external tool servers and use the capabilities they provide.
+Use your own API key and choose the provider and model that works for you.
 
-This can be used to extend the agent beyond its built-in functionality.
+Depending on the current version, providers can include:
 
-> 🧪 MCP support is still evolving.
+| Provider | Type |
+| :--- | :--- |
+| OpenRouter | Multi-model |
+| Google | AI models |
+| Mistral | AI models |
+| Hugging Face | AI models |
+| NVIDIA NIM | AI models |
+| OpenAI-compatible APIs | Custom-compatible |
+| Custom endpoints | Your own backend |
 
----
-
-## 🔌 Bring Your Own Provider
-
-Aulthium is designed around **Bring Your Own Key (BYOK)**.
-
-You can configure your own supported AI provider and model.
-
-Depending on the current version, this may include:
-
-- OpenRouter
-- Google
-- Mistral
-- Hugging Face
-- NVIDIA NIM
-- OpenAI-compatible APIs
-- Custom endpoints
-
-You provide the API key.
-
-You choose the provider.
-
-You choose the model.
+> **Your key. Your provider. Your model.**
 
 ---
 
-## 🛡️ Human-in-the-Loop
+# 🛡️ Human in the Loop
 
-Aulthium doesn't blindly execute everything the AI requests.
+Aulthium is designed so the AI doesn't simply execute everything without you.
 
-Actions such as shell commands can require user approval.
-
-Example:
+For example:
 
 ```text
 ┌─ ❯ SHELL RUN ───────────────────────────────
@@ -215,69 +336,126 @@ Example:
 ? Run this command? [y/N]
 ```
 
-**The AI suggests. You decide.**
+The agent suggests an action.
 
-Always review commands, file modifications, MCP connections, and plugins before approving them.
+**You decide whether it happens.**
+
+Always review commands, file changes, MCP connections, and plugins before approving them.
 
 ---
 
-## 📱 Built for Mobile
+# 🔍 Web-Aware Development
 
-Aulthium can run directly inside **Termux on Android**.
+Software changes quickly.
 
-This makes it possible to have an AI development agent without needing a traditional desktop computer.
+A package that worked yesterday can change tomorrow.
 
-It can also run on:
+Aulthium can search the web when fresh information is needed.
+
+```text
+You
+ │
+ ▼
+Aulthium
+ │
+ ├── Understand request
+ │
+ ├── Search when needed
+ │
+ ├── Read relevant information
+ │
+ └── Continue working
+```
+
+This makes it useful for:
+
+- 📚 Documentation
+- 🔧 Debugging
+- 📦 Package research
+- 🌐 API development
+- 🆕 Recent changes
+
+---
+
+# 📱 Built for the Terminal
+
+Aulthium is designed for environments where a terminal is available.
+
+### Supported environments
 
 - 🐧 Linux
 - 🍎 macOS
-- 📱 Android with Termux
+- 📱 Android through Termux
+
+That means you can have an AI coding agent on a phone without needing a traditional desktop IDE.
 
 ---
 
-## 🧠 AI-Assisted Development
+# 🚀 Quick Start
 
-Aulthium is a **vibe-coded open-source project**.
+Run Aulthium:
 
-LLMs are heavily involved in the implementation, while the project's direction, experimentation, design decisions, testing, and improvements remain human-driven.
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/aulthium/main/aulthium.sh)
+```
 
-The project is continuously evolving, so bugs and experimental features are expected.
+Configure your AI provider and start working.
 
-If you find something that can be improved:
-
-- Open an issue
-- Submit a pull request
-- Build a plugin
-- Improve the documentation
-- Share your ideas
+That's it.
 
 ---
 
-## 📋 Requirements
+# 🧠 Examples
 
-### Core
+Ask Aulthium:
 
-- Bash
-- curl
-- Internet connection
-- API key for your selected AI provider
+```text
+Create a Python API for this project.
+```
 
-### Plugins
+```text
+Find why this program is crashing.
+```
 
-Plugins may have additional requirements depending on their implementation.
+```text
+Read the project structure and explain how it works.
+```
 
-For example, a plugin may require:
+```text
+Search the web for the latest documentation for this API.
+```
 
-- Python
-- Node.js
-- Another runtime
-- Additional packages
+```text
+Create a plugin that adds a custom tool.
+```
+
+```text
+Fix the bugs in this project and explain what you changed.
+```
+
+Aulthium isn't just a chatbot.
+
+**It's an agent that can work with your environment.**
 
 ---
 
-## 🤝 Contributing
+# 🧪 Project Status
 
-Contributions are welcome!
+Aulthium is actively evolving.
+
+Some features are experimental and the project may contain bugs.
+
+The plugin ecosystem, MCP functionality, WebChat, and agent capabilities are continuously being improved.
+
+If something breaks:
+
+**Tell us. Fix it. Build on it.**
+
+---
+
+# 🤝 Contributing
+
+Aulthium is open source, and contributions are welcome.
 
 You can contribute by:
 
@@ -288,24 +466,51 @@ You can contribute by:
 - 🧩 Creating plugins
 - 🔀 Opening pull requests
 
-Not every feature needs to become part of the Aulthium core.
+Not every feature needs to live inside the core.
 
-If you want to experiment with something new, **consider building a plugin.**
+Sometimes the best contribution is simply:
+
+> **Build a plugin.**
 
 ---
 
-## 📄 License
+# 📋 Requirements
+
+### Core
+
+- Bash
+- `curl`
+- Internet connection
+- API key for your selected provider
+
+### Plugins
+
+Individual plugins may require additional runtimes or packages.
+
+For example:
+
+- Python
+- Node.js
+- Other runtimes
+
+---
+
+# 📄 License
 
 Aulthium is licensed under the **GPL-3.0 License**.
 
-See [LICENSE](LICENSE) for the full license.
+See [`LICENSE`](LICENSE) for the full license.
 
 ---
 
+<h2 align="center">⭐ Built with vision. Powered by AI. Improved by humans.</h2>
+
 <p align="center">
-  <strong>Built with vision. Powered by AI. Improved by humans.</strong>
+  If Aulthium is useful to you, consider giving the repository a star.
 </p>
 
 <p align="center">
-  ⭐ If Aulthium is useful to you, consider giving it a star.
+  <a href="https://github.com/d3stiny-io/aulthium">
+    <strong>Explore Aulthium →</strong>
+  </a>
 </p>
