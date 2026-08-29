@@ -100,7 +100,7 @@ def _cfg_int(key, legacy_env, default):
     except (TypeError, ValueError):
         return default
 
-MAX_RATE_LIMIT_RETRIES = _cfg_int("max_rate_limit_retries", "AULTHIUM_MAX_RATE_LIMIT_RETRIES", 6)
+MAX_RATE_LIMIT_RETRIES = _cfg_int("max_rate_limit_retries", "AULTHIUM_MAX_RATE_LIMIT_RETRIES", 9)
 MAX_RATE_LIMIT_WAIT = _cfg_int("max_rate_limit_wait", "AULTHIUM_MAX_RATE_LIMIT_WAIT", 60)
 SHELL_TIMEOUT_SECS = _cfg_int("shell_timeout_secs", "AULTHIUM_SHELL_TIMEOUT_SECS", 60)
 
@@ -220,7 +220,7 @@ def extract_reply(body_text):
     return obj["choices"][0]["message"]["content"]
 
 QUOTA_RE = re.compile(r"per-day|per-month|daily|quota|free-models-per|RESOURCE_EXHAUSTED", re.I)
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+RETRYABLE_STATUS = {401, 429, 500, 502, 503, 504}
 
 def call_with_retry(messages, job):
     attempt = 0
@@ -265,6 +265,9 @@ def call_with_retry(messages, job):
         if attempt >= MAX_RATE_LIMIT_RETRIES:
             if status == 429:
                 return None, "HTTP 429 (rate limited): %s" % (err_msg or body[:300])
+            if status == 401:
+                return None, "HTTP 401 (authentication failed) after %s retries: %s" % (
+                    MAX_RATE_LIMIT_RETRIES, err_msg or body[:300])
             return None, "HTTP %s (server error) after %s retries: %s" % (
                 status, MAX_RATE_LIMIT_RETRIES, err_msg or body[:300])
 
@@ -278,6 +281,7 @@ def call_with_retry(messages, job):
         total_wait = wait_secs + jitter
 
         reason = "Rate limited by %s (HTTP 429)" % PROVIDER_LABEL if status == 429 \
+            else "%s returned HTTP 401 (authentication error)" % PROVIDER_LABEL if status == 401 \
             else "%s returned HTTP %s (server error)" % (PROVIDER_LABEL, status)
         job.set_status(
             "retrying",
