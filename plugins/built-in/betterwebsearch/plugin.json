@@ -7,6 +7,7 @@
   "mode": "hook",
   "hook": "web_search",
   "toggle_prefix": "bws",
+  "autostart": true,
   "permissions": ["network"],
   "config": {
     "num_results": "5",
