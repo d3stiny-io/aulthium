@@ -137,6 +137,19 @@ SKIP_CONFIRMATIONS=0
 # doesn't break plugin discovery.
 PLUGINS_DIR="${AULTHIUM_PLUGINS_DIR:-$HOME/.aulthium/plugins}"
 
+# Where hook-plugin on/off/stopped state survives across restarts (see
+# plugin_hook_state_load/save and plugins_autostart below). Lives next to
+# the plugins themselves so it moves with PLUGINS_DIR if that's overridden.
+PLUGIN_HOOK_STATE_FILE="$PLUGINS_DIR/.hook_state.json"
+
+# Where per-plugin permission grants survive across restarts (see
+# plugin_perms_grant_load/save and plugin_confirm_permissions below). A
+# grant is keyed to a fingerprint of the exact permission set approved, so
+# a plugin whose declared permissions change (a bad-faith update, or just
+# an honest new feature) is re-prompted instead of silently inheriting an
+# old approval.
+PLUGIN_PERMS_FILE="$PLUGINS_DIR/.permissions.json"
+
 # "Built-in" plugins are no longer bundled as source inside this script,
 # and their names are no longer hardcoded here either — they're discovered
 # live by scanning a folder in a GitHub repo Aulthium knows the coordinates
@@ -1398,10 +1411,12 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp refresh [name]" "re-discover tools (one server, or all)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp cloudflare" "quick-pick from Cloudflare's managed MCP servers"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin" "list installed plugins"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run <name>" "launch a plugin (needs y/N confirmation)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run <name>" "launch a plugin (needs a y/N permissions grant)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run --stoprun <n>" "fully stop/de-register a running hook plugin"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin toggle <n> <s>" "turn a running hook plugin on/off without stopping it"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin info <name>" "show a plugin's manifest details"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin info <name>" "show a plugin's manifest, effective config, and integrity"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin config <name>" "view/set/unset a plugin's local config overrides"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin verify <name>" "check installed files against the hash recorded at install"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin install <p>" "install from a folder, github:owner/repo, or a zip URL"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin update [name]" "check (and confirm) GitHub-sourced plugins for updates"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin remove <name>" "delete an installed plugin (needs y/N confirmation)"
@@ -4273,8 +4288,14 @@ web_search_query_plugin_hook() {
   # Same env a foreground plugin_run gets (provider/model/key etc) — a
   # hook plugin is invoked fresh on every call, not left running, so this
   # has to happen (and be cleaned up) around each individual call rather
-  # than once at 't> plugin run' time.
+  # than once at 't> plugin run' time. Secrets gating mirrors plugin_run:
+  # the live API key only goes out if this plugin declared "secrets" in
+  # its permissions (approved back when it was registered via t> plugin run).
+  local _perm_list
+  _perm_list="$(jq -r '.permissions // [] | join(" ")' "$dir/plugin.json" 2>/dev/null)"
+  [[ " $_perm_list " == *" secrets "* ]] && PLUGIN_EXPORT_SECRETS=1 || PLUGIN_EXPORT_SECRETS=0
   plugin_export_env
+  plugin_export_config_env "$name" "$dir"
   output="$(cd "$dir" && eval "$entry" "$(printf '%q' "$query")" 2>/dev/null)"
   status=$?
   unset AULTHIUM_API_KEY AULTHIUM_API_URL AULTHIUM_API_KIND AULTHIUM_PROVIDER \
@@ -4282,6 +4303,8 @@ web_search_query_plugin_hook() {
         AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
         AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
         AULTHIUM_SHELL_TIMEOUT_SECS
+  plugin_unset_config_env
+  PLUGIN_EXPORT_SECRETS=0
 
   if [[ $status -ne 0 || -z "$output" ]]; then
     WEB_SEARCH_LAST_ERROR="hook plugin '$name' failed or returned nothing (exit $status)."
@@ -5836,6 +5859,112 @@ plugins_ensure_dir() {
   mkdir -p "$PLUGINS_DIR" 2>/dev/null
 }
 
+# Persisted on/off/stopped state for hook plugins, so an explicit
+# `t> plugin toggle <n> off` or `t> plugin run --stoprun <n>` sticks across
+# a full restart of Aulthium (not just a Ctrl+C-free session) — see
+# plugins_autostart, which is what actually reads this back on the way up.
+#
+# Echoes "on" / "off" / "stopped" for a known name, or nothing if the
+# state file doesn't exist yet or has never recorded that name (autostart
+# treats "nothing recorded" as "on" — a plugin's first-ever install starts
+# out active by default, same as if the state file didn't exist at all).
+plugin_hook_state_load() {
+  local name="$1"
+  [[ -f "$PLUGIN_HOOK_STATE_FILE" ]] || return 0
+  jq -r --arg n "$name" '.[$n] // empty' "$PLUGIN_HOOK_STATE_FILE" 2>/dev/null
+}
+
+# Records one plugin's on/off/stopped state into PLUGIN_HOOK_STATE_FILE,
+# merging with whatever's already there (read-modify-write via a temp file
+# + mv so a crash mid-write can't truncate it to garbage). Best-effort: a
+# write failure here doesn't fail the caller's toggle/run/stoprun, it just
+# means that particular state change won't survive a restart.
+plugin_hook_state_save() {
+  local name="$1" state="$2" tmp existing
+  plugins_ensure_dir
+  existing="{}"
+  [[ -f "$PLUGIN_HOOK_STATE_FILE" ]] && existing="$(cat "$PLUGIN_HOOK_STATE_FILE" 2>/dev/null)"
+  [[ -z "$existing" ]] && existing="{}"
+  tmp="$(mktemp)" || return 1
+  if printf '%s' "$existing" | jq --arg n "$name" --arg s "$state" '.[$n] = $s' > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$PLUGIN_HOOK_STATE_FILE"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# Called once at startup (from main, after the provider/key are already
+# set up) to bring back every installed hook plugin that opts into
+# "autostart": true in its plugin.json — e.g. better-websearch. Default
+# behavior is "on" every launch, Ctrl+C or not; an explicit prior
+# `t> plugin toggle <n> off` or `t> plugin run --stoprun <n>` is what
+# overrides that (read back via plugin_hook_state_load), not the other
+# way around. Silent on success (status_panel/plugin list show the
+# result); failures (missing runtime, hook collision, bad manifest) print
+# a warning but never block the rest of startup.
+plugins_autostart() {
+  local dir name manifest mode hook toggle_prefix runtime entry autostart state
+
+  for dir in "$PLUGINS_DIR"/*/; do
+    manifest="${dir}plugin.json"
+    [[ -f "$manifest" ]] || continue
+    name="$(basename "$dir")"
+
+    mode="$(jq -r '.mode // "foreground"' "$manifest" 2>/dev/null)"
+    [[ "$mode" == "hook" ]] || continue
+    autostart="$(jq -r '.autostart // false' "$manifest" 2>/dev/null)"
+    [[ "$autostart" == "true" ]] || continue
+
+    state="$(plugin_hook_state_load "$name")"
+    [[ "$state" == "stopped" ]] && continue
+    [[ -z "$state" ]] && state="on"
+
+    hook="$(jq -r '.hook // empty' "$manifest" 2>/dev/null)"
+    entry="$(jq -r '.entry // empty' "$manifest" 2>/dev/null)"
+    runtime="$(jq -r '.runtime // empty' "$manifest" 2>/dev/null)"
+    toggle_prefix="$(jq -r '.toggle_prefix // empty' "$manifest" 2>/dev/null)"
+
+    if [[ -z "$hook" || -z "$entry" ]]; then
+      warn "Autostart: '$name' has an incomplete hook manifest (missing entry/hook) — skipped."
+      continue
+    fi
+    if [[ -n "$runtime" ]] && ! want_cmd "$runtime"; then
+      warn "Autostart: '$name' needs '$runtime', which isn't available — skipped. Run 't> plugin run $name' once that's fixed."
+      continue
+    fi
+
+    case "$hook" in
+      web_search)
+        if [[ -n "$WEB_SEARCH_HOOK_PLUGIN" ]]; then
+          warn "Autostart: '$name' also wants the web_search hook, already taken by '$WEB_SEARCH_HOOK_PLUGIN' — skipped."
+          continue
+        fi
+        WEB_SEARCH_HOOK_PLUGIN="$name"
+        ;;
+      *)
+        warn "Autostart: '$name' declares an unknown hook point '$hook' — skipped."
+        continue
+        ;;
+    esac
+
+    if [[ -n "$toggle_prefix" ]]; then
+      if [[ -n "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]:-}" ]]; then
+        warn "Autostart: toggle prefix '${toggle_prefix}>' already claimed — '$name' will only be toggleable via t> plugin toggle."
+        toggle_prefix=""
+      else
+        TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]="$name"
+      fi
+    fi
+
+    RUNNING_PLUGIN_ENABLED[$name]="$state"
+    RUNNING_PLUGIN_HOOK[$name]="$hook"
+    RUNNING_PLUGIN_ENTRY[$name]="$entry"
+    RUNNING_PLUGIN_DIR[$name]="$dir"
+    RUNNING_PLUGIN_TOGGLE_PREFIX[$name]="$toggle_prefix"
+  done
+}
+
 # Scans $BUILTIN_PLUGINS_PATH inside $BUILTIN_PLUGINS_REPO via GitHub's
 # "contents" API and prints one "name owner/repo/path/to/name" pair per
 # line — the same shape BUILTIN_PLUGIN_SOURCES used to be hardcoded as,
@@ -5905,6 +6034,340 @@ builtin_plugin_repo_for() {
   done <<< "$(builtin_plugin_sources)"
   return 1
 }
+
+# ── Plugin manifest validation, permissions, integrity & config ─────────
+# Everything in this section is shared across every way a plugin reaches
+# disk (t> plugin install <folder|url|github:...>),
+# so a plugin is held to the same bar regardless of where it came from.
+
+# Known permission scopes a plugin.json may declare in its "permissions"
+# array. Purely declarative — Aulthium still does not sandbox a plugin the
+# way it sandboxes the file agent to WORKSPACE_DIR — but declaring them
+# lets plugin_confirm_permissions show a specific, honest picture of what
+# a plugin says it needs, instead of the old one-size-fits-all warning.
+KNOWN_PLUGIN_PERMISSIONS="network filesystem shell mcp secrets"
+
+plugin_permission_label() {
+  case "$1" in
+    network)    printf 'Network access — can make its own HTTP requests (beyond the AI API call itself).' ;;
+    filesystem) printf 'Filesystem access — can read/write files outside the sandboxed workspace.' ;;
+    shell)      printf 'Shell access — can run arbitrary commands on this machine.' ;;
+    mcp)        printf 'MCP access — can call your connected MCP servers/tools.' ;;
+    secrets)    printf 'Secrets access — receives your live API key for the active provider.' ;;
+    *)          printf 'Unrecognized permission scope (not known to this version of Aulthium).' ;;
+  esac
+}
+
+# Structural validation shared by every install path — catches the stuff
+# that would otherwise fail confusingly deep inside plugin_run/plugin_export_env:
+# invalid JSON, a missing/unsafe name, a mode/hook combo that doesn't make
+# sense, and permission strings outside the known set (warned, not
+# blocked — a future Aulthium version may know scopes this one doesn't).
+# Prints its own err/warn messages; returns non-zero on anything serious
+# enough to block an install.
+plugin_manifest_validate() {
+  local manifest="$1" name entry mode hook perms p unknown=""
+  if [[ ! -f "$manifest" ]]; then
+    err "No plugin.json at $manifest"
+    return 1
+  fi
+  if ! jq empty "$manifest" 2>/dev/null; then
+    err "plugin.json isn't valid JSON."
+    return 1
+  fi
+  name="$(jq -r '.name // empty' "$manifest" 2>/dev/null)"
+  if [[ -z "$name" ]]; then
+    err "plugin.json is missing a \"name\" field."
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    err "Plugin name must contain only letters, numbers, - or _: got '$name'."
+    return 1
+  fi
+  mode="$(jq -r '.mode // "foreground"' "$manifest" 2>/dev/null)"
+  if [[ "$mode" != "foreground" && "$mode" != "hook" ]]; then
+    err "plugin.json \"mode\" must be \"foreground\" or \"hook\" (got '$mode')."
+    return 1
+  fi
+  entry="$(jq -r '.entry // empty' "$manifest" 2>/dev/null)"
+  if [[ -z "$entry" ]]; then
+    warn "plugin.json has no \"entry\" command — it won't be runnable until one is added."
+  fi
+  if [[ "$mode" == "hook" ]]; then
+    hook="$(jq -r '.hook // empty' "$manifest" 2>/dev/null)"
+    if [[ -z "$hook" ]]; then
+      err "\"mode\": \"hook\" needs a \"hook\" field naming the hook point (e.g. \"web_search\")."
+      return 1
+    fi
+  fi
+  perms="$(jq -r '.permissions[]? // empty' "$manifest" 2>/dev/null)"
+  if [[ -n "$perms" ]]; then
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      [[ " $KNOWN_PLUGIN_PERMISSIONS " == *" $p "* ]] || unknown="$unknown $p"
+    done <<< "$perms"
+    if [[ -n "$unknown" ]]; then
+      warn "plugin.json declares unrecognized permission(s):$unknown — shown to the user as-is, but this version of Aulthium has no built-in description for them."
+    fi
+  fi
+  return 0
+}
+
+# A stable fingerprint of exactly what a manifest's "permissions" array
+# currently says (order-independent), used to decide whether a prior grant
+# still covers what's being installed/run now.
+# Informational-only permissions display shown right after a fresh
+# install — NOT a grant, doesn't touch PLUGIN_PERMS_FILE, and asks
+# nothing. The actual grant gate is plugin_confirm_permissions, which
+# always runs at 't> plugin run' time regardless of what happened here;
+# this just means nobody is surprised by that prompt later.
+plugin_install_show_permissions() {
+  local manifest="$1" perms p
+  perms="$(jq -r '.permissions[]? // empty' "$manifest" 2>/dev/null)"
+  [[ -n "$perms" ]] || return 0
+  muted "This plugin declares permissions (confirmed again on first run):"
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    muted "  - $p — $(plugin_permission_label "$p")"
+  done <<< "$perms"
+}
+
+plugin_perms_fingerprint() {
+  jq -r '.permissions // [] | sort | join(",")' "$1" 2>/dev/null | sha256sum 2>/dev/null | awk '{print $1}'
+}
+
+plugin_perms_grant_load() {
+  local name="$1"
+  [[ -f "$PLUGIN_PERMS_FILE" ]] || return 0
+  jq -r --arg n "$name" '.[$n] // empty' "$PLUGIN_PERMS_FILE" 2>/dev/null
+}
+
+# Read-modify-write via temp file + mv, same crash-safe shape as
+# plugin_hook_state_save above.
+plugin_perms_grant_save() {
+  local name="$1" fp="$2" tmp existing
+  plugins_ensure_dir
+  existing="{}"
+  [[ -f "$PLUGIN_PERMS_FILE" ]] && existing="$(cat "$PLUGIN_PERMS_FILE" 2>/dev/null)"
+  [[ -z "$existing" ]] && existing="{}"
+  tmp="$(mktemp)" || return 1
+  if printf '%s' "$existing" | jq --arg n "$name" --arg f "$fp" '.[$n] = $f' > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$PLUGIN_PERMS_FILE"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# Shows exactly what a plugin's manifest declares it needs and gets an
+# explicit y/N via confirm_yes_no — deliberately NEVER confirm_action, so
+# 't> confirm off' (scoped to agent-proposed file/shell/MCP actions — see
+# confirm_action above) can never silently wave a plugin's permission
+# grant through. Skips re-asking only when the exact same permission set
+# (by fingerprint) was already approved for this plugin name before;
+# anything that changes the set — a reinstall with a different
+# "permissions" array, an update, a plugin.json hand-edit — asks again.
+plugin_confirm_permissions() {
+  local name="$1" manifest="$2" perms fp prior p
+  perms="$(jq -r '.permissions[]? // empty' "$manifest" 2>/dev/null)"
+  fp="$(plugin_perms_fingerprint "$manifest")"
+  prior="$(plugin_perms_grant_load "$name")"
+
+  box_top "PLUGIN PERMISSIONS: $name" "$ICON_WARN" "$C_WARN"
+  if [[ -z "$perms" ]]; then
+    box_line "${C_MUTED}This plugin declares no permissions in its plugin.json.${C_RESET}"
+    box_line "${C_MUTED}It is still an ordinary external program — Aulthium does not sandbox it.${C_RESET}"
+  else
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      box_line "${C_BOLD}${p}${C_RESET}${C_MUTED} — $(plugin_permission_label "$p")${C_RESET}"
+    done <<< "$perms"
+  fi
+  box_bottom "$C_WARN"
+
+  if [[ -n "$prior" && "$prior" == "$fp" ]]; then
+    muted "Permissions unchanged since you last approved '$name' — not asking again."
+    return 0
+  fi
+  if [[ -n "$prior" ]]; then
+    warn "'$name' requested permissions changed since you last approved it — re-confirming."
+  fi
+
+  if confirm_yes_no "Grant '$name' the permissions above and run it?"; then
+    plugin_perms_grant_save "$name" "$fp"
+    return 0
+  fi
+  return 1
+}
+
+# Deterministic content hash of everything in a plugin's install directory
+# except plugin.json itself (where the hash gets stored — hashing it would
+# be circular) and config.json (a user's local overrides, not part of
+# what was actually "installed"). Stamped at install/create time via
+# plugin_stamp_integrity, and re-checked by plugin_verify / plugin_run to
+# detect drift — files changing on disk after install, whether from a
+# manual edit, a bug, or tampering.
+plugin_tree_checksum() {
+  local dir="$1"
+  find "$dir" -type f ! -name 'plugin.json' ! -name 'config.json' -print0 2>/dev/null \
+    | sort -z \
+    | xargs -0 sha256sum 2>/dev/null \
+    | sha256sum 2>/dev/null \
+    | awk '{print $1}'
+}
+
+# Stamps a freshly (re)computed _integrity.sha256 + _integrity.at (UTC
+# timestamp) into a plugin's manifest. Called right after every install
+# (local folder, zip URL, GitHub), so every plugin on disk carries a hash
+# of what was actually delivered.
+plugin_stamp_integrity() {
+  local dest="$1" manifest="$dest/plugin.json" hash stamped
+  [[ -f "$manifest" ]] || return 1
+  hash="$(plugin_tree_checksum "$dest")"
+  stamped="$(jq --arg h "$hash" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+    '._integrity = {"sha256": $h, "at": $t}' "$manifest" 2>/dev/null)"
+  if [[ -n "$stamped" ]]; then
+    printf '%s\n' "$stamped" > "$manifest"
+  fi
+}
+
+# `t> plugin verify <name>` — recomputes the hash and compares it to what
+# was recorded at install/create time. Strictly read-only: never
+# reinstalls, repairs, or re-stamps anything on a mismatch — that only
+# happens via a fresh t> plugin install/update, so the hash always means
+# "matches what was deliberately installed", never "matches whatever's
+# there now".
+plugin_verify() {
+  local name="$1" dir manifest stored current
+  if [[ -z "$name" ]]; then
+    warn "Usage: t> plugin verify <name>"
+    return 1
+  fi
+  dir="$PLUGINS_DIR/$name"
+  manifest="$dir/plugin.json"
+  if [[ ! -f "$manifest" ]]; then
+    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    return 1
+  fi
+  stored="$(jq -r '._integrity.sha256 // empty' "$manifest" 2>/dev/null)"
+  if [[ -z "$stored" ]]; then
+    warn "'$name' has no recorded integrity hash (installed before this feature existed) — nothing to verify against."
+    muted "Reinstall it to get one: t> plugin install <same source>"
+    return 1
+  fi
+  current="$(plugin_tree_checksum "$dir")"
+  if [[ "$current" == "$stored" ]]; then
+    ok "'$name' matches its recorded hash — files are unchanged since $(jq -r '._integrity.at // "install"' "$manifest" 2>/dev/null)."
+  else
+    err "'$name' does NOT match its recorded hash — files changed since $(jq -r '._integrity.at // "install"' "$manifest" 2>/dev/null)."
+    muted "recorded: $stored"
+    muted "current:  $current"
+  fi
+}
+
+# `t> plugin config <name>` family — per-plugin customization. A plugin
+# author declares defaults in plugin.json's "config" object; a user's own
+# overrides live separately in <plugin-dir>/config.json so they survive
+# `t> plugin update`/reinstall untouched. plugin_config_effective is the
+# single source of truth both the CLI and plugin_export_config_env (what a
+# running plugin actually receives) read from — defaults overlaid with
+# overrides, overrides always winning.
+plugin_config_effective() {
+  local dir="$1" defaults overrides
+  defaults="$(jq -c '.config // {}' "$dir/plugin.json" 2>/dev/null)"
+  [[ -n "$defaults" ]] || defaults="{}"
+  overrides="{}"
+  [[ -f "$dir/config.json" ]] && overrides="$(cat "$dir/config.json" 2>/dev/null)"
+  [[ -n "$overrides" ]] || overrides="{}"
+  jq -c -n --argjson d "$defaults" --argjson o "$overrides" '$d * $o' 2>/dev/null
+}
+
+plugin_config() {
+  local name="$1"; shift || true
+  local dir manifest sub
+  if [[ -z "$name" ]]; then
+    warn "Usage: t> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
+    return 1
+  fi
+  dir="$PLUGINS_DIR/$name"
+  manifest="$dir/plugin.json"
+  if [[ ! -f "$manifest" ]]; then
+    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    return 1
+  fi
+
+  sub="${1:-list}"; shift || true
+  case "$sub" in
+    list)
+      box_top "PLUGIN CONFIG: $name" "$ICON_PLUGIN" "$C_ACCENT2"
+      local eff line
+      eff="$(plugin_config_effective "$dir")"
+      if [[ -z "$eff" || "$eff" == "{}" ]]; then
+        box_line "${C_MUTED}(no config keys declared or set)${C_RESET}"
+      else
+        while IFS= read -r line; do
+          box_line "$line"
+        done < <(printf '%s' "$eff" | jq -r 'to_entries[] | "\(.key) = \(.value)"' 2>/dev/null)
+      fi
+      box_bottom "$C_ACCENT2"
+      muted "Set with: t> plugin config $name set <key> <value>   —   clear an override with: t> plugin config $name unset <key>"
+      ;;
+    get)
+      local key="$1"
+      if [[ -z "$key" ]]; then
+        warn "Usage: t> plugin config $name get <key>"
+        return 1
+      fi
+      printf '%s' "$(plugin_config_effective "$dir")" | jq -r --arg k "$key" '.[$k] // "(unset)"' 2>/dev/null
+      ;;
+    set)
+      local key="$1" val="$2" tmp existing
+      if [[ -z "$key" || -z "$val" ]]; then
+        warn "Usage: t> plugin config $name set <key> <value>"
+        return 1
+      fi
+      existing="{}"
+      [[ -f "$dir/config.json" ]] && existing="$(cat "$dir/config.json" 2>/dev/null)"
+      [[ -z "$existing" ]] && existing="{}"
+      tmp="$(mktemp)" || return 1
+      if printf '%s' "$existing" | jq --arg k "$key" --arg v "$val" '.[$k] = $v' > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$dir/config.json"
+        ok "Set '$key' = '$val' for '$name' (local override — untouched by t> plugin update/reinstall)."
+      else
+        rm -f "$tmp"
+        err "Couldn't write config.json for '$name'."
+        return 1
+      fi
+      ;;
+    unset)
+      local key="$1" tmp existing
+      if [[ -z "$key" ]]; then
+        warn "Usage: t> plugin config $name unset <key>"
+        return 1
+      fi
+      if [[ ! -f "$dir/config.json" ]]; then
+        warn "'$name' has no local config overrides to unset."
+        return 0
+      fi
+      existing="$(cat "$dir/config.json" 2>/dev/null)"
+      [[ -z "$existing" ]] && existing="{}"
+      tmp="$(mktemp)" || return 1
+      if printf '%s' "$existing" | jq --arg k "$key" 'del(.[$k])' > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$dir/config.json"
+        ok "Unset local override for '$key' — '$name' falls back to its plugin.json default (if any)."
+      else
+        rm -f "$tmp"
+        err "Couldn't update config.json for '$name'."
+        return 1
+      fi
+      ;;
+    *)
+      warn "Usage: t> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
+      return 1
+      ;;
+  esac
+}
+
 
 # Queries GitHub's REST API for a repo's latest release. On success, prints
 # two lines: the tag name, then the download URL of its best zip asset (a
@@ -5997,17 +6460,12 @@ plugin_install_from_url() {
   fi
   src_dir="$(dirname -- "$manifest_path")"
 
+  if ! plugin_manifest_validate "$manifest_path"; then
+    err "Refusing to install — plugin.json failed validation (see above)."
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
   name="$(jq -r '.name // empty' "$manifest_path" 2>/dev/null)"
-  if [[ -z "$name" ]]; then
-    err "plugin.json is missing a \"name\" field."
-    rm -rf -- "$tmp_dir"
-    return 1
-  fi
-  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-    err "Plugin name must contain only letters, numbers, - or _: got '$name'."
-    rm -rf -- "$tmp_dir"
-    return 1
-  fi
 
   plugins_ensure_dir
   dest="$PLUGINS_DIR/$name"
@@ -6043,7 +6501,9 @@ plugin_install_from_url() {
     fi
   fi
 
+  plugin_stamp_integrity "$dest"
   ok "Installed plugin '$name' (v$(jq -r '.version // "?"' "$dest/plugin.json" 2>/dev/null)) → $dest"
+  plugin_install_show_permissions "$dest/plugin.json"
   muted "Run it with: t> plugin run $name"
   rm -rf -- "$tmp_dir"
   return 0
@@ -6238,8 +6698,11 @@ plugin_list() {
     desc="$(jq -r '.description // "(no description)"' "${dir}plugin.json" 2>/dev/null)"
     entry="$(jq -r '.entry // "?"' "${dir}plugin.json" 2>/dev/null)"
     repo="$(jq -r '._source.repo // empty' "${dir}plugin.json" 2>/dev/null)"
+    local perms
+    perms="$(jq -r '.permissions // [] | join(", ")' "${dir}plugin.json" 2>/dev/null)"
     box_line "${C_BOLD}${name}${C_RESET}${C_MUTED} — ${desc}${C_RESET}"
     box_line "  ${C_MUTED}entry: ${entry}${C_RESET}"
+    [[ -n "$perms" ]] && box_line "  ${C_MUTED}permissions: ${perms}${C_RESET}"
     [[ -n "$repo" ]] && box_line "  ${C_MUTED}source: github.com/${repo}${C_RESET}"
   done
   if [[ "$found" -eq 0 ]]; then
@@ -6293,6 +6756,7 @@ plugin_list() {
 
   box_bottom "$C_ACCENT2"
   muted "Run one with: t> plugin run <name>   —   install one with: t> plugin install <path|github:owner/repo>   —   remove one with: t> plugin remove <name>"
+  muted "Scaffold a new one with the standalone aulthium-plugin-create.sh   —   tune one with: t> plugin config <name>   —   check it with: t> plugin verify <name>"
   muted "Plugins live in: $PLUGINS_DIR"
 }
 
@@ -6310,7 +6774,26 @@ plugin_info() {
   box_top "PLUGIN: $name" "$ICON_PLUGIN" "$C_ACCENT2"
   while IFS= read -r line; do
     box_line "$line"
-  done < <(jq -r 'to_entries[] | "\(.key): \(.value)"' "$manifest" 2>/dev/null)
+  done < <(jq -r 'to_entries[] | select(.key != "_integrity") | "\(.key): \(.value)"' "$manifest" 2>/dev/null)
+
+  local eff stored current dir
+  dir="$PLUGINS_DIR/$name"
+  eff="$(plugin_config_effective "$dir")"
+  if [[ -n "$eff" && "$eff" != "{}" ]]; then
+    box_line "effective config: $eff"
+  fi
+
+  stored="$(jq -r '._integrity.sha256 // empty' "$manifest" 2>/dev/null)"
+  if [[ -n "$stored" ]]; then
+    current="$(plugin_tree_checksum "$dir")"
+    if [[ "$current" == "$stored" ]]; then
+      box_line "${C_OK}integrity: OK${C_RESET} ${C_MUTED}(matches hash recorded $(jq -r '._integrity.at // "?"' "$manifest" 2>/dev/null))${C_RESET}"
+    else
+      box_line "${C_ERR}integrity: MISMATCH${C_RESET} ${C_MUTED}(files changed since $(jq -r '._integrity.at // "?"' "$manifest" 2>/dev/null) — run t> plugin verify $name)${C_RESET}"
+    fi
+  else
+    box_line "${C_MUTED}integrity: no hash recorded${C_RESET}"
+  fi
   box_bottom "$C_ACCENT2"
 }
 
@@ -6343,43 +6826,94 @@ plugin_export_env() {
   # schedule as the terminal's does, instead of guessing/hardcoding it.
   export AULTHIUM_SHELL_TIMEOUT_SECS="$SHELL_TIMEOUT_SECS"
 
+  # Sensitive: AULTHIUM_API_KEY is only worth exporting to a plugin that
+  # actually declared "secrets" in its permissions (and was granted it via
+  # plugin_confirm_permissions) — see the switch below, which now checks
+  # PLUGIN_EXPORT_SECRETS before ever setting AULTHIUM_API_KEY.
+  local _key=""
   case "$PROVIDER" in
     google)
       export AULTHIUM_API_KIND="google"
       export AULTHIUM_API_URL="$GOOGLE_API_BASE"
-      export AULTHIUM_API_KEY="$GOOGLE_KEY"
+      _key="$GOOGLE_KEY"
       ;;
     openrouter)
       export AULTHIUM_API_KIND="openai"
       export AULTHIUM_API_URL="$OPENROUTER_URL"
-      export AULTHIUM_API_KEY="$OPENROUTER_KEY"
+      _key="$OPENROUTER_KEY"
       ;;
     mistral)
       export AULTHIUM_API_KIND="openai"
       export AULTHIUM_API_URL="$MISTRAL_URL"
-      export AULTHIUM_API_KEY="$MISTRAL_KEY"
+      _key="$MISTRAL_KEY"
       ;;
     huggingface)
       export AULTHIUM_API_KIND="openai"
       export AULTHIUM_API_URL="$HF_URL"
-      export AULTHIUM_API_KEY="$HF_KEY"
+      _key="$HF_KEY"
       ;;
     nvidia_nim)
       export AULTHIUM_API_KIND="openai"
       export AULTHIUM_API_URL="$NVIDIA_URL"
-      export AULTHIUM_API_KEY="$NVIDIA_KEY"
+      _key="$NVIDIA_KEY"
       ;;
     custom)
       export AULTHIUM_API_KIND="openai"
       export AULTHIUM_API_URL="$CUSTOM_URL"
-      export AULTHIUM_API_KEY="$CUSTOM_KEY"
+      _key="$CUSTOM_KEY"
       ;;
     *)
       export AULTHIUM_API_KIND=""
       export AULTHIUM_API_URL=""
-      export AULTHIUM_API_KEY=""
       ;;
   esac
+  # Only ever hand the live API key to a plugin that declared "secrets" in
+  # its plugin.json permissions AND was granted it via
+  # plugin_confirm_permissions (see PLUGIN_EXPORT_SECRETS, set by
+  # plugin_run right before this is called). A plugin that didn't ask for
+  # "secrets" gets AULTHIUM_API_KEY="" — it can still see which provider/
+  # model is active (AULTHIUM_PROVIDER/AULTHIUM_MODEL), it just can't talk
+  # to the API on your behalf unless it said up front that it would.
+  if [[ "${PLUGIN_EXPORT_SECRETS:-0}" -eq 1 ]]; then
+    export AULTHIUM_API_KEY="$_key"
+  else
+    export AULTHIUM_API_KEY=""
+  fi
+}
+
+# Exports a running plugin's effective config (plugin.json defaults
+# overlaid with any local config.json overrides — see
+# plugin_config_effective above) so a plugin can read its own settings
+# without reinventing config-file parsing itself:
+#   AULTHIUM_PLUGIN_NAME          the plugin's own name
+#   AULTHIUM_PLUGIN_CONFIG_JSON   the whole effective config, as compact JSON
+#   AULTHIUM_PLUGIN_CFG_<KEY>     one var per top-level scalar config key,
+#                                  upper-cased with non-alnum chars -> "_"
+# PLUGIN_LAST_CFG_VARS remembers exactly which var names were exported so
+# plugin_unset_config_env can clean up precisely, however many/few config
+# keys a given plugin happens to declare.
+PLUGIN_LAST_CFG_VARS=()
+plugin_export_config_env() {
+  local name="$1" dir="$2" eff key val varname
+  eff="$(plugin_config_effective "$dir")"
+  [[ -n "$eff" ]] || eff="{}"
+  export AULTHIUM_PLUGIN_CONFIG_JSON="$eff"
+  export AULTHIUM_PLUGIN_NAME="$name"
+  PLUGIN_LAST_CFG_VARS=(AULTHIUM_PLUGIN_CONFIG_JSON AULTHIUM_PLUGIN_NAME)
+  while IFS=$'\t' read -r key val; do
+    [[ -z "$key" ]] && continue
+    varname="AULTHIUM_PLUGIN_CFG_$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+    export "$varname=$val"
+    PLUGIN_LAST_CFG_VARS+=("$varname")
+  done < <(printf '%s' "$eff" | jq -r 'to_entries[] | select(.value | (type == "string") or (type == "number") or (type == "boolean")) | "\(.key)\t\(.value)"' 2>/dev/null)
+}
+
+plugin_unset_config_env() {
+  local v
+  for v in "${PLUGIN_LAST_CFG_VARS[@]:-}"; do
+    [[ -n "$v" ]] && unset "$v"
+  done
+  PLUGIN_LAST_CFG_VARS=()
 }
 
 # `t> plugin run --stoprun <name>` — the counterpart to registering a hook
@@ -6407,6 +6941,7 @@ plugin_stoprun() {
   unset "RUNNING_PLUGIN_ENABLED[$name]" "RUNNING_PLUGIN_HOOK[$name]" \
         "RUNNING_PLUGIN_ENTRY[$name]" "RUNNING_PLUGIN_DIR[$name]" \
         "RUNNING_PLUGIN_TOGGLE_PREFIX[$name]"
+  plugin_hook_state_save "$name" "stopped"
 
   ok "Stopped '$name' — it's fully de-registered now (run it again with t> plugin run $name)."
 }
@@ -6434,6 +6969,7 @@ plugin_toggle() {
   fi
 
   RUNNING_PLUGIN_ENABLED[$name]="$state"
+  plugin_hook_state_save "$name" "$state"
   if [[ "$state" == "on" ]]; then
     ok "'$name' is now active."
   else
@@ -6499,12 +7035,31 @@ plugin_run() {
   box_line "${C_MUTED}dir:${C_RESET}   $dir"
   [[ "$mode" == "hook" ]] && box_line "${C_MUTED}mode:${C_RESET}  hook (${hook:-?}) — stays in chat, no separate prompt"
   box_bottom "$C_ACCENT2"
-  warn "Plugins are ordinary external programs — Aulthium does not sandbox them like the file agent."
-  warn "This one will receive your active provider, model, and API key as environment variables."
 
-  if ! confirm_action "Run plugin '$name'?"; then
+  # Integrity drift check — non-blocking (a plugin author edits their own
+  # files all the time), but surfaced loudly right before the trust
+  # decision below rather than left to be discovered later.
+  local _stored_hash _current_hash
+  _stored_hash="$(jq -r '._integrity.sha256 // empty' "$manifest" 2>/dev/null)"
+  if [[ -n "$_stored_hash" ]]; then
+    _current_hash="$(plugin_tree_checksum "$dir")"
+    if [[ "$_current_hash" != "$_stored_hash" ]]; then
+      warn "'$name' files have changed since they were installed/verified (on-disk hash no longer matches plugin.json's _integrity.sha256)."
+      warn "Run 't> plugin verify $name' for details before trusting this run."
+    fi
+  fi
+
+  warn "Plugins are ordinary external programs — Aulthium does not sandbox them like the file agent."
+  if ! plugin_confirm_permissions "$name" "$manifest"; then
     warn "Cancelled."
     return 1
+  fi
+  local _perm_list
+  _perm_list="$(jq -r '.permissions // [] | join(" ")' "$manifest" 2>/dev/null)"
+  if [[ " $_perm_list " == *" secrets "* ]]; then
+    PLUGIN_EXPORT_SECRETS=1
+  else
+    PLUGIN_EXPORT_SECRETS=0
   fi
 
   # Hook plugins (mode:"hook" in their manifest, e.g. better-websearch)
@@ -6545,6 +7100,7 @@ plugin_run() {
     RUNNING_PLUGIN_ENTRY[$name]="$entry"
     RUNNING_PLUGIN_DIR[$name]="$dir"
     RUNNING_PLUGIN_TOGGLE_PREFIX[$name]="$toggle_prefix"
+    plugin_hook_state_save "$name" "on"
 
     ok "'$name' is active — it'll now handle $hook automatically. Keep chatting at User>."
     if [[ -n "$toggle_prefix" ]]; then
@@ -6556,6 +7112,7 @@ plugin_run() {
   fi
 
   plugin_export_env
+  plugin_export_config_env "$name" "$dir"
   say "Starting '$name' — press Ctrl+C to stop it and return to chat."
   # Ctrl+C while the plugin is in the foreground delivers SIGINT to this
   # whole process group — including US, not just the plugin's child
@@ -6581,6 +7138,8 @@ plugin_run() {
         AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
         AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
         AULTHIUM_SHELL_TIMEOUT_SECS
+  plugin_unset_config_env
+  PLUGIN_EXPORT_SECRETS=0
 
   if [[ $status -ne 0 ]]; then
     warn "Plugin '$name' exited with status $status."
@@ -6612,15 +7171,11 @@ plugin_install() {
     err "No plugin.json found in $src — see BUILD_PLUGIN.md for the manifest format."
     return 1
   fi
+  if ! plugin_manifest_validate "$src/plugin.json"; then
+    err "Refusing to install — plugin.json failed validation (see above)."
+    return 1
+  fi
   name="$(jq -r '.name // empty' "$src/plugin.json" 2>/dev/null)"
-  if [[ -z "$name" ]]; then
-    err "plugin.json is missing a \"name\" field."
-    return 1
-  fi
-  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-    err "Plugin name must contain only letters, numbers, - or _: got '$name'."
-    return 1
-  fi
   plugins_ensure_dir
   dest="$PLUGINS_DIR/$name"
   if [[ -d "$dest" ]]; then
@@ -6631,7 +7186,9 @@ plugin_install() {
     rm -rf -- "$dest"
   fi
   if cp -R "$src" "$dest" 2>/dev/null; then
+    plugin_stamp_integrity "$dest"
     ok "Installed plugin '$name' → $dest"
+    plugin_install_show_permissions "$dest/plugin.json"
     muted "Run it with: t> plugin run $name"
   else
     err "Failed to copy plugin into $dest"
@@ -7343,6 +7900,24 @@ command_router() {
         plugin_install "$rest"
       fi
       ;;
+    plugin\ verify\ *)
+      rest="${cmd#plugin verify }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> plugin verify <name>"
+      else
+        plugin_verify "$rest"
+      fi
+      ;;
+    plugin\ config\ *)
+      rest="${cmd#plugin config }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      if [[ -z "$rest" ]]; then
+        warn "Usage: t> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
+      else
+        plugin_config $rest
+      fi
+      ;;
     plugin\ update)
       plugin_update
       ;;
@@ -7375,7 +7950,7 @@ command_router() {
       fi
       ;;
     plugin\ *)
-      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name] | remove <name> | toggle <name> <on|off> | run --stoprun <name>]"
+      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name] | remove <name> | toggle <name> <on|off> | config <name> ... | verify <name> | run --stoprun <name>]"
       ;;
     update)
       autoupdate_status_cmd
@@ -7482,6 +8057,7 @@ main() {
 
   mcp_bootstrap_from_env
   plugins_ensure_dir
+  plugins_autostart
 
   init_history
 

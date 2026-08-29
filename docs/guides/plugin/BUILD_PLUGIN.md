@@ -25,22 +25,90 @@ the marker-based protocol the in-chat file/shell agent uses.
   "description": "One short sentence describing what it does",
   "version": "1.0.0",
   "entry": "python3 myplugin.py",
-  "runtime": "python3"
+  "runtime": "python3",
+  "mode": "foreground",
+  "permissions": ["network"],
+  "config": { "timeout": "30" }
 }
 ```
 
-| field         | required | meaning                                                                 |
-|---------------|----------|--------------------------------------------------------------------------|
-| `name`        | yes      | must match the folder name; letters/numbers/`-`/`_` only                |
-| `description` | yes      | shown in `t> plugin list` and `t> plugin info`                          |
-| `entry`       | yes      | the shell command Aulthium runs, from inside your plugin's own folder   |
-| `runtime`     | no       | a command Aulthium checks exists before running `entry` (e.g. `python3`, `node`); skip this if `entry` needs nothing special |
-| `version`     | no       | free-form string, informational only                                    |
+| field           | required | meaning                                                                 |
+|-----------------|----------|--------------------------------------------------------------------------|
+| `name`          | yes      | must match the folder name; letters/numbers/`-`/`_` only                |
+| `description`   | yes      | shown in `t> plugin list` and `t> plugin info`                          |
+| `entry`         | yes*     | the shell command Aulthium runs, from inside your plugin's own folder (*not required to install, but the plugin can't be run without one) |
+| `runtime`       | no       | a command Aulthium checks exists before running `entry` (e.g. `python3`, `node`); skip this if `entry` needs nothing special |
+| `version`       | no       | free-form string, informational only                                    |
+| `mode`          | no       | `"foreground"` (default) or `"hook"` — see [Foreground vs. hook plugins](#foreground-vs-hook-plugins) |
+| `hook`          | if `mode` is `hook` | which hook point to register at — currently only `"web_search"` is supported |
+| `toggle_prefix` | no       | hook mode only — lets `<prefix>> on`/`<prefix>> off` toggle it from the normal chat prompt |
+| `autostart`     | no       | hook mode only — `true` to launch it automatically every time Aulthium starts |
+| `permissions`   | no       | array of scopes this plugin needs — see [Permissions](#permissions) |
+| `config`        | no       | object of default config keys/values — see [Config defaults and overrides](#config-defaults-and-overrides) |
 
 `entry` can be anything runnable from a shell: `python3 webchat.py`,
 `node server.js`, `./run.sh`, a compiled binary, etc. Aulthium runs it with
 `eval`, `cd`'d into your plugin's folder, so relative paths inside your
 entry command work as expected.
+
+## Foreground vs. hook plugins
+
+Most plugins are **foreground**: `t> plugin run <name>` takes over the
+terminal until the program exits (or you Ctrl+C out of it), then control
+returns to the normal chat prompt. This is the default if `mode` is
+omitted.
+
+A **hook** plugin (`"mode": "hook"`) is different: `t> plugin run <name>`
+doesn't take over anything — it just registers the plugin against a named
+hook point (declared in `"hook"`, e.g. `"web_search"`) and hands control
+straight back to the `User>` prompt. From then on, Aulthium calls the
+plugin automatically whenever that hook point fires, on-demand, per call —
+it never runs continuously as a background process.
+
+If you set a `toggle_prefix` (e.g. `"bws"`), the user can flip the plugin
+on/off from the ordinary chat prompt with `bws> on` / `bws> off`, without
+touching `t> plugin toggle`. Setting `"autostart": true` makes it register
+itself again automatically on every future launch, until explicitly
+stopped with `t> plugin run --stoprun <name>`.
+
+## Permissions
+
+Aulthium doesn't sandbox a plugin — declaring permissions is purely
+informational, so the person running your plugin knows what it's asking
+for before they grant it. The known scopes:
+
+| scope        | meaning                                                                 |
+|--------------|--------------------------------------------------------------------------|
+| `network`    | makes its own HTTP requests, beyond the AI API call itself             |
+| `filesystem` | reads/writes files outside the sandboxed workspace                     |
+| `shell`      | runs arbitrary commands on the machine                                 |
+| `mcp`        | calls the user's connected MCP servers/tools                           |
+| `secrets`    | receives the live API key for the active provider                      |
+
+Every `t> plugin run <name>` shows the declared permission set and asks
+for an explicit y/N grant — this is separate from `t> confirm off`, which
+only covers in-chat file/shell/MCP agent actions, never a plugin's grant.
+The grant is remembered by name, but only for as long as the exact
+permission set stays the same: change `"permissions"` in a later update
+and the user is re-prompted, rather than silently inheriting an old
+approval.
+
+## Config defaults and overrides
+
+`"config"` in `plugin.json` declares your plugin's defaults. A user can
+override any key locally without touching your manifest:
+
+```
+t> plugin config <name> list                     # see effective config (defaults + overrides)
+t> plugin config <name> set <key> <value>
+t> plugin config <name> get <key>
+t> plugin config <name> unset <key>
+```
+
+Overrides live in a separate `config.json` next to `plugin.json` inside
+the plugin's folder, so they survive `t> plugin update`/reinstall
+untouched. Your plugin receives the effective (merged) result at launch —
+see `AULTHIUM_PLUGIN_CONFIG_JSON` / `AULTHIUM_PLUGIN_CFG_<KEY>` below.
 
 ## Installing it
 
@@ -52,13 +120,82 @@ This copies the folder into `~/.aulthium/plugins/<name>/` (name comes
 from the manifest, not the source folder's name). Then:
 
 ```
-t> plugin list          # see it
-t> plugin info <name>   # see the full manifest
-t> plugin run <name>    # launch it (asks for y/N confirmation first)
+t> plugin list             # see it
+t> plugin info <name>      # see the full manifest, effective config, and integrity status
+t> plugin run <name>       # launch it (asks for y/N confirmation first)
+t> plugin toggle <name> <on|off>   # hook plugins only — flip without stopping
+t> plugin update [name]    # check GitHub-sourced plugins for a newer version
+t> plugin remove <name>    # delete an installed plugin (asks for confirmation)
 ```
 
 Anything after the name on `t> plugin run <name> ...` is passed straight
 through as extra arguments to your `entry` command.
+
+## Integrity fingerprint and `t> plugin verify`
+
+Every install/update stamps an `_integrity` block into `plugin.json` — a
+SHA-256 hash of every other file in the plugin's folder (nothing outside
+it, and not `plugin.json` or `config.json` themselves), plus a UTC
+timestamp:
+
+```json
+"_integrity": { "sha256": "…", "at": "2026-08-29T02:03:43Z" }
+```
+
+`t> plugin verify <name>` recomputes that hash right now and compares it
+to what's recorded — a strictly read-only check that never repairs or
+re-stamps anything. `t> plugin run` also checks this automatically and
+warns (non-fatally — you're allowed to edit your own plugin) if the files
+have drifted since the hash was last recorded. Getting a fresh, honest
+hash is the only way this ever reports a match — there's no supported way
+to make a changed plugin verify clean without actually reinstalling or
+otherwise re-stamping it, since that would defeat the point of having a
+fingerprint at all.
+
+## Scaffolding a new plugin
+
+There's no in-chat wizard for this — scaffolding lives in a separate,
+standalone script you run directly with bash, outside the Aulthium REPL:
+
+```
+./aulthium-plugin-create.sh <name> [flags...]
+```
+
+It writes the same `plugin.json` / entry-script / README shape described
+above straight into `$PLUGINS_DIR`, so the result is immediately usable
+from `t> plugin list` / `t> plugin run <name>` / `t> plugin verify <name>`
+— no separate `t> plugin install` step needed for something scaffolded
+this way. Useful flags:
+
+```
+--desc "<text>"            short description (may contain spaces)
+--version <x.y.z>          default: 0.1.0
+--mode foreground|hook     default: foreground
+--hook <point>             required for --mode hook; default: web_search
+--toggle-prefix <p>        hook-mode shorthand, e.g. 'bws' for 'bws> on'
+--autostart                hook-mode: launch automatically every start
+--runtime bash|python3|node|none   default: bash
+--perm <scope>             repeatable — network/filesystem/shell/mcp/secrets
+--config <key>=<value>     repeatable — a config default
+--force                    overwrite an existing plugin of the same name
+--security-print           print the integrity hash right after creating
+--verify                   immediately verify the new plugin's files
+```
+
+Example — scaffold a plugin with two permissions and a config default,
+then print and confirm its fingerprint in the same command:
+
+```
+./aulthium-plugin-create.sh webhook-relay \
+    --desc "Relays incoming webhooks to the active provider" \
+    --runtime python3 --perm network --perm secrets \
+    --config timeout=30 --security-print --verify
+```
+
+This only covers scaffolding. Everything else — installing from a
+folder/zip/GitHub repo, running, toggling, configuring, updating,
+removing — is still done from inside Aulthium with `t> plugin ...`, as
+described above.
 
 ## What Aulthium hands your plugin
 
@@ -153,7 +290,17 @@ back.
 
 ## Writing your own
 
-A minimal plugin needs nothing more than a manifest and one file:
+A minimal plugin needs nothing more than a manifest and one file. You can
+write these by hand, or scaffold the skeleton in one command with the
+standalone script (see [Scaffolding a new plugin](#scaffolding-a-new-plugin)
+above):
+
+```
+./aulthium-plugin-create.sh hello --desc "Prints a one-off reply from the AI, non-interactively" --runtime python3
+```
+
+That writes `~/.aulthium/plugins/hello/plugin.json`, a `run.py` stub, and
+a `README.md`. Or by hand:
 
 ```
 ~/.aulthium/plugins/hello/plugin.json
@@ -205,9 +352,10 @@ t> plugin run hello
 - Plugins are **not** confined to `AULTHIUM_WORKSPACE_DIR` or anything
   else — they run with your normal shell privileges, exactly like the
   shell agent's proposed commands. Only install and run plugins you
-  trust.
-- `t> plugin run` always asks for a y/N confirmation before launching,
-  regardless of `t> confirm off` (that toggle only covers the in-chat
-  file/shell/MCP agent actions, not plugins).
-- There's currently no uninstall command — remove a plugin by deleting
-  its folder under `~/.aulthium/plugins/`.
+  trust, and treat a `t> plugin verify` mismatch as a reason to stop and
+  look, not something to wave through.
+- `t> plugin run` always asks for a y/N permissions confirmation before
+  launching, regardless of `t> confirm off` (that toggle only covers the
+  in-chat file/shell/MCP agent actions, not plugins).
+- `t> plugin remove <name>` uninstalls a plugin (with confirmation); you
+  can also just delete its folder under `~/.aulthium/plugins/` by hand.
