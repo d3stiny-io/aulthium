@@ -8003,28 +8003,79 @@ command_router() {
   esac
 }
 
+# Forwards anything after "<prefix>> " that ISN'T the literal on/off
+# toggle straight to a hook plugin's entry command, using the exact same
+# call convention web_search_query_plugin_hook already uses for it: the
+# text goes in as one shell-quoted argv argument, and whatever the entry
+# prints to stdout is shown back in chat as-is. Aulthium doesn't parse or
+# know anything about the subcommand itself (e.g. "use my-skill") — that
+# meaning is entirely up to the plugin's own entry script. A plugin that
+# only ever wants on/off never has to care this exists; it's purely
+# opt-in by the plugin choosing to handle extra argv beyond a bare query.
+#
+# Deliberately gated on RUNNING_PLUGIN_ENABLED like the hook call is —
+# toggling a plugin off with "<prefix>> off" also stops this shorthand
+# from reaching it, rather than leaving a side door open while "off".
+plugin_toggle_prefix_forward() {
+  local name="$1" rest="$2" dir entry output status _perm_list
+
+  if [[ "${RUNNING_PLUGIN_ENABLED[$name]:-off}" != "on" ]]; then
+    warn "'$name' is toggled off — turn it on first with: t> plugin toggle $name on"
+    return 1
+  fi
+
+  dir="${RUNNING_PLUGIN_DIR[$name]}"
+  entry="${RUNNING_PLUGIN_ENTRY[$name]}"
+
+  _perm_list="$(jq -r '.permissions // [] | join(" ")' "$dir/plugin.json" 2>/dev/null)"
+  [[ " $_perm_list " == *" secrets "* ]] && PLUGIN_EXPORT_SECRETS=1 || PLUGIN_EXPORT_SECRETS=0
+  plugin_export_env
+  plugin_export_config_env "$name" "$dir"
+  output="$(cd "$dir" && eval "$entry" "$(printf '%q' "$rest")" 2>&1)"
+  status=$?
+  unset AULTHIUM_API_KEY AULTHIUM_API_URL AULTHIUM_API_KIND AULTHIUM_PROVIDER \
+        AULTHIUM_PROVIDER_LABEL AULTHIUM_MODEL AULTHIUM_WORKSPACE_DIR \
+        AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
+        AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
+        AULTHIUM_SHELL_TIMEOUT_SECS
+  plugin_unset_config_env
+  PLUGIN_EXPORT_SECRETS=0
+
+  [[ -n "$output" ]] && printf '%s\n' "$output"
+  if [[ $status -ne 0 ]]; then
+    warn "'$name' exited $status handling: $rest"
+  fi
+  return $status
+}
+
 # Anything that isn't a "t> ..." command lands here. Ordinarily that's
 # just a chat message, but a running hook plugin with a "toggle_prefix"
 # (e.g. better-websearch's "bws") gets first look — typing "bws> on" or
 # "bws> off" at the normal chat prompt is recognized as that plugin's
 # shorthand toggle instead of being sent to the AI as a message, so
 # switching it on/off never requires leaving the chat flow at User> at
-# all. Anything that doesn't match a registered prefix falls straight
-# through to send_chat, same as before this existed.
+# all. Anything else after the prefix (e.g. "skills> use my-skill") is
+# forwarded verbatim to the plugin itself via plugin_toggle_prefix_forward
+# rather than rejected — see that function for the call convention. Only
+# a completely unrecognized prefix falls straight through to send_chat,
+# same as before this existed.
 handle_repl_input() {
-  local input="$1" prefix rest
+  local input="$1" prefix rest rest_lc
   for prefix in "${!TOGGLE_PREFIX_TO_PLUGIN[@]}"; do
     case "$input" in
       "${prefix}>"*)
         rest="${input#"${prefix}>"}"
         rest="${rest# }"
-        rest="${rest,,}"
-        case "$rest" in
+        rest_lc="${rest,,}"
+        case "$rest_lc" in
           on|off)
-            plugin_toggle "${TOGGLE_PREFIX_TO_PLUGIN[$prefix]}" "$rest"
+            plugin_toggle "${TOGGLE_PREFIX_TO_PLUGIN[$prefix]}" "$rest_lc"
+            ;;
+          "")
+            warn "Usage: ${prefix}> <on|off|...>"
             ;;
           *)
-            warn "Usage: ${prefix}> <on|off>"
+            plugin_toggle_prefix_forward "${TOGGLE_PREFIX_TO_PLUGIN[$prefix]}" "$rest"
             ;;
         esac
         return 0

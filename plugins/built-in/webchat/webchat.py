@@ -167,32 +167,82 @@ Rules:
   not something to display or explain line-by-line unless asked.
 """
 
-def _do_request(url, data_bytes, headers):
+def _open_stream(url, data_bytes, headers):
+    """
+    Opens a streaming POST request. Returns (resp_or_None, status, error_body, headers).
+    On success, resp is the live response object (caller must iterate + close it).
+    On failure, resp is None and error_body holds whatever error text we could recover.
+    """
     req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace"), dict(resp.headers)
+        resp = urllib.request.urlopen(req, timeout=120)
+        return resp, resp.status, None, dict(resp.headers)
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode("utf-8", "replace")
         except Exception:
             body = ""
-        return e.code, body, dict(e.headers or {})
+        return None, e.code, body, dict(e.headers or {})
     except Exception as e:
-        return 0, json.dumps({"error": {"message": str(e)}}), {}
+        return None, 0, json.dumps({"error": {"message": str(e)}}), {}
 
-def call_openai_compatible_raw(messages):
+def _iter_sse_data_lines(resp):
+    """Yields the payload after 'data:' for each SSE line, skipping blanks/comments."""
+    for raw_line in resp:
+        try:
+            line = raw_line.decode("utf-8", "replace").strip()
+        except Exception:
+            continue
+        if not line or not line.startswith("data:"):
+            continue
+        yield line[len("data:"):].strip()
+
+def call_openai_compatible_stream(messages, job):
+    """
+    Streams a chat completion (SSE, OpenAI-compatible 'delta' chunks).
+    Feeds each text delta to job.append_partial() as it arrives, so the UI can
+    render it live. Returns (status, full_text_or_error_body, headers).
+    """
     payload = json.dumps({
         "model": MODEL,
         "messages": messages,
         "temperature": 0.7,
+        "stream": True,
     }).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if API_KEY:
         headers["Authorization"] = "Bearer " + API_KEY
-    return _do_request(API_URL, payload, headers)
+    resp, status, err_body, resp_headers = _open_stream(API_URL, payload, headers)
+    if resp is None:
+        return status, err_body, resp_headers
 
-def call_google_raw(messages):
+    chunks = []
+    try:
+        for data in _iter_sse_data_lines(resp):
+            if job.cancelled:
+                break
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            try:
+                delta = obj["choices"][0]["delta"].get("content") or ""
+            except Exception:
+                delta = ""
+            if delta:
+                chunks.append(delta)
+                job.append_partial(delta)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    return status, "".join(chunks), resp_headers
+
+def call_google_stream(messages, job):
+    """Streams a Gemini response (SSE) the same way as call_openai_compatible_stream."""
     contents = []
     system_text = None
     for m in messages:
@@ -209,15 +259,37 @@ def call_google_raw(messages):
     if system_text:
         body_obj["systemInstruction"] = {"parts": [{"text": system_text}]}
     payload = json.dumps(body_obj).encode("utf-8")
-    url = API_URL.rstrip("/") + "/models/" + MODEL + ":generateContent?key=" + urllib.parse.quote(API_KEY)
-    return _do_request(url, payload, {"Content-Type": "application/json"})
+    url = (API_URL.rstrip("/") + "/models/" + MODEL
+           + ":streamGenerateContent?alt=sse&key=" + urllib.parse.quote(API_KEY))
+    resp, status, err_body, resp_headers = _open_stream(url, payload, {"Content-Type": "application/json"})
+    if resp is None:
+        return status, err_body, resp_headers
 
-def extract_reply(body_text):
-    obj = json.loads(body_text)
-    if API_KIND == "google":
-        parts = obj["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts)
-    return obj["choices"][0]["message"]["content"]
+    chunks = []
+    try:
+        for data in _iter_sse_data_lines(resp):
+            if job.cancelled:
+                break
+            if not data:
+                continue
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            try:
+                parts = obj["candidates"][0]["content"]["parts"]
+                delta = "".join(p.get("text", "") for p in parts)
+            except Exception:
+                delta = ""
+            if delta:
+                chunks.append(delta)
+                job.append_partial(delta)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    return status, "".join(chunks), resp_headers
 
 QUOTA_RE = re.compile(r"per-day|per-month|daily|quota|free-models-per|RESOURCE_EXHAUSTED", re.I)
 RETRYABLE_STATUS = {401, 429, 500, 502, 503, 504}
@@ -226,11 +298,14 @@ def call_with_retry(messages, job):
     attempt = 0
     wait_secs = 2
     while True:
+        if job.cancelled:
+            return None, "cancelled"
+        job.reset_partial()
         job.set_status("working", "thinking...")
         if API_KIND == "google":
-            status, body, headers = call_google_raw(messages)
+            status, text_or_body, headers = call_google_stream(messages, job)
         else:
-            status, body, headers = call_openai_compatible_raw(messages)
+            status, text_or_body, headers = call_openai_compatible_stream(messages, job)
 
         if job.cancelled:
             return None, "cancelled"
@@ -238,20 +313,19 @@ def call_with_retry(messages, job):
         if status not in RETRYABLE_STATUS:
             if status == 0:
                 try:
-                    msg = json.loads(body).get("error", {}).get("message", body)
+                    msg = json.loads(text_or_body).get("error", {}).get("message", text_or_body)
                 except Exception:
-                    msg = body
+                    msg = text_or_body
                 return None, "Connection error: %s" % msg
             if 200 <= status < 300:
-                try:
-                    return extract_reply(body), None
-                except Exception as e:
-                    return None, "Could not parse the response: %s" % e
-            return None, "HTTP %s: %s" % (status, body[:500])
+                if not text_or_body.strip():
+                    return None, "The provider returned an empty streamed response."
+                return text_or_body, None
+            return None, "HTTP %s: %s" % (status, text_or_body[:500])
 
         err_msg = ""
         try:
-            err_msg = json.loads(body).get("error", {}).get("message", "") or ""
+            err_msg = json.loads(text_or_body).get("error", {}).get("message", "") or ""
         except Exception:
             pass
 
@@ -264,12 +338,12 @@ def call_with_retry(messages, job):
 
         if attempt >= MAX_RATE_LIMIT_RETRIES:
             if status == 429:
-                return None, "HTTP 429 (rate limited): %s" % (err_msg or body[:300])
+                return None, "HTTP 429 (rate limited): %s" % (err_msg or text_or_body[:300])
             if status == 401:
                 return None, "HTTP 401 (authentication failed) after %s retries: %s" % (
-                    MAX_RATE_LIMIT_RETRIES, err_msg or body[:300])
+                    MAX_RATE_LIMIT_RETRIES, err_msg or text_or_body[:300])
             return None, "HTTP %s (server error) after %s retries: %s" % (
-                status, MAX_RATE_LIMIT_RETRIES, err_msg or body[:300])
+                status, MAX_RATE_LIMIT_RETRIES, err_msg or text_or_body[:300])
 
         attempt += 1
         retry_after = headers.get("Retry-After") or headers.get("retry-after")
@@ -292,6 +366,9 @@ def call_with_retry(messages, job):
         while remaining > 0 and not job.cancelled:
             time.sleep(1 if remaining > 1 else remaining)
             remaining -= 1
+
+        if job.cancelled:
+            return None, "cancelled"
 
         wait_secs *= 2
 
@@ -493,6 +570,7 @@ class Job:
         self.error = None
         self.action = None
         self.events = []
+        self.partial = ""
         self.lock = threading.Lock()
         self.confirm_event = threading.Event()
         self.confirm_result = False
@@ -508,6 +586,22 @@ class Job:
         with self.lock:
             self.events.append({"type": etype, "text": text})
 
+    def reset_partial(self):
+        with self.lock:
+            self.partial = ""
+
+    def append_partial(self, text):
+        with self.lock:
+            self.partial += text
+            self.status = "streaming"
+            self.detail = ""
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled = True
+        # Unblock a pending tool-confirmation wait, if any — treated as a decline.
+        self.confirm_event.set()
+
     def snapshot(self, since=0):
         with self.lock:
             return {
@@ -516,6 +610,7 @@ class Job:
                 "reply": self.reply,
                 "error": self.error,
                 "action": self.action,
+                "partial": self.partial,
                 "events": self.events[since:],
                 "event_count": len(self.events),
             }
@@ -552,14 +647,24 @@ def need_confirm_and_wait(job, call):
         job.action = None
     return approved
 
+def _finish_stopped(job):
+    with job.lock:
+        job.status = "stopped"
+        stopped_text = strip_markers(job.partial or "").strip()
+        job.reply = stopped_text if stopped_text else None
+
 def run_job(job):
     messages = job.messages
     if not messages or messages[0].get("role") != "system":
         messages = [{"role": "system", "content": TOOL_SYSTEM_PROMPT}] + messages
 
     for _round in range(6):
+        if job.cancelled:
+            _finish_stopped(job)
+            return
         reply_text, err = call_with_retry(messages, job)
         if job.cancelled:
+            _finish_stopped(job)
             return
         if err:
             with job.lock:
@@ -576,8 +681,14 @@ def run_job(job):
         messages.append({"role": "assistant", "content": reply_text})
         results = []
         for call in calls:
+            if job.cancelled:
+                _finish_stopped(job)
+                return
             if call["kind"] in NEEDS_CONFIRM:
                 approved = need_confirm_and_wait(job, call)
+                if job.cancelled:
+                    _finish_stopped(job)
+                    return
                 if not approved:
                     target = call.get("path") or call.get("command", "")
                     results.append("%s on '%s' was declined by the user." % (call["kind"], target))
@@ -774,6 +885,10 @@ PAGE_TEMPLATE = r"""<!doctype html>
   .retry-row { display: inline-flex; align-items: center; gap: 9px; color: var(--text-2); font-size: 13.2px; }
   .retry-row .spin { animation: rotate 0.9s linear infinite; }
   @keyframes rotate { to { transform: rotate(360deg); } }
+  .msg.pending.streaming { display: block; white-space: pre-wrap; word-wrap: break-word; }
+  .stream-cursor { display: inline-block; width: 8px; height: 1em; margin-left: 1px; vertical-align: text-bottom;
+    background: var(--text-2); animation: cursor-blink 0.9s step-start infinite; }
+  @keyframes cursor-blink { 50% { opacity: 0; } }
   .msg.error { align-self: flex-start; display: flex; gap: 10px; align-items: flex-start;
     background: rgba(255,255,255,0.04); border: 1px solid var(--stroke-3); color: var(--text);
     border-radius: var(--r-lg) var(--r-lg) var(--r-lg) var(--r-xs); font-size: 13.8px;
@@ -893,6 +1008,19 @@ PAGE_TEMPLATE = r"""<!doctype html>
   .send:hover:not(:disabled) .icon { transform: translateY(-1px); }
   .send:active:not(:disabled) { transform: scale(0.88); }
   .send:disabled { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.3); box-shadow: none; cursor: default; }
+  .stop { width: 44px; height: 44px; min-width: 44px; border-radius: 50%; border: none; cursor: pointer;
+    background: #ff453a; color: #ffffff; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 14px rgba(255,69,58,0.35); flex: none; touch-action: manipulation;
+    transition: transform var(--t), box-shadow var(--t); }
+  .stop .icon { width: 15px; height: 15px; }
+  .stop:hover { transform: translateY(-2px) scale(1.05); box-shadow: 0 6px 26px rgba(255,69,58,0.45); }
+  .stop:active { transform: scale(0.88); }
+  .newline-btn { width: 38px; height: 38px; min-width: 38px; border-radius: 50%; border: 1px solid var(--stroke-2);
+    background: transparent; color: var(--text-2); display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex: none; touch-action: manipulation; transition: background var(--t), color var(--t); }
+  .newline-btn .icon { width: 15px; height: 15px; }
+  .newline-btn:hover { background: var(--glass); color: var(--text); }
+  .newline-btn:active { transform: scale(0.9); }
   .composer-hint { text-align: center; margin-top: 9px; font-family: var(--mono); font-size: 10px;
     letter-spacing: 0.05em; color: var(--text-3); opacity: 0.8; }
   @media (hover: none) { .composer-hint { display: none; } }
@@ -1053,7 +1181,9 @@ window.__WEBCHAT_APP__ = function () {
     terminal: '<polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line>',
     folder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>',
     refresh: '<polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>',
-    x: '<line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>'
+    x: '<line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>',
+    stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none"></rect>',
+    cornerDownLeft: '<polyline points="9 10 4 15 9 20"></polyline><path d="M20 4v7a4 4 0 0 1-4 4H4"></path>'
   };
   function icon(name, cls) {
     return html`<svg className=${cls ? "icon " + cls : "icon"} viewBox="0 0 24 24" fill="none"
@@ -1203,6 +1333,18 @@ window.__WEBCHAT_APP__ = function () {
 
   /* ---------- composer ---------- */
   function Composer(props) {
+    function insertNewline() {
+      var ta = props.taRef.current;
+      if (!ta) { props.onChange(props.value + "\n"); return; }
+      var start = ta.selectionStart == null ? props.value.length : ta.selectionStart;
+      var end = ta.selectionEnd == null ? props.value.length : ta.selectionEnd;
+      var next = props.value.slice(0, start) + "\n" + props.value.slice(end);
+      props.onChange(next);
+      requestAnimationFrame(function () {
+        if (ta.setSelectionRange) ta.setSelectionRange(start + 1, start + 1);
+        ta.focus();
+      });
+    }
     return html`<form className="composer-wrap" onSubmit=${props.onSubmit}>
       <div className="composer-glass">
         <textarea ref=${props.taRef} rows=${1} placeholder=${"Message " + APP_NAME + "\u2026"}
@@ -1210,9 +1352,13 @@ window.__WEBCHAT_APP__ = function () {
           onKeyDown=${function (e) {
             if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (e.target.form) e.target.form.requestSubmit(); }
           }} aria-label="Message input"></textarea>
-        <button type="submit" className="send" disabled=${props.busy || !props.value.trim()} aria-label="Send message">${icon("send")}</button>
+        <button type="button" className="newline-btn" onClick=${insertNewline}
+          aria-label="Insert a new line" title="New line">${icon("cornerDownLeft")}</button>
+        ${props.busy
+          ? html`<button type="button" className="stop" onClick=${props.onStop} aria-label="Stop generating">${icon("stop")}</button>`
+          : html`<button type="submit" className="send" disabled=${!props.value.trim()} aria-label="Send message">${icon("send")}</button>`}
       </div>
-      <div className="composer-hint">Enter to send · Shift + Enter for a new line</div>
+      <div className="composer-hint">Enter to send · Shift + Enter or ⏎ for a new line</div>
     </form>`;
   }
 
@@ -1236,6 +1382,7 @@ window.__WEBCHAT_APP__ = function () {
     var logRef = useRef(null);
     var taRef = useRef(null);
     var nearBottomRef = useRef(true);
+    var currentJobIdRef = useRef(null);
 
     function updateItem(id, patch) {
       setItems(function (prev) {
@@ -1296,6 +1443,14 @@ window.__WEBCHAT_APP__ = function () {
       }
     }
 
+    function stripMarkersJS(text) {
+      var out = text;
+      out = out.replace(/<<<FILE_WRITE\s+path="([^"]*)">>>\n([\s\S]*?)\n<<<END_FILE_WRITE>>>/g, "");
+      out = out.replace(/<<<SHELL_RUN>>>\n([\s\S]*?)\n<<<END_SHELL_RUN>>>/g, "");
+      out = out.replace(/<<<(FILE_READ|DIR_LIST|WEB_SEARCH|FILE_DELETE)\s+(?:path|query)="([^"]*)">>>/g, "");
+      return out;
+    }
+
     async function pollJob(jobId, pid) {
       var since = 0;
       for (;;) {
@@ -1307,11 +1462,17 @@ window.__WEBCHAT_APP__ = function () {
         since = data.event_count || since;
         (data.events || []).forEach(function (ev) { addNote(ev.type === "auto", ev.text); });
         if (data.status === "working" || data.status === "retrying") {
-          updateItem(pid, { kind: "pending", state: data.status, detail: data.detail || "thinking..." });
+          updateItem(pid, { kind: "pending", streaming: false, state: data.status, detail: data.detail || "thinking..." });
           await sleep(500);
           continue;
         }
+        if (data.status === "streaming") {
+          updateItem(pid, { kind: "pending", streaming: true, state: "streaming", text: stripMarkersJS(data.partial || "") });
+          await sleep(180);
+          continue;
+        }
         if (data.status === "confirm" && data.action) {
+          currentJobIdRef.current = null;
           var cid = uid();
           setItems(function (prev) {
             return prev.filter(function (it) { return it.id !== pid; })
@@ -1320,12 +1481,27 @@ window.__WEBCHAT_APP__ = function () {
           return;
         }
         if (data.status === "done") {
+          currentJobIdRef.current = null;
           var reply = data.reply || "";
           messagesRef.current.push({ role: "assistant", content: reply });
           updateItem(pid, { kind: "assistant", html: renderMarkdown(reply), state: null, detail: null });
           return;
         }
+        if (data.status === "stopped") {
+          currentJobIdRef.current = null;
+          var stoppedText = data.reply || "";
+          if (stoppedText) messagesRef.current.push({ role: "assistant", content: stoppedText });
+          updateItem(pid, {
+            kind: stoppedText ? "assistant" : "note",
+            html: stoppedText ? renderMarkdown(stoppedText) : undefined,
+            text: stoppedText ? undefined : "Stopped.",
+            auto: true,
+            state: null, detail: null
+          });
+          return;
+        }
         if (data.status === "error") {
+          currentJobIdRef.current = null;
           updateItem(pid, { kind: "error", text: "Error: " + (data.error || "unknown error"), state: null, detail: null });
           return;
         }
@@ -1342,11 +1518,32 @@ window.__WEBCHAT_APP__ = function () {
           body: JSON.stringify({ id: item.jobId, approved: approved })
         });
       } catch (e) { /* keep going — the server times out on its own */ }
+      currentJobIdRef.current = item.jobId;
+      busyRef.current = true;
+      setBusy(true);
       var pid = uid();
       nearBottomRef.current = true;
       setItems(function (prev) { return prev.concat([{ id: pid, kind: "pending", state: "working" }]); });
       await sleep(300);
-      await pollJob(item.jobId, pid);
+      try {
+        await pollJob(item.jobId, pid);
+      } finally {
+        currentJobIdRef.current = null;
+        busyRef.current = false;
+        setBusy(false);
+      }
+    }
+
+    async function stopCurrent() {
+      var jobId = currentJobIdRef.current;
+      if (!jobId) return;
+      try {
+        await fetch("/api/chat/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: jobId })
+        });
+      } catch (e) { /* the poll loop will settle on its own status either way */ }
     }
 
     async function send(text) {
@@ -1367,10 +1564,12 @@ window.__WEBCHAT_APP__ = function () {
         });
         var started = await res.json();
         if (started.error) throw new Error(started.error);
+        currentJobIdRef.current = started.job_id;
         await pollJob(started.job_id, pid);
       } catch (err) {
         updateItem(pid, { kind: "error", text: "Error: " + (err && err.message ? err.message : String(err)), state: null, detail: null });
       } finally {
+        currentJobIdRef.current = null;
         busyRef.current = false;
         setBusy(false);
         var ta = taRef.current;
@@ -1447,6 +1646,9 @@ window.__WEBCHAT_APP__ = function () {
         return html`<div key=${it.id} className="msg assistant markdown" dangerouslySetInnerHTML=${{ __html: it.html }}></div>`;
       }
       if (it.kind === "pending") {
+        if (it.streaming) {
+          return html`<div key=${it.id} className="msg assistant pending streaming">${it.text || ""}<span className="stream-cursor"></span></div>`;
+        }
         return html`<div key=${it.id} className="msg assistant pending">
           ${it.state === "retrying"
             ? html`<span className="retry-row">${icon("refresh", "spin")}<span>${it.detail || "thinking..."}</span></span>`
@@ -1482,7 +1684,7 @@ window.__WEBCHAT_APP__ = function () {
               onClick=${function () { nearBottomRef.current = true; scrollToBottom(true); }}>${icon("chevronDown")}</button>`
           : null}
       </div>
-      <${Composer} value=${input} onChange=${setInput} onSubmit=${handleSubmit} busy=${busy} taRef=${taRef} />
+      <${Composer} value=${input} onChange=${setInput} onSubmit=${handleSubmit} busy=${busy} taRef=${taRef} onStop=${stopCurrent} />
     </div>`;
   }
 
@@ -1633,6 +1835,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             job.confirm_result = approved
             job.confirm_event.set()
+            self._send_json(200, {"ok": True})
+            return
+
+        if parsed.path == "/api/chat/cancel":
+            try:
+                data = self._read_json()
+                job_id = data.get("id", "")
+            except Exception:
+                self._send_json(400, {"error": "bad request"})
+                return
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            if not job:
+                self._send_json(404, {"error": "unknown job"})
+                return
+            job.cancel()
             self._send_json(200, {"ok": True})
             return
 

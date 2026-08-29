@@ -71,6 +71,46 @@ touching `t> plugin toggle`. Setting `"autostart": true` makes it register
 itself again automatically on every future launch, until explicitly
 stopped with `t> plugin run --stoprun <name>`.
 
+### The `web_search` hook's actual call convention
+
+When the hook fires, Aulthium calls your `entry` command with the search
+query as **one shell-quoted argv argument** — equivalent to
+`entry "$query"`, not JSON, not stdin. Whatever your program prints to
+stdout is used as the result verbatim if it exits 0 with non-empty
+output; a nonzero exit or empty stdout means "I don't have anything for
+this," and Aulthium falls through to its normal search providers instead
+(so a plugin that doesn't want to handle a particular query should just
+print nothing and exit non-zero, rather than treating that as an error).
+
+```python
+import sys
+query = sys.argv[1]   # the whole query, already de-quoted by the shell
+...
+print(result_text)    # becomes the search result
+# or, to decline and let the real search run:
+# sys.exit(1)
+```
+
+### Prefix commands beyond on/off
+
+Anything typed after `<prefix>>` that *isn't* literally `on` or `off` is
+forwarded straight to your `entry` command, using the same call
+convention the hook point itself uses: the trailing text goes in as a
+single shell-quoted argv argument, and whatever your program prints to
+stdout is shown back in the chat as-is. Aulthium doesn't parse or
+understand this text at all — your entry script decides what it means.
+
+```
+skills> use my-skill        # -> entry gets invoked as: entry "use my-skill"
+```
+
+This only fires while the plugin is toggled **on** — `<prefix>> off`
+blocks it too, same as it blocks the hook point itself. Your entry
+script has to tell this call apart from a real hook invocation itself
+(e.g. by checking whether argv[1] starts with a subcommand word it
+recognizes) — Aulthium doesn't tag the two differently, both arrive as
+one shell-quoted argv argument.
+
 ## Permissions
 
 Aulthium doesn't sandbox a plugin — declaring permissions is purely
