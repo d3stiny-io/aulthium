@@ -13,12 +13,15 @@ it's not, so the plugin still works with zero extra installs either way.
 
 Two things it mirrors from the terminal session, on top of plain chat:
 
-  - HTTP 429 retry-with-backoff, same shape as call_provider_with_retry in
-    the main script: temporary throttling gets retried (Retry-After header
-    if present, otherwise exponential backoff + jitter, capped), exhausted
-    daily/monthly quota fails fast with a clear message instead of burning
-    retries. The browser sees this live (a "rate limited, retrying in Xs"
-    status) instead of just staring at a spinner.
+  - HTTP 429/5xx retry-with-backoff (up to 6 attempts by default), same
+    shape as call_provider_with_retry in the main script: temporary
+    throttling or a transient server error (429/500/502/503/504) gets
+    retried (Retry-After header if present, otherwise exponential backoff
+    + jitter, capped), exhausted daily/monthly quota fails fast with a
+    clear message instead of burning retries, and non-retryable errors
+    (4xx other than 429, connection failures) fail immediately. The
+    browser sees this live (a "rate limited, retrying in Xs" status)
+    instead of just staring at a spinner.
 
   - The same marker-based tool protocol as the terminal file agent
     (FILE_READ / DIR_LIST / WEB_SEARCH run immediately; FILE_WRITE /
@@ -217,6 +220,7 @@ def extract_reply(body_text):
     return obj["choices"][0]["message"]["content"]
 
 QUOTA_RE = re.compile(r"per-day|per-month|daily|quota|free-models-per|RESOURCE_EXHAUSTED", re.I)
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 def call_with_retry(messages, job):
     attempt = 0
@@ -231,14 +235,13 @@ def call_with_retry(messages, job):
         if job.cancelled:
             return None, "cancelled"
 
-        if status == 0:
-            try:
-                msg = json.loads(body).get("error", {}).get("message", body)
-            except Exception:
-                msg = body
-            return None, "Connection error: %s" % msg
-
-        if status != 429:
+        if status not in RETRYABLE_STATUS:
+            if status == 0:
+                try:
+                    msg = json.loads(body).get("error", {}).get("message", body)
+                except Exception:
+                    msg = body
+                return None, "Connection error: %s" % msg
             if 200 <= status < 300:
                 try:
                     return extract_reply(body), None
@@ -252,7 +255,7 @@ def call_with_retry(messages, job):
         except Exception:
             pass
 
-        if QUOTA_RE.search(err_msg or ""):
+        if status == 429 and QUOTA_RE.search(err_msg or ""):
             return None, (
                 "%s free-tier quota exhausted: %s — retrying won't help until it resets. "
                 "Switch models in the terminal (t> model), check billing, or wait for the reset."
@@ -260,7 +263,10 @@ def call_with_retry(messages, job):
             )
 
         if attempt >= MAX_RATE_LIMIT_RETRIES:
-            return None, "HTTP 429 (rate limited): %s" % (err_msg or body[:300])
+            if status == 429:
+                return None, "HTTP 429 (rate limited): %s" % (err_msg or body[:300])
+            return None, "HTTP %s (server error) after %s retries: %s" % (
+                status, MAX_RATE_LIMIT_RETRIES, err_msg or body[:300])
 
         attempt += 1
         retry_after = headers.get("Retry-After") or headers.get("retry-after")
@@ -271,10 +277,12 @@ def call_with_retry(messages, job):
         jitter = random.randint(1, 3)
         total_wait = wait_secs + jitter
 
+        reason = "Rate limited by %s (HTTP 429)" % PROVIDER_LABEL if status == 429 \
+            else "%s returned HTTP %s (server error)" % (PROVIDER_LABEL, status)
         job.set_status(
             "retrying",
-            "Rate limited by %s (HTTP 429). Retrying in %ss... (%s/%s)"
-            % (PROVIDER_LABEL, total_wait, attempt, MAX_RATE_LIMIT_RETRIES),
+            "%s. Retrying in %ss... (%s/%s)"
+            % (reason, total_wait, attempt, MAX_RATE_LIMIT_RETRIES),
         )
         remaining = total_wait
         while remaining > 0 and not job.cancelled:
