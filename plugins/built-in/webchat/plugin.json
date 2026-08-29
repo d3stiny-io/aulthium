@@ -4,10 +4,10 @@
   "version": "1.1.1",
   "entry": "python3 webchat.py",
   "runtime": "python3",
-  "permissions": ["network", "shell"],
+  "permissions": ["network", "shell", "secrets"],
   "config": {
     "port": "8420",
-    "max_rate_limit_retries": "6",
+    "max_rate_limit_retries": "9",
     "max_rate_limit_wait": "60",
     "shell_timeout_secs": "60"
   }
