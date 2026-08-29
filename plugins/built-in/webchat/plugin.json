@@ -1,7 +1,14 @@
 {
   "name": "webchat",
   "description": "Chat with the AI from a page in your browser instead of typing in the terminal, with markdown rendering, the same 429 retry-with-backoff, and file/web-search/shell tool use (gated by yes/no confirmation) as the terminal session",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "entry": "python3 webchat.py",
-  "runtime": "python3"
+  "runtime": "python3",
+  "permissions": ["network", "shell"],
+  "config": {
+    "port": "8420",
+    "max_rate_limit_retries": "6",
+    "max_rate_limit_wait": "60",
+    "shell_timeout_secs": "60"
+  }
 }

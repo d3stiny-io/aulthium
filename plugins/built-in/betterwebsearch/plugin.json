@@ -1,10 +1,18 @@
 {
   "name": "betterwebsearch",
   "description": "Upgrades WEB_SEARCH: fetches each top result's actual page and extracts real article text instead of DuckDuckGo snippets.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "runtime": "python3",
   "entry": "python3 betterwebsearch.py",
   "mode": "hook",
   "hook": "web_search",
-  "toggle_prefix": "bws"
+  "toggle_prefix": "bws",
+  "permissions": ["network"],
+  "config": {
+    "num_results": "5",
+    "fetch_workers": "4",
+    "excerpt_chars": "1200",
+    "search_timeout": "15",
+    "fetch_timeout": "10"
+  }
 }

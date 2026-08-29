@@ -38,6 +38,10 @@ Two ways to use this:
      of the snippet-only version.
 
 See BUILD_PLUGIN.md in the Aulthium repo for the full plugin contract.
+
+Tunable via `t> plugin config betterwebsearch set <key> <value>` (see
+plugin.json for the defaults): num_results, fetch_workers, excerpt_chars,
+search_timeout, fetch_timeout.
 """
 import json
 import os
@@ -57,12 +61,31 @@ except ImportError:
     )
     sys.exit(1)
 
+# --- effective plugin config (plugin.json "config" defaults, overridden by
+# `t> plugin config betterwebsearch set <key> <value>`) ---------------------
+# Aulthium hands the merged result down two ways: the whole thing as JSON in
+# AULTHIUM_PLUGIN_CONFIG_JSON, and each key individually as
+# AULTHIUM_PLUGIN_CFG_<KEY> (upper-cased). Per-key env takes precedence.
+try:
+    _CONFIG = json.loads(os.environ.get("AULTHIUM_PLUGIN_CONFIG_JSON", "") or "{}")
+except (TypeError, ValueError):
+    _CONFIG = {}
+
+def _cfg_int(key, default):
+    v = os.environ.get("AULTHIUM_PLUGIN_CFG_" + key.upper())
+    if v is None:
+        v = _CONFIG.get(key)
+    try:
+        return int(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
 USER_AGENT = "Mozilla/5.0 (compatible; AulthiumBetterWebSearch/1.0)"
-SEARCH_TIMEOUT = 15
-FETCH_TIMEOUT = 10
-MAX_EXCERPT_CHARS = 1200
-DEFAULT_NUM_RESULTS = 5
-DEFAULT_FETCH_WORKERS = 4
+SEARCH_TIMEOUT = _cfg_int("search_timeout", 15)
+FETCH_TIMEOUT = _cfg_int("fetch_timeout", 10)
+MAX_EXCERPT_CHARS = _cfg_int("excerpt_chars", 1200)
+DEFAULT_NUM_RESULTS = _cfg_int("num_results", 5)
+DEFAULT_FETCH_WORKERS = _cfg_int("fetch_workers", 4)
 
 # Tags that are never article content, stripped before any extraction.
 STRIP_TAGS = ["script", "style", "noscript", "nav", "header", "footer",

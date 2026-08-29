@@ -35,6 +35,10 @@ Two things it mirrors from the terminal session, on top of plain chat:
 Launched by Aulthium via 't> plugin run webchat', which exports the
 connection details below as env vars before starting this process. See
 BUILD_PLUGIN.md for the full contract if you're writing your own plugin.
+
+Tunable via `t> plugin config webchat set <key> <value>` (see plugin.json
+for the defaults): port, max_rate_limit_retries, max_rate_limit_wait,
+shell_timeout_secs.
 """
 import json
 import os
@@ -67,15 +71,35 @@ APP_NAME = os.environ.get("AULTHIUM_APP_NAME", "Aulthium")
 WORKSPACE_DIR = os.environ.get("AULTHIUM_WORKSPACE_DIR", "")
 HOST = "127.0.0.1"
 
-def _env_int(name, default):
+# --- effective plugin config (plugin.json "config" defaults, overridden by
+# `t> plugin config webchat set <key> <value>`) -----------------------------
+# Aulthium hands the merged result down two ways: the whole thing as JSON in
+# AULTHIUM_PLUGIN_CONFIG_JSON, and each key individually as
+# AULTHIUM_PLUGIN_CFG_<KEY> (upper-cased). We accept either, per-key env
+# taking precedence, and fall back to this plugin's old dedicated env vars
+# (AULTHIUM_WEBCHAT_PORT etc.) so anything set that way still works.
+try:
+    _CONFIG = json.loads(os.environ.get("AULTHIUM_PLUGIN_CONFIG_JSON", "") or "{}")
+except (TypeError, ValueError):
+    _CONFIG = {}
+
+def _cfg(key, legacy_env=None, default=""):
+    v = os.environ.get("AULTHIUM_PLUGIN_CFG_" + key.upper())
+    if v is None:
+        v = _CONFIG.get(key)
+    if v is None and legacy_env:
+        v = os.environ.get(legacy_env)
+    return default if v is None else v
+
+def _cfg_int(key, legacy_env, default):
     try:
-        return int(os.environ.get(name, "") or default)
+        return int(_cfg(key, legacy_env, default))
     except (TypeError, ValueError):
         return default
 
-MAX_RATE_LIMIT_RETRIES = _env_int("AULTHIUM_MAX_RATE_LIMIT_RETRIES", 6)
-MAX_RATE_LIMIT_WAIT = _env_int("AULTHIUM_MAX_RATE_LIMIT_WAIT", 60)
-SHELL_TIMEOUT_SECS = _env_int("AULTHIUM_SHELL_TIMEOUT_SECS", 60)
+MAX_RATE_LIMIT_RETRIES = _cfg_int("max_rate_limit_retries", "AULTHIUM_MAX_RATE_LIMIT_RETRIES", 6)
+MAX_RATE_LIMIT_WAIT = _cfg_int("max_rate_limit_wait", "AULTHIUM_MAX_RATE_LIMIT_WAIT", 60)
+SHELL_TIMEOUT_SECS = _cfg_int("shell_timeout_secs", "AULTHIUM_SHELL_TIMEOUT_SECS", 60)
 
 if not API_URL:
     sys.stderr.write(
@@ -1219,7 +1243,7 @@ def find_free_port(start):
     return start
 
 def main():
-    start_port = int(os.environ.get("AULTHIUM_WEBCHAT_PORT", "8420"))
+    start_port = _cfg_int("port", "AULTHIUM_WEBCHAT_PORT", 8420)
     port = find_free_port(start_port)
     server = ThreadingHTTPServer((HOST, port), Handler)
     url = "http://%s:%d/" % (HOST, port)
