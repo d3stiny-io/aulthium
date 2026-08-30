@@ -11,11 +11,11 @@ SELF_SCRIPT_PATH="$(realpath -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
 
 # AULTHIUM
 # Single-file Bash terminal AI client for Termux / Linux
-# Talks to either OpenRouter or Google AI Studio, chosen via 't> provider'.
+# Talks to either OpenRouter or Google AI Studio, chosen via 'a> provider'.
 # Conversation stays in memory only while the process is running.
 
 APP_NAME="AULTHIUM"
-APP_VERSION="v1.0.4"
+APP_VERSION="v1.0.5"
 OPENROUTER_URL="https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL="https://openrouter.ai/api/v1/models"
 GOOGLE_API_BASE="https://generativelanguage.googleapis.com/v1beta"
@@ -25,7 +25,7 @@ DEFAULT_GOOGLE_MODEL="gemini-2.0-flash"
 # Which backend we're talking to: "openrouter" or "google". Everything that
 # depends on this (API key, endpoint, request/response shape, model list)
 # is looked up through this single switch rather than duplicated per call
-# site, so 't> provider' only ever needs to flip this one variable.
+# site, so 'a> provider' only ever needs to flip this one variable.
 # Left empty on purpose — main() forces an explicit choice at startup via
 # pick_provider_startup rather than silently defaulting to one backend.
 PROVIDER=""
@@ -101,7 +101,7 @@ MCP_OAUTH_CRED_IDS=()
 #   MCP_SERVERS="name1=https://host1/mcp,name2=https://host2/mcp"
 # with an optional per-server bearer key picked up from
 # MCP_<NAME>_KEY (name uppercased, non-alphanumeric chars turned into "_").
-# Anything beyond that is managed at runtime with 't> mcp add/remove/list/refresh'.
+# Anything beyond that is managed at runtime with 'a> mcp add/remove/list/refresh'.
 
 # ── Credential storage (OAuth tokens, etc.) ─────────────────────────────
 # See CREDENTIAL STORE section below for the implementation and its
@@ -110,7 +110,7 @@ MCP_OAUTH_CRED_IDS=()
 CRED_STORE_DIR="${AULTHIUM_CRED_DIR:-$HOME/.aulthium/credentials}"
 # "plain" (default: 0600-permissioned JSON files) or "encrypted" (AES-256
 # via openssl, passphrase held in memory only) — see cred_store_init.
-# 't> mcp cred encrypt on' switches this on for the rest of the session.
+# 'a> mcp cred encrypt on' switches this on for the rest of the session.
 CRED_STORE_MODE="plain"
 CRED_STORE_PASSPHRASE="" # session-only; never written to disk. Encrypted mode only.
 CRED_STORE_INITIALIZED=0
@@ -128,7 +128,7 @@ CRED_STORE_INITIALIZED=0
 # just what's there the next time Aulthium is launched. See the
 # "AUTO-UPDATE" functions below (autoupdate_worker and friends).
 AUTOUPDATE_URL="${AULTHIUM_UPDATE_URL:-}"
-AUTOUPDATE_ENABLED=1                                    # session toggle — 't> update on/off'
+AUTOUPDATE_ENABLED=1                                    # session toggle — 'a> update on/off'
 AUTOUPDATE_INTERVAL_SECS="${AULTHIUM_UPDATE_INTERVAL:-21600}"  # 6h between automatic checks
 AUTOUPDATE_STATE_DIR=""       # session-scoped scratch dir (lock/ready/error markers)
 AUTOUPDATE_LOCK_FILE=""
@@ -146,7 +146,7 @@ WORKSPACE_DIR=""
 
 # Global on/off switch for the y/N confirmation blocker in front of every
 # file-changing action, shell command, and MCP tool call. Defaults ON (1 =
-# ask first) since that's the safe behavior; 't> confirm off' flips this to
+# ask first) since that's the safe behavior; 'a> confirm off' flips this to
 # 0, at which point confirm_yes_no auto-approves everything instantly
 # instead of prompting. The action is still always PRINTED to the screen
 # either way — this only removes the "do you want to proceed?" gate, not
@@ -196,7 +196,7 @@ BUILTIN_PLUGIN_SOURCES_FETCHED=0
 
 # Set by plugin_install_github right before it calls plugin_install_from_url,
 # so the latter knows which repo to stamp into the installed plugin.json's
-# "_source" field (for later `t> plugin update`). Empty means "not a
+# "_source" field (for later `a> plugin update`). Empty means "not a
 # GitHub-tracked install" — plugin_install_from_url clears it back to empty
 # the moment it reads it, so a stale value never leaks into an unrelated call.
 PLUGIN_INSTALL_SOURCE_REPO=""
@@ -204,7 +204,7 @@ PLUGIN_INSTALL_SOURCE_REPO=""
 # Registry for "hook" plugins — plugins whose plugin.json sets
 # "mode": "hook" (e.g. better-websearch) instead of the default foreground
 # one (e.g. webchat). A hook plugin doesn't take over the terminal when
-# run: `t> plugin run <name>` just registers it here and hands control
+# run: `a> plugin run <name>` just registers it here and hands control
 # straight back to the normal "User>" prompt. It's invoked on-demand,
 # per call, at whatever hook point its manifest names — see
 # KNOWN_HOOK_POINTS below for the full list — instead of running
@@ -213,7 +213,7 @@ PLUGIN_INSTALL_SOURCE_REPO=""
 # All six arrays are keyed by plugin name and stay in lockstep — a name
 # is "running" iff it has an entry in RUNNING_PLUGIN_ENABLED. Session-only,
 # same as everything else here: nothing here survives a restart, so a
-# hook plugin needs `t> plugin run <name>` again after one.
+# hook plugin needs `a> plugin run <name>` again after one.
 declare -A RUNNING_PLUGIN_ENABLED=()      # name -> "on" | "off"
 declare -A RUNNING_PLUGIN_HOOK=()         # name -> hook point, e.g. "web_search"
 declare -A RUNNING_PLUGIN_ENTRY=()        # name -> manifest "entry" command
@@ -242,10 +242,19 @@ declare -A TOGGLE_PREFIX_TO_PLUGIN=()
 #   chat_pre    — see chat_pre_plugin_hook, called from send_chat
 KNOWN_HOOK_POINTS="web_search shell_exec file_action mcp_call chat_pre"
 
-# hook_name -> name of the plugin that currently owns it. Only one plugin
-# can own a given hook point at a time — see hook_claim_ownership for the
-# priority-based rule used when a second plugin wants the same point.
-declare -A HOOK_OWNER=()
+# hook_name -> space-separated list of plugin names currently registered
+# for that hook point, ordered highest-priority-first (ties keep whatever
+# order they were inserted in). Any number of plugins can share a single
+# hook point — there's no single "owner" anymore. Each *_plugin_hook
+# wrapper below walks this chain in order and decides what "multiple
+# plugins on one point" means for its own hook: web_search tries each in
+# turn and stops at the first success (a fallback chain); shell_exec,
+# file_action, and mcp_call run every active plugin in order and let any
+# one of them veto (a review chain, first veto wins); chat_pre threads the
+# message through every active plugin in order, each one seeing the
+# previous plugin's rewrite (a transform chain). See hook_chain_add /
+# hook_active_chain for the mechanics.
+declare -A HOOK_CHAIN=()
 
 # True (exit 0) iff $1 is one of KNOWN_HOOK_POINTS.
 hook_point_is_known() {
@@ -253,51 +262,83 @@ hook_point_is_known() {
   [[ "$h" == *" $1 "* ]]
 }
 
-# Attempts to give plugin $1 ownership of hook point $2 at priority $3
-# (integer; higher = stronger claim, default/undeclared is 0). If the
-# point is unclaimed, or already owned by $1 itself (re-registration),
-# takes it immediately. If owned by a different plugin:
-#   - equal or lower incumbent priority: the incumbent is stopped
-#     (plugin_stoprun) and $1 takes over, with a warning naming what
-#     was replaced — this is the original "last one in wins" behavior,
-#     now scoped to same-or-lower priority so a plugin that cares can
-#     opt out of being casually bumped by declaring a higher "priority"
-#     in its plugin.json.
-#   - strictly higher incumbent priority: refuses and warns; $1 does
-#     NOT take the point. Returns 1.
-# Callers (plugin_run, plugins_autostart) still need to set
-# RUNNING_PLUGIN_PRIORITY[$1] themselves after a successful claim.
-hook_claim_ownership() {
-  local name="$1" hook="$2" priority="${3:-0}" incumbent incumbent_priority
-  incumbent="${HOOK_OWNER[$hook]:-}"
-  if [[ -z "$incumbent" || "$incumbent" == "$name" ]]; then
-    HOOK_OWNER[$hook]="$name"
-    return 0
-  fi
-  incumbent_priority="${RUNNING_PLUGIN_PRIORITY[$incumbent]:-0}"
-  if (( priority < incumbent_priority )); then
-    warn "'$name' wants the $hook hook but '$incumbent' already holds it at a higher priority (${incumbent_priority} > ${priority}) — skipped."
-    return 1
-  fi
-  warn "Replacing '$incumbent' as the active $hook hook with '$name'."
-  plugin_stoprun "$incumbent"
-  HOOK_OWNER[$hook]="$name"
-  return 0
+# Places plugin $1 into hook point $2's chain, positioned by priority $3
+# (integer; higher runs earlier in the chain; default/undeclared is 0).
+# Ties keep existing relative order — a newcomer at the same priority as
+# an existing member goes in after it. If $1 is already in the chain (a
+# re-registration, e.g. `a> plugin run` on something already running),
+# it's removed and re-inserted at its (possibly new) priority rather than
+# duplicated. Unlike the old single-owner model, this never refuses and
+# never stops another plugin — every plugin that names a known hook point
+# gets a slot; priority only decides ordering within the chain, not
+# whether it's allowed to join it. Callers (plugin_run, plugins_autostart)
+# are expected to have already set RUNNING_PLUGIN_PRIORITY[$1], since
+# that's what existing members' positions are compared against.
+hook_chain_add() {
+  local name="$1" hook="$2" priority="${3:-0}"
+  hook_chain_remove "$name" "$hook"
+  local chain="${HOOK_CHAIN[$hook]:-}"
+  local -a members=() new_members=()
+  [[ -n "$chain" ]] && read -r -a members <<< "$chain"
+  local m inserted=0
+  for m in "${members[@]}"; do
+    if [[ "$inserted" -eq 0 ]] && (( priority > ${RUNNING_PLUGIN_PRIORITY[$m]:-0} )); then
+      new_members+=("$name")
+      inserted=1
+    fi
+    new_members+=("$m")
+  done
+  [[ "$inserted" -eq 0 ]] && new_members+=("$name")
+  HOOK_CHAIN[$hook]="${new_members[*]}"
 }
 
-# Releases whatever hook point $1 currently owns, if any. Called from
-# plugin_stoprun so a stopped plugin never leaves a dangling HOOK_OWNER
-# entry pointing at a name that's no longer running.
-hook_release_ownership() {
+# Removes plugin $1 from hook point $2's chain, if present. Called from
+# plugin_stoprun (via hook_chain_release) so a stopped plugin never leaves
+# a dangling HOOK_CHAIN entry for a name that's no longer running, and
+# from hook_chain_add itself so re-registering moves rather than
+# duplicates an entry.
+hook_chain_remove() {
+  local name="$1" hook="$2" chain="${HOOK_CHAIN[$hook]:-}"
+  [[ -n "$chain" ]] || return 0
+  local -a members=() new_members=()
+  read -r -a members <<< "$chain"
+  local m
+  for m in "${members[@]}"; do
+    [[ "$m" == "$name" ]] || new_members+=("$m")
+  done
+  if [[ "${#new_members[@]}" -eq 0 ]]; then
+    unset "HOOK_CHAIN[$hook]"
+  else
+    HOOK_CHAIN[$hook]="${new_members[*]}"
+  fi
+}
+
+# Releases whatever hook point plugin $1 is registered on, if any. Called
+# from plugin_stoprun.
+hook_chain_release() {
   local name="$1" hook="${RUNNING_PLUGIN_HOOK[$name]:-}"
-  [[ -n "$hook" && "${HOOK_OWNER[$hook]:-}" == "$name" ]] && unset "HOOK_OWNER[$hook]"
+  [[ -n "$hook" ]] && hook_chain_remove "$name" "$hook"
+}
+
+# Fills the global array HOOK_ACTIVE_CHAIN with the plugins currently
+# registered for hook point $1 that are ALSO toggled "on", preserving
+# priority order. A plugin that's registered but toggled off is skipped
+# silently — a hook point with nothing active in it (empty result here) means every
+# *_plugin_hook wrapper below falls through to its built-in behavior.
+hook_active_chain() {
+  local hook="$1" chain="${HOOK_CHAIN[$hook]:-}" m
+  HOOK_ACTIVE_CHAIN=()
+  [[ -n "$chain" ]] || return 0
+  for m in $chain; do
+    [[ "${RUNNING_PLUGIN_ENABLED[$m]:-off}" == "on" ]] && HOOK_ACTIVE_CHAIN+=("$m")
+  done
 }
 
 # Shells out to hook plugin $1's entry command with "$2..." appended as
 # individually shell-quoted arguments — the shared invocation core behind
 # every specific *_plugin_hook wrapper below (web_search_query_plugin_hook
 # has its own inline copy of this for historical reasons and is untouched).
-# Exports the same env a foreground `t> plugin run` gets (provider/model/
+# Exports the same env a foreground `a> plugin run` gets (provider/model/
 # key, config overrides, secrets only if the plugin's permissions include
 # "secrets") around the single call and cleans it up after, exactly like
 # plugin_toggle_prefix_forward does for its "<prefix>> ..." shorthand calls.
@@ -327,17 +368,6 @@ plugin_hook_call() {
   plugin_unset_config_env
   PLUGIN_EXPORT_SECRETS=0
   return $status
-}
-
-# True (0) iff hook point $1 currently has an owner that's also toggled on
-# — the common "is there actually anyone to call" guard shared by every
-# *_plugin_hook wrapper below, so a hook point with no plugin, or one
-# that's registered but toggled off, is indistinguishable to a call site
-# from "hook not active" without each of them re-deriving it.
-hook_point_is_active() {
-  local name="${HOOK_OWNER[$1]:-}"
-  [[ -n "$name" ]] || return 1
-  [[ "${RUNNING_PLUGIN_ENABLED[$name]:-off}" == "on" ]]
 }
 
 # In-memory conversation history only.
@@ -766,28 +796,28 @@ EOF
 }
 
 # Renders the "connected / model / sandbox" status panel shown at startup
-# and after 't> clear'. Centralized so both call sites always match.
+# and after 'a> clear'. Centralized so both call sites always match.
 status_panel() {
   printf "${C_ACCENT2}┌─ SESSION ─────────────────────────────────────${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET} %-10s ${C_OK}%s${C_RESET}\n" "provider" "$(provider_label) — connected"
   printf "${C_MUTED}│${C_RESET} %-10s %s\n" "model" "$CURRENT_MODEL"
   printf "${C_MUTED}│${C_RESET} %-10s %s\n" "sandbox" "$WORKSPACE_DIR"
   if [[ "${#MCP_NAMES[@]}" -gt 0 ]]; then
-    printf "${C_MUTED}│${C_RESET} %-10s %s\n" "mcp" "${#MCP_NAMES[@]} server(s) — t> mcp for details"
+    printf "${C_MUTED}│${C_RESET} %-10s %s\n" "mcp" "${#MCP_NAMES[@]} server(s) — a> mcp for details"
   fi
   if [[ -n "$MEMORY_FILE" ]]; then
     printf "${C_MUTED}│${C_RESET} %-10s %s\n" "memory" "connected — $MEMORY_FILE"
   fi
   if [[ "$SKIP_CONFIRMATIONS" -eq 1 ]]; then
-    printf "${C_MUTED}│${C_RESET} %-10s ${C_WARN}%s${C_RESET}\n" "confirm" "OFF — actions auto-run, no y/N asked (t> confirm on to re-enable)"
+    printf "${C_MUTED}│${C_RESET} %-10s ${C_WARN}%s${C_RESET}\n" "confirm" "OFF — actions auto-run, no y/N asked (a> confirm on to re-enable)"
   fi
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
-  printf "${C_MUTED}Type ${C_RESET}t> help${C_MUTED} for commands · ${C_RESET}Ctrl+C${C_MUTED} to exit${C_RESET}\n"
+  printf "${C_MUTED}Type ${C_RESET}a> help${C_MUTED} for commands · ${C_RESET}Ctrl+C${C_MUTED} to exit${C_RESET}\n"
   printf "${C_MUTED}While waiting on a reply: ${C_RESET}Ctrl+T${C_MUTED} cancel thinking · ${C_RESET}Ctrl+S${C_MUTED} stop prompt${C_RESET}\n\n"
 }
 
 # Clears the terminal and reprints the banner + status panel. This is what
-# 't> clear' runs, and it's also run automatically right after a model
+# 'a> clear' runs, and it's also run automatically right after a model
 # switch finishes (see apply_model_switch) so what's on screen afterward is
 # a clean session view showing the new model, not the picker's scrollback.
 run_clear_screen() {
@@ -797,7 +827,7 @@ run_clear_screen() {
 }
 
 # Finalizes a confirmed model switch: runs the same clear-screen-and-
-# reprint-status flow as 't> clear' FIRST, then announces the switch on
+# reprint-status flow as 'a> clear' FIRST, then announces the switch on
 # the now-clean screen — so the confirmation is the last thing printed and
 # actually stays visible, instead of being wiped by the clear that used to
 # come after it. Called from every model-picking path (tier picker, fuzzy
@@ -907,7 +937,7 @@ check_deps() {
   fi
 
   # base64 (coreutils) is required for OAuth PKCE (RFC 7636) and for
-  # encoding token-store contents — without it, "t> mcp add" can still add
+  # encoding token-store contents — without it, "a> mcp add" can still add
   # apikey/none-auth servers, but OAuth-based connections are disabled.
   HAVE_BASE64=1
   want_cmd base64 || HAVE_BASE64=0
@@ -1046,7 +1076,7 @@ autoupdate_worker() {
 }
 
 # Fires autoupdate_worker in the background if it's worth doing right now.
-# force=1 (from 't> update check') skips the time-based throttle; anything
+# force=1 (from 'a> update check') skips the time-based throttle; anything
 # else respects it. Never blocks: the network call happens entirely inside
 # the backgrounded subshell.
 autoupdate_check_async() {
@@ -1087,10 +1117,10 @@ autoupdate_poll() {
   AUTOUPDATE_NOTIFIED=1
   echo
   ok "Update v$v is downloaded and already in place — this session keeps running $APP_VERSION, untouched."
-  muted "Pick it up anytime: t> exit, then start Aulthium again."
+  muted "Pick it up anytime: a> exit, then start Aulthium again."
 }
 
-# 't> update' with no argument.
+# 'a> update' with no argument.
 autoupdate_status_cmd() {
   if [[ -z "$AUTOUPDATE_URL" ]]; then
     muted "Auto-update isn't configured — set AULTHIUM_UPDATE_URL to a raw URL of this"
@@ -1103,7 +1133,7 @@ autoupdate_status_cmd() {
     return 0
   fi
   if [[ "$AUTOUPDATE_ENABLED" -eq 0 ]]; then
-    warn "Auto-update is OFF for this session. Run 't> update on' to re-enable it."
+    warn "Auto-update is OFF for this session. Run 'a> update on' to re-enable it."
     return 0
   fi
 
@@ -1133,7 +1163,7 @@ confirm_yes_no() {
 # as opposed to one-off setup/config prompts (create workspace dir?, load
 # this memory file?, switch model/provider?), which always use plain
 # confirm_yes_no above and always ask regardless of this setting. Honors
-# the 't> confirm off' toggle: the action is still always printed to the
+# the 'a> confirm off' toggle: the action is still always printed to the
 # screen either way, this only decides whether the "do you want to
 # proceed?" gate actually waits for a y/N or auto-approves instantly.
 confirm_action() {
@@ -1145,19 +1175,19 @@ confirm_action() {
   confirm_yes_no "$prompt"
 }
 
-# 't> confirm' with no argument — reports the current state.
+# 'a> confirm' with no argument — reports the current state.
 confirm_status() {
   if [[ "$SKIP_CONFIRMATIONS" -eq 1 ]]; then
     warn "Confirmations are OFF — file writes/edits/deletes, folder actions, shell"
     warn "commands, and MCP tool calls all run immediately without asking first."
-    muted "Run 't> confirm on' to turn the y/N blocker back on."
+    muted "Run 'a> confirm on' to turn the y/N blocker back on."
   else
     ok "Confirmations are ON — every file/folder/shell/MCP action asks for a y/N first."
-    muted "Run 't> confirm off' to disable it (not recommended)."
+    muted "Run 'a> confirm off' to disable it (not recommended)."
   fi
 }
 
-# 't> confirm on' — always safe, no extra prompt needed to turn safety back on.
+# 'a> confirm on' — always safe, no extra prompt needed to turn safety back on.
 enable_confirmations() {
   if [[ "$SKIP_CONFIRMATIONS" -eq 0 ]]; then
     muted "Confirmations are already on."
@@ -1167,7 +1197,7 @@ enable_confirmations() {
   ok "Confirmations enabled — every action will ask for a y/N before running."
 }
 
-# 't> confirm off' — requires an explicit extra confirmation of its own
+# 'a> confirm off' — requires an explicit extra confirmation of its own
 # (via plain confirm_yes_no, which always asks regardless of this setting)
 # since this is the one toggle that removes every other safety gate at once.
 disable_confirmations() {
@@ -1183,7 +1213,7 @@ disable_confirmations() {
   if confirm_yes_no "Are you sure you want to disable confirmations?"; then
     SKIP_CONFIRMATIONS=1
     ok "Confirmations disabled. Actions will now run automatically."
-    muted "Run 't> confirm on' anytime to turn the blocker back on."
+    muted "Run 'a> confirm on' anytime to turn the blocker back on."
   else
     muted "Cancelled — confirmations remain on."
   fi
@@ -1374,7 +1404,7 @@ init_history() {
 # file (see memory_append_message_to_file) — so nothing is lost even when
 # check_chat_limit trims the in-memory context to stay under the local
 # guardrail below. Reconnect to (or resume) any such file with
-# 't> memory connect <file_path>'.
+# 'a> memory connect <file_path>'.
 MEMORY_FILE=""
 
 append_message() {
@@ -1471,7 +1501,7 @@ memory_load_file() {
   MEMORY_FILE="$saved_memory_file"
 }
 
-# 't> memory connect <file_path>' — an existing file is offered for loading
+# 'a> memory connect <file_path>' — an existing file is offered for loading
 # (replacing the live conversation) or left alone and just appended to from
 # here on; a new path gets created with the current conversation as its
 # starting content. Either way MEMORY_FILE ends up pointed at it, so every
@@ -1479,7 +1509,7 @@ memory_load_file() {
 memory_connect() {
   local path="$1" abs
   if [[ -z "$path" ]]; then
-    warn "Usage: t> memory connect <file_path>"
+    warn "Usage: a> memory connect <file_path>"
     return 1
   fi
 
@@ -1517,9 +1547,9 @@ memory_disconnect() {
 memory_status() {
   if [[ -n "$MEMORY_FILE" ]]; then
     ok "Connected to: $MEMORY_FILE"
-    muted "Every turn is appended there automatically. t> memory disconnect to stop."
+    muted "Every turn is appended there automatically. a> memory disconnect to stop."
   else
-    muted "Not connected to a file. t> memory connect <file_path> to start (or reconnect to an old one)."
+    muted "Not connected to a file. a> memory connect <file_path> to start (or reconnect to an old one)."
   fi
 }
 
@@ -1567,7 +1597,7 @@ check_chat_limit() {
       init_history
       append_message "assistant" "(Earlier conversation archived to $(basename "$saved_path") in the sandbox. Continuing with a clean context — ask if you need something from before.)"
       ok "History saved to $saved_path and connected."
-      muted "Every turn from here is appended there automatically. Reload it anytime with: t> memory connect $saved_path"
+      muted "Every turn from here is appended there automatically. Reload it anytime with: a> memory connect $saved_path"
     else
       err "Could not save history — continuing without archiving."
     fi
@@ -1580,54 +1610,54 @@ check_chat_limit() {
 show_help() {
   echo
   printf "${C_ACCENT2}┌─ COMMANDS ────────────────────────────────────${C_RESET}\n"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> help" "show this menu"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> provider" "switch between OpenRouter, Google AI Studio, or Other"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> key" "change the API key for the current provider"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model" "open the model picker (choose Free or Paid first)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> model <name>" "switch to a model by name (confirmation required)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> current" "show current provider and model"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir" "show the current sandbox folder"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir <path>" "change the sandbox folder"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp" "list connected MCP servers and their tools"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp add <n> <url>" "connect a remote MCP server (API key or none)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp oauth <n> <url>" "connect via OAuth 2.1 + PKCE (opens your browser)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp remove <name>" "disconnect an MCP server"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp refresh [name]" "re-discover tools (one server, or all)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp cloudflare" "quick-pick from Cloudflare's managed MCP servers"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp github" "quick-connect to GitHub's official remote MCP server"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp cred ..." "encrypt on/off | clear — manage stored OAuth tokens"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin" "list installed plugins"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run <name>" "launch a plugin (needs a y/N permissions grant)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run --stoprun <n>" "fully stop/de-register a running hook plugin"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin toggle <n> <s>" "turn a running hook plugin on/off without stopping it"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin info <name>" "show a plugin's manifest, effective config, and integrity"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin config <name>" "view/set/unset a plugin's local config overrides"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin verify <name>" "check installed files against the hash recorded at install"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin install <p>" "install from a folder, github:owner/repo, or a zip URL"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin update [name]" "check (and confirm) GitHub-sourced plugins for updates"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin remove <name>" "delete an installed plugin (needs y/N confirmation)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory" "show whether a history file is connected"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory connect <p>" "connect/reconnect a history file (load or start it)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> memory disconnect" "stop appending turns to the connected file"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm" "show whether the y/N action blocker is on or off"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm on" "require y/N before every file/shell/MCP action (default)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> confirm off" "auto-approve every action instantly (no more asking)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> undo" "reverse the last file/folder/zip/network change"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> redo" "re-apply the last change you undid"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> clear" "clear the terminal"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> reset" "start a new conversation"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> history" "show chat history"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> update" "show auto-update status"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> update check" "check for an update now (runs in background, non-blocking)"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> update on|off" "toggle background auto-update checks for this session"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> exit" "exit Aulthium"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> help" "show this menu"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> provider" "switch between OpenRouter, Google AI Studio, or Other"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> key" "change the API key for the current provider"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> model" "open the model picker (choose Free or Paid first)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> model <name>" "switch to a model by name (confirmation required)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> current" "show current provider and model"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> workdir" "show the current sandbox folder"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> workdir <path>" "change the sandbox folder"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp" "list connected MCP servers and their tools"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp add <n> <url>" "connect a remote MCP server (API key or none)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp oauth <n> <url>" "connect via OAuth 2.1 + PKCE (opens your browser)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp remove <name>" "disconnect an MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp refresh [name]" "re-discover tools (one server, or all)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp cloudflare" "quick-pick from Cloudflare's managed MCP servers"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp github" "quick-connect to GitHub's official remote MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp cred ..." "encrypt on/off | clear — manage stored OAuth tokens"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin" "list installed plugins"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin run <name>" "launch a plugin (needs a y/N permissions grant)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin run --stoprun <n>" "fully stop/de-register a running hook plugin"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin toggle <n> <s>" "turn a running hook plugin on/off without stopping it"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin info <name>" "show a plugin's manifest, effective config, and integrity"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin config <name>" "view/set/unset a plugin's local config overrides"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin verify <name>" "check installed files against the hash recorded at install"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin install <p>" "install from a folder, github:owner/repo, or a zip URL"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin update [name]" "check (and confirm) GitHub-sourced plugins for updates"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin remove <name>" "delete an installed plugin (needs y/N confirmation)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> memory" "show whether a history file is connected"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> memory connect <p>" "connect/reconnect a history file (load or start it)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> memory disconnect" "stop appending turns to the connected file"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> confirm" "show whether the y/N action blocker is on or off"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> confirm on" "require y/N before every file/shell/MCP action (default)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> confirm off" "auto-approve every action instantly (no more asking)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> undo" "reverse the last file/folder/zip/network change"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> redo" "re-apply the last change you undid"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> clear" "clear the terminal"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> reset" "start a new conversation"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> history" "show chat history"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> update" "show auto-update status"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> update check" "check for an update now (runs in background, non-blocking)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> update on|off" "toggle background auto-update checks for this session"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> exit" "exit Aulthium"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
   printf "\n${C_MUTED}Chat: type any normal message at the ${C_RESET}User>${C_MUTED} prompt.${C_RESET}\n"
   printf "${C_MUTED}If the conversation gets very long, you'll be asked once whether to save it to\n"
   printf "a file and connect to it, or trim the oldest turns instead. Once connected, every\n"
   printf "turn is appended there automatically and you won't be asked again — reload that\n"
-  printf "file anytime (this session or a future one) with ${C_RESET}t> memory connect <path>${C_MUTED}.${C_RESET}\n"
+  printf "file anytime (this session or a future one) with ${C_RESET}a> memory connect <path>${C_MUTED}.${C_RESET}\n"
 
   printf "\n${C_MUTED}While a reply is in progress:${C_RESET}\n"
   printf "${C_MUTED}  ${C_RESET}Ctrl+T${C_MUTED}  cancel thinking — abort just the current network call.${C_RESET}\n"
@@ -1651,7 +1681,7 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       zip/unzip an archive, or make a network request/download —\n"
   printf "${C_MUTED}│${C_RESET}       every one of these is shown to you and needs a yes/no\n"
   printf "${C_MUTED}│${C_RESET}       confirmation first. File/folder/zip/network-download\n"
-  printf "${C_MUTED}│${C_RESET}       changes can be undone with 't> undo' (redo with 't> redo').\n"
+  printf "${C_MUTED}│${C_RESET}       changes can be undone with 'a> undo' (redo with 'a> redo').\n"
   printf "${C_MUTED}│${C_RESET}       Network requests reach the real internet; everything else\n"
   printf "${C_MUTED}│${C_RESET}       never touches anything outside the sandbox folder.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
@@ -1665,7 +1695,7 @@ show_help() {
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
   printf "\n${C_ACCENT2}┌─ MCP TOOLS ───────────────────────────────────${C_RESET}\n"
-  printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_MCP}${C_RESET}      connect a remote MCP server with ${C_RESET}t> mcp add\n"
+  printf "${C_MUTED}│${C_RESET} ${C_OK}${ICON_MCP}${C_RESET}      connect a remote MCP server with ${C_RESET}a> mcp add\n"
   printf "${C_MUTED}│${C_RESET}       <name> <url>${C_MUTED} — its tools are discovered immediately\n"
   printf "${C_MUTED}│${C_RESET}       and folded into what the agent can call. Unlike the\n"
   printf "${C_MUTED}│${C_RESET}       read-only file/search tools, calling one needs a\n"
@@ -1676,11 +1706,11 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       MCP_SERVERS env var: name1=url1,name2=url2 — with an\n"
   printf "${C_MUTED}│${C_RESET}       optional key for each in MCP_<NAME>_KEY.\n"
   printf "${C_MUTED}│${C_RESET}\n"
-  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> mcp cloudflare${C_MUTED} quick-picks from Cloudflare's own\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}a> mcp cloudflare${C_MUTED} quick-picks from Cloudflare's own\n"
   printf "${C_MUTED}│${C_RESET}       managed MCP servers (docs, Workers bindings, Radar, AI\n"
   printf "${C_MUTED}│${C_RESET}       Gateway, ...) by name instead of typing out a URL — once\n"
   printf "${C_MUTED}│${C_RESET}       added they're ordinary MCP servers like any other.\n"
-  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> mcp github${C_MUTED} quick-connects to GitHub's official\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}a> mcp github${C_MUTED} quick-connects to GitHub's official\n"
   printf "${C_MUTED}│${C_RESET}       remote MCP server (repos, issues, PRs, Actions, ...) via\n"
   printf "${C_MUTED}│${C_RESET}       a personal access token or browser OAuth.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
@@ -1696,21 +1726,26 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       Built-in plugins aren't bundled in this script — they're\n"
   printf "${C_MUTED}│${C_RESET}       discovered live from github.com/%s\n" "$BUILTIN_PLUGINS_REPO"
   printf "${C_MUTED}│${C_RESET}       (path: %s), so what's available can\n" "$BUILTIN_PLUGINS_PATH"
-  printf "${C_MUTED}│${C_RESET}       change without a script update. See ${C_RESET}t> plugin list${C_MUTED}\n"
-  printf "${C_MUTED}│${C_RESET}       for the current set — ${C_RESET}t> plugin run <name>${C_MUTED} fetches\n"
+  printf "${C_MUTED}│${C_RESET}       change without a script update. See ${C_RESET}a> plugin list${C_MUTED}\n"
+  printf "${C_MUTED}│${C_RESET}       for the current set — ${C_RESET}a> plugin run <name>${C_MUTED} fetches\n"
   printf "${C_MUTED}│${C_RESET}       one from GitHub the first time, and\n"
-  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> plugin update <name>${C_MUTED} checks for a newer release.\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}a> plugin update <name>${C_MUTED} checks for a newer release.\n"
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET}       Write your own by reading BUILD_PLUGIN.md, then\n"
-  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> plugin install <folder|github:owner/repo|url>${C_MUTED}.\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}a> plugin install <folder|github:owner/repo|url>${C_MUTED}.\n"
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET}       A \"hook\" plugin (${C_RESET}\"mode\": \"hook\"${C_MUTED} in its manifest)\n"
   printf "${C_MUTED}│${C_RESET}       registers for one hook point and is invoked on-demand\n"
   printf "${C_MUTED}│${C_RESET}       instead of taking over the terminal. Known hook points:\n"
   printf "${C_MUTED}│${C_RESET}       %s\n" "$KNOWN_HOOK_POINTS"
-  printf "${C_MUTED}│${C_RESET}       Only one plugin can own a given point at a time — an\n"
-  printf "${C_MUTED}│${C_RESET}       optional integer ${C_RESET}\"priority\"${C_MUTED} in plugin.json (default 0)\n"
-  printf "${C_MUTED}│${C_RESET}       decides who wins if two plugins want the same one.\n"
+  printf "${C_MUTED}│${C_RESET}       Multiple plugins can run on the same hook point at once —\n"
+  printf "${C_MUTED}│${C_RESET}       an optional integer ${C_RESET}\"priority\"${C_MUTED} in plugin.json (default 0)\n"
+  printf "${C_MUTED}│${C_RESET}       decides where each one sits in the chain (higher runs\n"
+  printf "${C_MUTED}│${C_RESET}       first, ties keep registration order). What \"multiple\"\n"
+  printf "${C_MUTED}│${C_RESET}       means depends on the hook: web_search tries each until\n"
+  printf "${C_MUTED}│${C_RESET}       one succeeds; shell_exec/file_action/mcp_call let any one\n"
+  printf "${C_MUTED}│${C_RESET}       of them veto; chat_pre threads the message through all of\n"
+  printf "${C_MUTED}│${C_RESET}       them in turn. ${C_RESET}a> plugin${C_MUTED} shows each plugin's chain position.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
 }
 
@@ -1739,7 +1774,7 @@ show_history() {
 # toggling between tiers in the model picker (free -> back -> paid -> back
 # -> free...) doesn't re-download the same multi-hundred-KB /models response
 # over and over inside one session. Short TTL — long enough to cover a user
-# bouncing between tiers a few times, short enough that a real 't> mcp
+# bouncing between tiers a few times, short enough that a real 'a> mcp
 # refresh'-style manual retry (or just waiting) still gets fresh data.
 OPENROUTER_MODELS_CACHE_FILE=""
 OPENROUTER_MODELS_CACHE_TIME=0
@@ -1863,7 +1898,7 @@ confirm_model_switch() {
   [[ "$ans" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
 }
 
-# Entry point for "t> provider". Always shows both options and always
+# Entry point for "a> provider". Always shows both options and always
 # blocks on an explicit confirmation before actually switching — same
 # pattern as the model picker. Switching providers also resets the current
 # model to a sensible default for the new backend (OpenRouter and Google
@@ -2041,7 +2076,7 @@ pick_provider_ui() {
         ok "Switched provider to: $(provider_label)"
         if ! ensure_provider_key; then
           warn "No API key provided — chats will fail until you set one."
-          muted "Run 't> key' to set it."
+          muted "Run 'a> key' to set it."
         fi
       else
         muted "Cancelled."
@@ -2078,11 +2113,11 @@ pick_provider_ui() {
   esac
   CURRENT_MODEL_LABEL="$CURRENT_MODEL"
   ok "Switched provider to: $new_label"
-  muted "Model reset to $CURRENT_MODEL — use 't> model' to pick a different one."
+  muted "Model reset to $CURRENT_MODEL — use 'a> model' to pick a different one."
 
   if ! ensure_provider_key; then
     warn "No $new_label API key provided — chats will fail until you set one."
-    muted "Run 't> provider' again, or 't> model', to be prompted for it."
+    muted "Run 'a> provider' again, or 'a> model', to be prompted for it."
   fi
 }
 
@@ -2260,7 +2295,7 @@ pick_model_from_tier() {
   done
 }
 
-# Entry point for the "t> model" command.
+# Entry point for the "a> model" command.
 # - OpenRouter: always asks Free-or-Paid first, then hands off to
 #   pick_model_from_tier, which itself always confirms before committing a
 #   switch. 'back' from the tier list returns here so the user can pick a
@@ -2395,7 +2430,7 @@ set_model_by_name() {
   if [[ "$count" -gt 1 ]]; then
     echo "$fuzzy_match"
     echo
-    warn "More than one match. Use 't> model' to pick one."
+    warn "More than one match. Use 'a> model' to pick one."
     rm -f "$free_tmp" "$paid_tmp"
     return 1
   fi
@@ -2469,7 +2504,7 @@ set_model_by_name_google() {
   if [[ "$count" -gt 1 ]]; then
     echo "$fuzzy_match"
     echo
-    warn "More than one match. Use 't> model' to pick one."
+    warn "More than one match. Use 'a> model' to pick one."
     rm -f "$models_tmp"
     return 1
   fi
@@ -2493,7 +2528,7 @@ set_model_by_name_google() {
 #   move     — a = where the item currently is, b = where to move it back to
 # A single logical action (one marker, or one whole BULK_*/ZIP_EXTRACT
 # block) is wrapped in undo_group_begin/undo_group_end so all its entries
-# share one group id — one 't> undo' reverts the whole batch together.
+# share one group id — one 'a> undo' reverts the whole batch together.
 # Undo and redo are the same operation aimed at opposite stacks: applying
 # an entry first snapshots whatever it's about to overwrite and pushes
 # THAT as the inverse onto the other stack, so flipping back and forth
@@ -2565,7 +2600,7 @@ push_undo() {
 # Snapshots the CURRENT state of $1 and records an undo entry that would
 # restore exactly that state. Call this BEFORE mutating $1 (write, edit,
 # delete, or overwrite-on-move). $2 is the human label shown in
-# 't> undo'/'t> redo' output (usually the workspace-relative path).
+# 'a> undo'/'a> redo' output (usually the workspace-relative path).
 snapshot_before_change() {
   local abs="$1" label="$2" desc
   desc="$(_snapshot_path "$abs")"
@@ -2677,28 +2712,33 @@ undo_status() {
 }
 
 
-# If a "file_action" hook plugin is registered and toggled on, gives it a
-# look at a pending file mutation before the user is even asked to confirm
-# it. Entry is invoked as: <entry> file_action <action> <path>, where
-# action is one of write/edit/create-folder/delete-file/delete-folder (see
-# KNOWN_HOOK_POINTS comment for which call sites this does and doesn't
-# cover). UNLIKE web_search's hook, a non-zero exit here is a deliberate
-# VETO, not "the hook failed" — there's no built-in file-review behavior
-# to fall back to, so silence/success (exit 0) is the only way to mean
-# "allow". Sets FILE_ACTION_HOOK_VETO_REASON to the plugin's stdout (or a
-# generic fallback if it printed nothing) when it vetoes. No hook
-# registered, or one that's toggled off, always allows (returns 0) — a
-# missing hook plugin should never block ordinary file actions.
+# If one or more "file_action" hook plugins are registered and toggled
+# on, gives EACH of them (in priority order) a look at a pending file
+# mutation before the user is even asked to confirm it, stopping at the
+# first one that objects. Entry is invoked as: <entry> file_action
+# <action> <path>, where action is one of write/edit/create-folder/
+# delete-file/delete-folder (see KNOWN_HOOK_POINTS comment for which call
+# sites this does and doesn't cover). UNLIKE web_search's hook, a
+# non-zero exit here is a deliberate VETO, not "the hook failed" —
+# there's no built-in file-review behavior to fall back to, so silence/
+# success (exit 0) from every plugin in the chain is the only way to mean
+# "allow". Sets FILE_ACTION_HOOK_VETO_REASON (and FILE_ACTION_HOOK_VETO_BY,
+# the vetoing plugin's name) when one vetoes. No plugins registered, or
+# all toggled off, always allows (returns 0) — an empty or inactive chain
+# should never block ordinary file actions.
 file_action_plugin_hook() {
   local action="$1" path="$2" name
-  hook_point_is_active "file_action" || return 0
-  name="${HOOK_OWNER[file_action]}"
+  hook_active_chain "file_action"
+  [[ "${#HOOK_ACTIVE_CHAIN[@]}" -gt 0 ]] || return 0
 
-  if plugin_hook_call "$name" "file_action" "$action" "$path"; then
-    return 0
-  fi
-  FILE_ACTION_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT:-'$name' declined this action without a reason}"
-  return 1
+  for name in "${HOOK_ACTIVE_CHAIN[@]}"; do
+    if ! plugin_hook_call "$name" "file_action" "$action" "$path"; then
+      FILE_ACTION_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT:-'$name' declined this action without a reason}"
+      FILE_ACTION_HOOK_VETO_BY="$name"
+      return 1
+    fi
+  done
+  return 0
 }
 
 handle_write_action() {
@@ -2707,7 +2747,7 @@ handle_write_action() {
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe write proposal: $rel"; return; }
 
   if ! file_action_plugin_hook "write" "$abs"; then
-    warn "Skipped write: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    warn "Skipped write: $rel (blocked by hook plugin '$FILE_ACTION_HOOK_VETO_BY' — $FILE_ACTION_HOOK_VETO_REASON)"
     return
   fi
 
@@ -2755,7 +2795,7 @@ handle_edit_action() {
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe edit proposal: $rel"; return; }
 
   if ! file_action_plugin_hook "edit" "$abs"; then
-    warn "Skipped edit: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    warn "Skipped edit: $rel (blocked by hook plugin '$FILE_ACTION_HOOK_VETO_BY' — $FILE_ACTION_HOOK_VETO_REASON)"
     return
   fi
 
@@ -2849,7 +2889,7 @@ handle_folder_create_action() {
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe folder proposal: $rel"; return; }
 
   if ! file_action_plugin_hook "create-folder" "$abs"; then
-    warn "Skipped folder creation: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    warn "Skipped folder creation: $rel (blocked by hook plugin '$FILE_ACTION_HOOK_VETO_BY' — $FILE_ACTION_HOOK_VETO_REASON)"
     return
   fi
 
@@ -2886,7 +2926,7 @@ handle_delete_action() {
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe delete proposal: $rel"; return; }
 
   if ! file_action_plugin_hook "delete-file" "$abs"; then
-    warn "Skipped delete: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    warn "Skipped delete: $rel (blocked by hook plugin '$FILE_ACTION_HOOK_VETO_BY' — $FILE_ACTION_HOOK_VETO_REASON)"
     return
   fi
 
@@ -3115,7 +3155,7 @@ handle_folder_delete_action() {
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe folder delete proposal: $rel"; return; }
 
   if ! file_action_plugin_hook "delete-folder" "$abs"; then
-    warn "Skipped folder delete: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    warn "Skipped folder delete: $rel (blocked by hook plugin '$FILE_ACTION_HOOK_VETO_BY' — $FILE_ACTION_HOOK_VETO_REASON)"
     return
   fi
 
@@ -3142,7 +3182,7 @@ handle_folder_delete_action() {
   box_line "$abs"
   box_line "${C_DIM}contains $entry_count item(s), all of which will be removed${C_RESET}"
   box_bottom "$C_ERR"
-  warn "This deletes the folder AND everything inside it (run 't> undo' to reverse it)."
+  warn "This deletes the folder AND everything inside it (run 'a> undo' to reverse it)."
 
   if confirm_action "Delete this folder and everything inside it?"; then
     undo_group_begin
@@ -3308,7 +3348,7 @@ handle_bulk_delete_action() {
     fi
   done
   box_bottom "$C_ERR"
-  warn "This deletes every item listed above (run 't> undo' to reverse it)."
+  warn "This deletes every item listed above (run 'a> undo' to reverse it)."
 
   if confirm_action "Delete all $n item(s)?"; then
     undo_group_begin
@@ -4512,58 +4552,66 @@ web_search_query_scrape_ddglite() {
   format_search_results titles urls snippets
 }
 
-# If a "web_search" hook plugin (e.g. better-websearch) is currently
-# registered AND toggled on, shells out to its entry command with the
-# query as its argument and uses whatever it prints as the result body
-# instead of the built-in SearXNG/DDG chain. Returns 1 (with
-# WEB_SEARCH_LAST_ERROR set) if no such plugin is active, it's toggled
-# off, or it ran but failed/returned nothing — either way the caller
-# (web_search_query) falls through to the normal providers, so a flaky or
-# disabled hook plugin never blocks search outright.
+# If one or more "web_search" hook plugins (e.g. better-websearch) are
+# currently registered AND toggled on, tries them in priority order,
+# shelling out to each entry command with the query as its argument and
+# using whatever the first one to succeed prints as the result body —
+# instead of the built-in SearXNG/DDG chain. A plugin that errors or
+# returns nothing is skipped in favor of the next one in the chain, same
+# as the old single-plugin fallback did against the built-in providers.
+# Returns 1 (with WEB_SEARCH_LAST_ERROR set) if no plugin is active or
+# every active one failed — either way the caller (web_search_query)
+# falls through to the normal providers, so a flaky or disabled chain
+# never blocks search outright.
 web_search_query_plugin_hook() {
   local query="$1" name dir entry output status
-  name="${HOOK_OWNER[web_search]:-}"
-  [[ -n "$name" ]] || return 1
-  [[ "${RUNNING_PLUGIN_ENABLED[$name]:-off}" == "on" ]] || {
-    WEB_SEARCH_LAST_ERROR="hook plugin '$name' is installed but toggled off (t> plugin toggle $name on to re-enable)."
-    return 1
-  }
-
-  dir="${RUNNING_PLUGIN_DIR[$name]}"
-  entry="${RUNNING_PLUGIN_ENTRY[$name]}"
-  # Same env a foreground plugin_run gets (provider/model/key etc) — a
-  # hook plugin is invoked fresh on every call, not left running, so this
-  # has to happen (and be cleaned up) around each individual call rather
-  # than once at 't> plugin run' time. Secrets gating mirrors plugin_run:
-  # the live API key only goes out if this plugin declared "secrets" in
-  # its permissions (approved back when it was registered via t> plugin run).
-  local _perm_list
-  _perm_list="$(jq -r '.permissions // [] | join(" ")' "$dir/plugin.json" 2>/dev/null)"
-  [[ " $_perm_list " == *" secrets "* ]] && PLUGIN_EXPORT_SECRETS=1 || PLUGIN_EXPORT_SECRETS=0
-  plugin_export_env
-  plugin_export_config_env "$name" "$dir"
-  output="$(cd "$dir" && eval "$entry" "$(printf '%q' "$query")" 2>/dev/null)"
-  status=$?
-  unset AULTHIUM_API_KEY AULTHIUM_API_URL AULTHIUM_API_KIND AULTHIUM_PROVIDER \
-        AULTHIUM_PROVIDER_LABEL AULTHIUM_MODEL AULTHIUM_WORKSPACE_DIR \
-        AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
-        AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
-        AULTHIUM_SHELL_TIMEOUT_SECS
-  plugin_unset_config_env
-  PLUGIN_EXPORT_SECRETS=0
-
-  if [[ $status -ne 0 || -z "$output" ]]; then
-    WEB_SEARCH_LAST_ERROR="hook plugin '$name' failed or returned nothing (exit $status)."
+  hook_active_chain "web_search"
+  if [[ "${#HOOK_ACTIVE_CHAIN[@]}" -eq 0 ]]; then
+    WEB_SEARCH_LAST_ERROR="no web_search hook plugin is registered and toggled on."
     return 1
   fi
 
-  # Drop the plugin's own "Searching for: ..." preamble line (and the
-  # blank line after it) if present — handle_web_search_action already
-  # shows the query above the results box, so it'd just be repeated.
-  output="$(printf '%s\n' "$output" | sed '/^Searching for: /d' | sed '/./,$!d')"
+  local -a errs=()
+  for name in "${HOOK_ACTIVE_CHAIN[@]}"; do
+    dir="${RUNNING_PLUGIN_DIR[$name]}"
+    entry="${RUNNING_PLUGIN_ENTRY[$name]}"
+    # Same env a foreground plugin_run gets (provider/model/key etc) — a
+    # hook plugin is invoked fresh on every call, not left running, so this
+    # has to happen (and be cleaned up) around each individual call rather
+    # than once at 'a> plugin run' time. Secrets gating mirrors plugin_run:
+    # the live API key only goes out if this plugin declared "secrets" in
+    # its permissions (approved back when it was registered via a> plugin run).
+    local _perm_list
+    _perm_list="$(jq -r '.permissions // [] | join(" ")' "$dir/plugin.json" 2>/dev/null)"
+    [[ " $_perm_list " == *" secrets "* ]] && PLUGIN_EXPORT_SECRETS=1 || PLUGIN_EXPORT_SECRETS=0
+    plugin_export_env
+    plugin_export_config_env "$name" "$dir"
+    output="$(cd "$dir" && eval "$entry" "$(printf '%q' "$query")" 2>/dev/null)"
+    status=$?
+    unset AULTHIUM_API_KEY AULTHIUM_API_URL AULTHIUM_API_KIND AULTHIUM_PROVIDER \
+          AULTHIUM_PROVIDER_LABEL AULTHIUM_MODEL AULTHIUM_WORKSPACE_DIR \
+          AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
+          AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
+          AULTHIUM_SHELL_TIMEOUT_SECS
+    plugin_unset_config_env
+    PLUGIN_EXPORT_SECRETS=0
 
-  FORMAT_SEARCH_RESULT="SEARCH RESULTS (via plugin '$name')"$'\n\n'"$output"
-  return 0
+    if [[ $status -ne 0 || -z "$output" ]]; then
+      errs+=("'$name' failed or returned nothing (exit $status)")
+      continue
+    fi
+
+    # Drop the plugin's own "Searching for: ..." preamble line (and the
+    # blank line after it) if present — handle_web_search_action already
+    # shows the query above the results box, so it'd just be repeated.
+    output="$(printf '%s\n' "$output" | sed '/^Searching for: /d' | sed '/./,$!d')"
+
+    FORMAT_SEARCH_RESULT="SEARCH RESULTS (via plugin '$name')"$'\n\n'"$output"
+    return 0
+  done
+
+  WEB_SEARCH_LAST_ERROR="every web_search hook plugin failed — $(IFS='; '; echo "${errs[*]}")"
+  return 1
 }
 
 # Dispatcher: the active "web_search" hook plugin (if any) gets first
@@ -4763,7 +4811,7 @@ mcp_resolve_key() {
   if [[ "$auth_type" == "oauth" ]]; then
     tok="$(oauth_get_valid_token "${MCP_OAUTH_CRED_IDS[$idx]}")"; rc=$?
     if [[ $rc -eq 2 ]]; then
-      warn "OAuth session for \"${MCP_NAMES[$idx]}\" has expired and can't be refreshed — run: t> mcp oauth ${MCP_NAMES[$idx]} ${MCP_URLS[$idx]}"
+      warn "OAuth session for \"${MCP_NAMES[$idx]}\" has expired and can't be refreshed — run: a> mcp oauth ${MCP_NAMES[$idx]} ${MCP_URLS[$idx]}"
       return 1
     fi
     [[ $rc -ne 0 ]] && return 1
@@ -4821,8 +4869,8 @@ mcp_connect_server() {
 }
 
 # Pushes a new server into the parallel arrays and connects it — the shared
-# tail end of every "add a server" path (manual t> mcp add, MCP_SERVERS
-# bootstrap, the Cloudflare quick-pick below, and now t> mcp oauth), so
+# tail end of every "add a server" path (manual a> mcp add, MCP_SERVERS
+# bootstrap, the Cloudflare quick-pick below, and now a> mcp oauth), so
 # they can't drift out of sync with each other. auth_type/oauth_cred_id
 # default to the pre-OAuth "apikey"/"" shape so every existing call site
 # above keeps working unchanged. Returns mcp_connect_server's status.
@@ -4841,13 +4889,13 @@ mcp_register_server() {
   mcp_connect_server "$idx"
 }
 
-# 't> mcp add <name> <url>' — validates the name, prompts for an API key
+# 'a> mcp add <name> <url>' — validates the name, prompts for an API key
 # (skipped if MCP_<NAME>_KEY is already set), connects immediately, and
 # resets the conversation so the new tools are visible in the system prompt.
 mcp_add_server() {
   local name="$1" url="$2" key_var key entered
   if [[ -z "$name" || -z "$url" ]]; then
-    warn "Usage: t> mcp add <name> <url>"
+    warn "Usage: a> mcp add <name> <url>"
     return 1
   fi
   if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
@@ -4855,7 +4903,7 @@ mcp_add_server() {
     return 1
   fi
   if mcp_find_index "$name" >/dev/null; then
-    warn "A server named \"$name\" is already configured — 't> mcp remove $name' first to replace it."
+    warn "A server named \"$name\" is already configured — 'a> mcp remove $name' first to replace it."
     return 1
   fi
 
@@ -4873,7 +4921,7 @@ mcp_add_server() {
   fi
 }
 
-# 't> mcp oauth <name> <url>' — same shape as 't> mcp add' but authenticates
+# 'a> mcp oauth <name> <url>' — same shape as 'a> mcp add' but authenticates
 # via the generic OAuth 2.1 + PKCE flow (oauth_run_flow) instead of a
 # static bearer key. The resulting tokens are stored under a fresh
 # credential id (not the server name — see MCP_OAUTH_CRED_IDS comment)
@@ -4881,7 +4929,7 @@ mcp_add_server() {
 mcp_add_server_oauth() {
   local name="$1" url="$2" cred_id token_json
   if [[ -z "$name" || -z "$url" ]]; then
-    warn "Usage: t> mcp oauth <name> <url>"
+    warn "Usage: a> mcp oauth <name> <url>"
     return 1
   fi
   if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
@@ -4889,7 +4937,7 @@ mcp_add_server_oauth() {
     return 1
   fi
   if mcp_find_index "$name" >/dev/null; then
-    warn "A server named \"$name\" is already configured — 't> mcp remove $name' first to replace it."
+    warn "A server named \"$name\" is already configured — 'a> mcp remove $name' first to replace it."
     return 1
   fi
   if [[ "${HAVE_BASE64:-1}" -eq 0 ]]; then
@@ -4949,7 +4997,7 @@ mcp_refresh_server() {
 mcp_refresh_all() {
   local i
   if [[ "${#MCP_NAMES[@]}" -eq 0 ]]; then
-    muted "No MCP servers configured yet — t> mcp add <name> <url>"
+    muted "No MCP servers configured yet — a> mcp add <name> <url>"
     return 0
   fi
   for i in "${!MCP_NAMES[@]}"; do
@@ -4962,7 +5010,7 @@ mcp_refresh_all() {
 mcp_list_servers() {
   local i name url count
   if [[ "${#MCP_NAMES[@]}" -eq 0 ]]; then
-    muted "No MCP servers configured. Add one with: t> mcp add <name> <url>"
+    muted "No MCP servers configured. Add one with: a> mcp add <name> <url>"
     return 0
   fi
   box_top "MCP SERVERS" "$ICON_MCP" "$C_ACCENT2"
@@ -5039,7 +5087,7 @@ mcp_bootstrap_from_env() {
 #     the same tier of protection tools like `gh` and `gcloud` fall back to
 #     when no OS keychain is available.
 #
-#   - "encrypted" mode (opt-in, 't> mcp cred encrypt on', requires
+#   - "encrypted" mode (opt-in, 'a> mcp cred encrypt on', requires
 #     openssl): the same JSON is instead stored AES-256-CBC-encrypted
 #     (PBKDF2, 200k iterations, random salt) under a passphrase that is
 #     ONLY ever held in memory for the running session — never written to
@@ -5168,7 +5216,7 @@ cred_delete() {
   rm -f "$path" 2>/dev/null
 }
 
-# Wipes every stored credential — 't> mcp cred clear', confirmed by the
+# Wipes every stored credential — 'a> mcp cred clear', confirmed by the
 # caller before this runs.
 cred_clear() {
   [[ -d "$CRED_STORE_DIR" ]] || return 0
@@ -6034,10 +6082,10 @@ oauth_get_valid_token() {
 # https://developers.cloudflare.com/agents/model-context-protocol/cloudflare/servers-for-cloudflare/).
 # This is purely a convenience so those don't have to be typed out by URL
 # one at a time — under the hood a server picked here is registered exactly
-# the same way as any 't> mcp add <name> <url>' server (same arrays, same
-# 't> mcp list/remove/refresh', shows up in the system prompt the same
+# the same way as any 'a> mcp add <name> <url>' server (same arrays, same
+# 'a> mcp list/remove/refresh', shows up in the system prompt the same
 # way). Everything that ISN'T on Cloudflare's list stays exactly as before:
-# added manually by name + URL via 't> mcp add', i.e. "other".
+# added manually by name + URL via 'a> mcp add', i.e. "other".
 #
 # Cloudflare's docs lead with interactive OAuth, which a headless bash
 # script can't do. The supported non-interactive alternative is a
@@ -6085,11 +6133,11 @@ CF_MCP_DESCS=(
   "Token-efficient search of the Cloudflare Agents SDK docs"
 )
 
-# 't> mcp cloudflare' — lists the catalog above, lets the user pick one or
+# 'a> mcp cloudflare' — lists the catalog above, lets the user pick one or
 # more (comma-separated numbers, or "all"), then registers each pick either
 # via browser OAuth (each Cloudflare service authorizes separately, so this
 # opens the browser once per pick) or a single Cloudflare API token reused
-# across the whole batch — mirrors the same choice 't> mcp github' offers.
+# across the whole batch — mirrors the same choice 'a> mcp github' offers.
 mcp_pick_cloudflare() {
   local i sel choice token entered any_added=0
   local -a raw_parts=() picks=()
@@ -6129,7 +6177,7 @@ mcp_pick_cloudflare() {
         name="${CF_MCP_NAMES[$pidx]}"
         url="${CF_MCP_URLS[$pidx]}"
         if mcp_find_index "$name" >/dev/null; then
-          warn "\"$name\" is already configured — skipping (t> mcp remove $name first to re-add)."
+          warn "\"$name\" is already configured — skipping (a> mcp remove $name first to re-add)."
           continue
         fi
         mcp_add_server_oauth "$name" "$url" && any_added=1
@@ -6153,7 +6201,7 @@ mcp_pick_cloudflare() {
     name="${CF_MCP_NAMES[$pidx]}"
     url="${CF_MCP_URLS[$pidx]}"
     if mcp_find_index "$name" >/dev/null; then
-      warn "\"$name\" is already configured — skipping (t> mcp remove $name first to re-add)."
+      warn "\"$name\" is already configured — skipping (a> mcp remove $name first to re-add)."
       continue
     fi
     key_var="$(mcp_env_key_for "$name")"
@@ -6176,8 +6224,8 @@ mcp_pick_cloudflare() {
 # at GH_MCP_URL below, exposing repos/issues/PRs/actions/etc as tools. Unlike
 # the Cloudflare picker above there's no catalog to choose from — this is
 # just a named shortcut so the URL doesn't have to be typed out, registered
-# exactly like any 't> mcp add <name> <url>' server (same arrays, same
-# 't> mcp list/remove/refresh').
+# exactly like any 'a> mcp add <name> <url>' server (same arrays, same
+# 'a> mcp list/remove/refresh').
 #
 # GitHub's server supports two auth styles: a fine-grained Personal Access
 # Token sent as a bearer key (simplest, works headless), or full OAuth 2.1 +
@@ -6187,13 +6235,13 @@ mcp_pick_cloudflare() {
 GH_MCP_NAME="github"
 GH_MCP_URL="https://api.githubcopilot.com/mcp/"
 
-# 't> mcp github' — offers PAT-or-OAuth, then registers GH_MCP_NAME/GH_MCP_URL
-# exactly like a manual 't> mcp add' / 't> mcp oauth' would.
+# 'a> mcp github' — offers PAT-or-OAuth, then registers GH_MCP_NAME/GH_MCP_URL
+# exactly like a manual 'a> mcp add' / 'a> mcp oauth' would.
 mcp_pick_github() {
   local choice token entered key_var
 
   if mcp_find_index "$GH_MCP_NAME" >/dev/null; then
-    warn "\"$GH_MCP_NAME\" is already configured — 't> mcp remove $GH_MCP_NAME' first to reconnect."
+    warn "\"$GH_MCP_NAME\" is already configured — 'a> mcp remove $GH_MCP_NAME' first to reconnect."
     return 1
   fi
 
@@ -6276,37 +6324,45 @@ $listing
 MCPPROMPT
 }
 
-# If an "mcp_call" hook plugin is registered and toggled on, gives it a
-# look at the pending server/tool/arguments before the user is asked to
-# confirm the call. Entry is invoked as: <entry> mcp_call <server> <tool>
-# <args-json>. Same VETO:/transform/pass-through contract as
-# shell_exec_plugin_hook: exit 0 + "VETO:<reason>" blocks the call, exit 0
-# + other non-empty (and valid-JSON) stdout replaces the argument object,
-# exit 0 + empty stdout or a non-zero exit leaves the arguments unchanged.
-# If the replacement stdout isn't valid JSON it's discarded with a warning
-# rather than sent on to the server. Always sets MCP_CALL_HOOK_ARGS to
-# whatever arguments should actually be sent.
+# If one or more "mcp_call" hook plugins are registered and toggled on,
+# gives EACH of them (in priority order) a look at the pending server/
+# tool/arguments before the user is asked to confirm the call, threading
+# the arguments through the whole chain — each plugin sees whatever the
+# previous one in the chain left them as. Entry is invoked as: <entry>
+# mcp_call <server> <tool> <args-json>. Same VETO:/transform/pass-through
+# contract per plugin as shell_exec_plugin_hook: exit 0 + "VETO:<reason>"
+# blocks the call immediately (the chain stops there), exit 0 + other
+# non-empty (and valid-JSON) stdout replaces the argument object for the
+# next plugin in the chain, exit 0 + empty stdout or a non-zero exit
+# leaves the arguments as they were and moves on. If a plugin's
+# replacement stdout isn't valid JSON it's discarded with a warning
+# rather than sent on. Always sets MCP_CALL_HOOK_ARGS to whatever
+# arguments should actually be sent, and (on veto) MCP_CALL_HOOK_VETO_BY
+# to the vetoing plugin's name.
 mcp_call_plugin_hook() {
   local server="$1" tool="$2" args="$3" name
   MCP_CALL_HOOK_ARGS="$args"
-  hook_point_is_active "mcp_call" || return 0
-  name="${HOOK_OWNER[mcp_call]}"
+  hook_active_chain "mcp_call"
+  [[ "${#HOOK_ACTIVE_CHAIN[@]}" -gt 0 ]] || return 0
 
-  if ! plugin_hook_call "$name" "mcp_call" "$server" "$tool" "$args"; then
-    return 0
-  fi
-  if [[ "$PLUGIN_HOOK_OUTPUT" == VETO:* ]]; then
-    MCP_CALL_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT#VETO:}"
-    MCP_CALL_HOOK_VETO_REASON="${MCP_CALL_HOOK_VETO_REASON# }"
-    return 1
-  fi
-  if [[ -n "$PLUGIN_HOOK_OUTPUT" ]]; then
-    if jq -e . >/dev/null 2>&1 <<< "$PLUGIN_HOOK_OUTPUT"; then
-      MCP_CALL_HOOK_ARGS="$PLUGIN_HOOK_OUTPUT"
-    else
-      warn "Hook plugin '$name' returned non-JSON for mcp_call — ignoring its output, using the original arguments."
+  for name in "${HOOK_ACTIVE_CHAIN[@]}"; do
+    if ! plugin_hook_call "$name" "mcp_call" "$server" "$tool" "$MCP_CALL_HOOK_ARGS"; then
+      continue
     fi
-  fi
+    if [[ "$PLUGIN_HOOK_OUTPUT" == VETO:* ]]; then
+      MCP_CALL_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT#VETO:}"
+      MCP_CALL_HOOK_VETO_REASON="${MCP_CALL_HOOK_VETO_REASON# }"
+      MCP_CALL_HOOK_VETO_BY="$name"
+      return 1
+    fi
+    if [[ -n "$PLUGIN_HOOK_OUTPUT" ]]; then
+      if jq -e . >/dev/null 2>&1 <<< "$PLUGIN_HOOK_OUTPUT"; then
+        MCP_CALL_HOOK_ARGS="$PLUGIN_HOOK_OUTPUT"
+      else
+        warn "Hook plugin '$name' returned non-JSON for mcp_call — ignoring its output, using the arguments as they stood before this plugin."
+      fi
+    fi
+  done
   return 0
 }
 
@@ -6322,8 +6378,8 @@ handle_mcp_call_action() {
   [[ -z "$(printf '%s' "$args_text" | tr -d '[:space:]')" ]] && args_text="{}"
 
   if ! mcp_call_plugin_hook "$server" "$tool" "$args_text"; then
-    warn "MCP_CALL $server.$tool blocked by hook plugin — ${MCP_CALL_HOOK_VETO_REASON:-no reason given}."
-    AGENT_TOOL_OUTPUT+=$'\n\n'"[MCP_CALL $server.$tool]: blocked by hook plugin (${MCP_CALL_HOOK_VETO_REASON:-no reason given})."
+    warn "MCP_CALL $server.$tool blocked by hook plugin '${MCP_CALL_HOOK_VETO_BY:-?}' — ${MCP_CALL_HOOK_VETO_REASON:-no reason given}."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[MCP_CALL $server.$tool]: blocked by hook plugin '${MCP_CALL_HOOK_VETO_BY:-?}' (${MCP_CALL_HOOK_VETO_REASON:-no reason given})."
     return
   fi
   args_text="$MCP_CALL_HOOK_ARGS"
@@ -6362,8 +6418,8 @@ handle_mcp_call_action() {
   url="${MCP_URLS[$idx]}"
   key="$(mcp_resolve_key "$idx")" || {
     box_bottom "$C_ERR"
-    warn "MCP_CALL $server.$tool failed: OAuth session expired and needs reconnecting (t> mcp oauth $server ${MCP_URLS[$idx]})."
-    AGENT_TOOL_OUTPUT+=$'\n\n'"[MCP_CALL $server.$tool]: call failed (OAuth session expired — reconnect with t> mcp oauth $server)."
+    warn "MCP_CALL $server.$tool failed: OAuth session expired and needs reconnecting (a> mcp oauth $server ${MCP_URLS[$idx]})."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[MCP_CALL $server.$tool]: call failed (OAuth session expired — reconnect with a> mcp oauth $server)."
     return
   }
   session="${MCP_SESSION_IDS[$idx]}"
@@ -6424,33 +6480,43 @@ handle_web_search_action() {
   AGENT_TOOL_OUTPUT+=$'\n\n'"[WEB_SEARCH \"$query\"] (results may be out of date the instant they're fetched — treat as a snapshot, not ground truth):"$'\n'"$results"
 }
 
-# If a "shell_exec" hook plugin is registered and toggled on, gives it a
-# look at the pending command before the user is asked to confirm it.
-# Entry is invoked as: <entry> shell_exec <command>. On exit 0:
+# If one or more "shell_exec" hook plugins are registered and toggled on,
+# gives EACH of them (in priority order) a look at the pending command
+# before the user is asked to confirm it, threading the command through
+# the whole chain — each plugin sees whatever the previous one in the
+# chain left it as. Entry is invoked as: <entry> shell_exec <command>.
+# On exit 0, per plugin:
 #   - stdout starting with "VETO:" blocks the command entirely — the rest
-#     of that line is the reason, surfaced to the user.
-#   - any other non-empty stdout REPLACES the command that will actually
-#     run (and gets shown in the confirmation box, not the original).
-#   - empty stdout leaves the command unchanged.
-# A non-zero exit (hook errored, crashed, etc) is treated as "no opinion"
-# — same fallback-to-unmodified behavior as web_search's hook when it
-# fails, so a flaky hook plugin never silently blocks shell access.
-# Always sets SHELL_EXEC_HOOK_CMD to whatever should actually run.
+#     of that line is the reason, surfaced to the user, and the chain
+#     stops there (later plugins never see it).
+#   - any other non-empty stdout REPLACES the command for the rest of the
+#     chain (and, if nothing later vetoes or changes it further, in the
+#     confirmation box the user sees).
+#   - empty stdout leaves the command unchanged and moves on.
+# A non-zero exit from any one plugin (hook errored, crashed, etc) is
+# treated as "no opinion" for that plugin — same fallback-to-unmodified
+# behavior as before, so one flaky plugin never silently blocks shell
+# access or breaks the rest of the chain. Always sets SHELL_EXEC_HOOK_CMD
+# to whatever should actually run, and (on veto) SHELL_EXEC_HOOK_VETO_BY
+# to the vetoing plugin's name.
 shell_exec_plugin_hook() {
   local cmd="$1" name
   SHELL_EXEC_HOOK_CMD="$cmd"
-  hook_point_is_active "shell_exec" || return 0
-  name="${HOOK_OWNER[shell_exec]}"
+  hook_active_chain "shell_exec"
+  [[ "${#HOOK_ACTIVE_CHAIN[@]}" -gt 0 ]] || return 0
 
-  if ! plugin_hook_call "$name" "shell_exec" "$cmd"; then
-    return 0
-  fi
-  if [[ "$PLUGIN_HOOK_OUTPUT" == VETO:* ]]; then
-    SHELL_EXEC_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT#VETO:}"
-    SHELL_EXEC_HOOK_VETO_REASON="${SHELL_EXEC_HOOK_VETO_REASON# }"
-    return 1
-  fi
-  [[ -n "$PLUGIN_HOOK_OUTPUT" ]] && SHELL_EXEC_HOOK_CMD="$PLUGIN_HOOK_OUTPUT"
+  for name in "${HOOK_ACTIVE_CHAIN[@]}"; do
+    if ! plugin_hook_call "$name" "shell_exec" "$SHELL_EXEC_HOOK_CMD"; then
+      continue
+    fi
+    if [[ "$PLUGIN_HOOK_OUTPUT" == VETO:* ]]; then
+      SHELL_EXEC_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT#VETO:}"
+      SHELL_EXEC_HOOK_VETO_REASON="${SHELL_EXEC_HOOK_VETO_REASON# }"
+      SHELL_EXEC_HOOK_VETO_BY="$name"
+      return 1
+    fi
+    [[ -n "$PLUGIN_HOOK_OUTPUT" ]] && SHELL_EXEC_HOOK_CMD="$PLUGIN_HOOK_OUTPUT"
+  done
   return 0
 }
 
@@ -6464,8 +6530,8 @@ handle_shell_run_action() {
   cmd_text="$(cat "$cmd_file")"
 
   if ! shell_exec_plugin_hook "$cmd_text"; then
-    warn "Shell command blocked by hook plugin — ${SHELL_EXEC_HOOK_VETO_REASON:-no reason given}."
-    AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN]: blocked by hook plugin (${SHELL_EXEC_HOOK_VETO_REASON:-no reason given})."
+    warn "Shell command blocked by hook plugin '${SHELL_EXEC_HOOK_VETO_BY:-?}' — ${SHELL_EXEC_HOOK_VETO_REASON:-no reason given}."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN]: blocked by hook plugin '${SHELL_EXEC_HOOK_VETO_BY:-?}' (${SHELL_EXEC_HOOK_VETO_REASON:-no reason given})."
     return
   fi
   cmd_text="$SHELL_EXEC_HOOK_CMD"
@@ -7270,7 +7336,7 @@ provider_label() {
 }
 
 # Non-fatal: prompts for the active provider's key if missing, returns 1 if
-# the user leaves it blank. Used both at startup and after 't> provider'
+# the user leaves it blank. Used both at startup and after 'a> provider'
 # switches the backend mid-session (where exiting the whole app would be
 # the wrong move).
 ensure_provider_key() {
@@ -7334,7 +7400,7 @@ ensure_provider_key() {
       CUSTOM_KEY="$entered"
       ;;
     *)
-      err "No provider selected yet — run 't> provider' first."
+      err "No provider selected yet — run 'a> provider' first."
       return 1
       ;;
   esac
@@ -7342,13 +7408,13 @@ ensure_provider_key() {
 }
 
 # Forces re-entry of the CURRENT provider's key, even if one is already set
-# (env var or typed earlier) — used by 't> key'. Unlike ensure_provider_key
+# (env var or typed earlier) — used by 'a> key'. Unlike ensure_provider_key
 # this never short-circuits on an existing value.
 change_api_key() {
   local label prompt_text entered
 
   if [[ -z "$PROVIDER" ]]; then
-    err "No provider selected yet — run 't> provider' first."
+    err "No provider selected yet — run 'a> provider' first."
     return 1
   fi
 
@@ -7396,7 +7462,7 @@ plugins_ensure_dir() {
 }
 
 # Persisted on/off/stopped state for hook plugins, so an explicit
-# `t> plugin toggle <n> off` or `t> plugin run --stoprun <n>` sticks across
+# `a> plugin toggle <n> off` or `a> plugin run --stoprun <n>` sticks across
 # a full restart of Aulthium (not just a Ctrl+C-free session) — see
 # plugins_autostart, which is what actually reads this back on the way up.
 #
@@ -7434,11 +7500,11 @@ plugin_hook_state_save() {
 # set up) to bring back every installed hook plugin that opts into
 # "autostart": true in its plugin.json — e.g. better-websearch. Default
 # behavior is "on" every launch, Ctrl+C or not; an explicit prior
-# `t> plugin toggle <n> off` or `t> plugin run --stoprun <n>` is what
+# `a> plugin toggle <n> off` or `a> plugin run --stoprun <n>` is what
 # overrides that (read back via plugin_hook_state_load), not the other
 # way around. Silent on success (status_panel/plugin list show the
-# result); failures (missing runtime, hook collision, bad manifest) print
-# a warning but never block the rest of startup.
+# result); failures (missing runtime, bad manifest) print a warning but
+# never block the rest of startup.
 plugins_autostart() {
   local dir name manifest mode hook toggle_prefix runtime entry autostart state priority
 
@@ -7468,7 +7534,7 @@ plugins_autostart() {
       continue
     fi
     if [[ -n "$runtime" ]] && ! want_cmd "$runtime"; then
-      warn "Autostart: '$name' needs '$runtime', which isn't available — skipped. Run 't> plugin run $name' once that's fixed."
+      warn "Autostart: '$name' needs '$runtime', which isn't available — skipped. Run 'a> plugin run $name' once that's fixed."
       continue
     fi
 
@@ -7476,13 +7542,12 @@ plugins_autostart() {
       warn "Autostart: '$name' declares an unknown hook point '$hook' — skipped. Known hook points: $KNOWN_HOOK_POINTS"
       continue
     fi
-    if ! hook_claim_ownership "$name" "$hook" "$priority"; then
-      continue
-    fi
+    RUNNING_PLUGIN_PRIORITY[$name]="$priority"
+    hook_chain_add "$name" "$hook" "$priority"
 
     if [[ -n "$toggle_prefix" ]]; then
       if [[ -n "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]:-}" ]]; then
-        warn "Autostart: toggle prefix '${toggle_prefix}>' already claimed — '$name' will only be toggleable via t> plugin toggle."
+        warn "Autostart: toggle prefix '${toggle_prefix}>' already claimed — '$name' will only be toggleable via a> plugin toggle."
         toggle_prefix=""
       else
         TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]="$name"
@@ -7494,7 +7559,6 @@ plugins_autostart() {
     RUNNING_PLUGIN_ENTRY[$name]="$entry"
     RUNNING_PLUGIN_DIR[$name]="$dir"
     RUNNING_PLUGIN_TOGGLE_PREFIX[$name]="$toggle_prefix"
-    RUNNING_PLUGIN_PRIORITY[$name]="$priority"
   done
 }
 
@@ -7524,7 +7588,7 @@ builtin_plugin_sources_fetch() {
 # (see BUILTIN_PLUGIN_SOURCES_FETCHED above) and hands back the cached
 # result on every call after that. Use builtin_plugin_sources_refresh
 # instead when the caller specifically wants a fresh live check
-# (e.g. 't> plugin list --refresh' or similar).
+# (e.g. 'a> plugin list --refresh' or similar).
 builtin_plugin_sources() {
   if [[ "$BUILTIN_PLUGIN_SOURCES_FETCHED" -eq 1 ]]; then
     printf '%s' "$BUILTIN_PLUGIN_SOURCES_CACHE"
@@ -7570,7 +7634,7 @@ builtin_plugin_repo_for() {
 
 # ── Plugin manifest validation, permissions, integrity & config ─────────
 # Everything in this section is shared across every way a plugin reaches
-# disk (t> plugin install <folder|url|github:...>),
+# disk (a> plugin install <folder|url|github:...>),
 # so a plugin is held to the same bar regardless of where it came from.
 
 # Known permission scopes a plugin.json may declare in its "permissions"
@@ -7655,7 +7719,7 @@ plugin_manifest_validate() {
 # Informational-only permissions display shown right after a fresh
 # install — NOT a grant, doesn't touch PLUGIN_PERMS_FILE, and asks
 # nothing. The actual grant gate is plugin_confirm_permissions, which
-# always runs at 't> plugin run' time regardless of what happened here;
+# always runs at 'a> plugin run' time regardless of what happened here;
 # this just means nobody is surprised by that prompt later.
 plugin_install_show_permissions() {
   local manifest="$1" perms p
@@ -7697,7 +7761,7 @@ plugin_perms_grant_save() {
 
 # Shows exactly what a plugin's manifest declares it needs and gets an
 # explicit y/N via confirm_yes_no — deliberately NEVER confirm_action, so
-# 't> confirm off' (scoped to agent-proposed file/shell/MCP actions — see
+# 'a> confirm off' (scoped to agent-proposed file/shell/MCP actions — see
 # confirm_action above) can never silently wave a plugin's permission
 # grant through. Skips re-asking only when the exact same permission set
 # (by fingerprint) was already approved for this plugin name before;
@@ -7767,28 +7831,28 @@ plugin_stamp_integrity() {
   fi
 }
 
-# `t> plugin verify <name>` — recomputes the hash and compares it to what
+# `a> plugin verify <name>` — recomputes the hash and compares it to what
 # was recorded at install/create time. Strictly read-only: never
 # reinstalls, repairs, or re-stamps anything on a mismatch — that only
-# happens via a fresh t> plugin install/update, so the hash always means
+# happens via a fresh a> plugin install/update, so the hash always means
 # "matches what was deliberately installed", never "matches whatever's
 # there now".
 plugin_verify() {
   local name="$1" dir manifest stored current
   if [[ -z "$name" ]]; then
-    warn "Usage: t> plugin verify <name>"
+    warn "Usage: a> plugin verify <name>"
     return 1
   fi
   dir="$PLUGINS_DIR/$name"
   manifest="$dir/plugin.json"
   if [[ ! -f "$manifest" ]]; then
-    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    err "No plugin named '$name' — run 'a> plugin list' to see what's installed."
     return 1
   fi
   stored="$(jq -r '._integrity.sha256 // empty' "$manifest" 2>/dev/null)"
   if [[ -z "$stored" ]]; then
     warn "'$name' has no recorded integrity hash (installed before this feature existed) — nothing to verify against."
-    muted "Reinstall it to get one: t> plugin install <same source>"
+    muted "Reinstall it to get one: a> plugin install <same source>"
     return 1
   fi
   current="$(plugin_tree_checksum "$dir")"
@@ -7801,10 +7865,10 @@ plugin_verify() {
   fi
 }
 
-# `t> plugin config <name>` family — per-plugin customization. A plugin
+# `a> plugin config <name>` family — per-plugin customization. A plugin
 # author declares defaults in plugin.json's "config" object; a user's own
 # overrides live separately in <plugin-dir>/config.json so they survive
-# `t> plugin update`/reinstall untouched. plugin_config_effective is the
+# `a> plugin update`/reinstall untouched. plugin_config_effective is the
 # single source of truth both the CLI and plugin_export_config_env (what a
 # running plugin actually receives) read from — defaults overlaid with
 # overrides, overrides always winning.
@@ -7822,13 +7886,13 @@ plugin_config() {
   local name="$1"; shift || true
   local dir manifest sub
   if [[ -z "$name" ]]; then
-    warn "Usage: t> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
+    warn "Usage: a> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
     return 1
   fi
   dir="$PLUGINS_DIR/$name"
   manifest="$dir/plugin.json"
   if [[ ! -f "$manifest" ]]; then
-    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    err "No plugin named '$name' — run 'a> plugin list' to see what's installed."
     return 1
   fi
 
@@ -7846,12 +7910,12 @@ plugin_config() {
         done < <(printf '%s' "$eff" | jq -r 'to_entries[] | "\(.key) = \(.value)"' 2>/dev/null)
       fi
       box_bottom "$C_ACCENT2"
-      muted "Set with: t> plugin config $name set <key> <value>   —   clear an override with: t> plugin config $name unset <key>"
+      muted "Set with: a> plugin config $name set <key> <value>   —   clear an override with: a> plugin config $name unset <key>"
       ;;
     get)
       local key="$1"
       if [[ -z "$key" ]]; then
-        warn "Usage: t> plugin config $name get <key>"
+        warn "Usage: a> plugin config $name get <key>"
         return 1
       fi
       printf '%s' "$(plugin_config_effective "$dir")" | jq -r --arg k "$key" '.[$k] // "(unset)"' 2>/dev/null
@@ -7859,7 +7923,7 @@ plugin_config() {
     set)
       local key="$1" val="$2" tmp existing
       if [[ -z "$key" || -z "$val" ]]; then
-        warn "Usage: t> plugin config $name set <key> <value>"
+        warn "Usage: a> plugin config $name set <key> <value>"
         return 1
       fi
       existing="{}"
@@ -7868,7 +7932,7 @@ plugin_config() {
       tmp="$(mktemp)" || return 1
       if printf '%s' "$existing" | jq --arg k "$key" --arg v "$val" '.[$k] = $v' > "$tmp" 2>/dev/null; then
         mv "$tmp" "$dir/config.json"
-        ok "Set '$key' = '$val' for '$name' (local override — untouched by t> plugin update/reinstall)."
+        ok "Set '$key' = '$val' for '$name' (local override — untouched by a> plugin update/reinstall)."
       else
         rm -f "$tmp"
         err "Couldn't write config.json for '$name'."
@@ -7878,7 +7942,7 @@ plugin_config() {
     unset)
       local key="$1" tmp existing
       if [[ -z "$key" ]]; then
-        warn "Usage: t> plugin config $name unset <key>"
+        warn "Usage: a> plugin config $name unset <key>"
         return 1
       fi
       if [[ ! -f "$dir/config.json" ]]; then
@@ -7898,7 +7962,7 @@ plugin_config() {
       fi
       ;;
     *)
-      warn "Usage: t> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
+      warn "Usage: a> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
       return 1
       ;;
   esac
@@ -8020,11 +8084,11 @@ plugin_install_from_url() {
     return 1
   fi
 
-  # Stamp how this landed here, so `t> plugin update` can find its way
+  # Stamp how this landed here, so `a> plugin update` can find its way
   # back to the same repo later without the user having to re-specify it.
   # jq merge — anything the manifest itself already declares wins over
   # this (a plugin author is free to ship their own richer "_source").
-  # Only stamped for a GitHub-sourced install; a plain `t> plugin install
+  # Only stamped for a GitHub-sourced install; a plain `a> plugin install
   # <url>` (no repo coordinate) leaves the manifest untouched.
   if [[ -n "$source_repo" ]]; then
     stamped="$(jq --arg repo "$source_repo" --arg path "$subpath" \
@@ -8040,7 +8104,7 @@ plugin_install_from_url() {
   plugin_stamp_integrity "$dest"
   ok "Installed plugin '$name' (v$(jq -r '.version // "?"' "$dest/plugin.json" 2>/dev/null)) → $dest"
   plugin_install_show_permissions "$dest/plugin.json"
-  muted "Run it with: t> plugin run $name"
+  muted "Run it with: a> plugin run $name"
   rm -rf -- "$tmp_dir"
   return 0
 }
@@ -8050,7 +8114,7 @@ plugin_install_from_url() {
 # ("owner/repo/plugins/built-in/webchat") — and installs it. Falls back to
 # the repo's default-branch source zip if it has no releases at all — good
 # enough for a plugin with no build step, though a real tagged release is
-# what makes `t> plugin update` meaningful (untagged installs have nothing
+# what makes `a> plugin update` meaningful (untagged installs have nothing
 # to compare against next time).
 #
 # A subpath coordinate ALWAYS goes straight to the default-branch source
@@ -8061,12 +8125,12 @@ plugin_install_from_url() {
 # has no reason to contain the rest of the repo tree, so relying on it here
 # would just as easily 404 on the subpath even when a release exists. Since
 # there's no per-plugin version signal to compare against ahead of time,
-# `t> plugin update` treats a subpath plugin as "sync to whatever's on the
+# `a> plugin update` treats a subpath plugin as "sync to whatever's on the
 # branch now" rather than "is there a newer tag" — see plugin_update below.
 plugin_install_github() {
   local full="$1" repo subpath release_info tag asset_url
   if [[ -z "$full" ]]; then
-    warn "Usage: t> plugin install github:<owner>/<repo>[/subpath]"
+    warn "Usage: a> plugin install github:<owner>/<repo>[/subpath]"
     return 1
   fi
   repo="$(printf '%s' "$full" | cut -d/ -f1,2)"
@@ -8094,7 +8158,7 @@ plugin_install_github() {
   plugin_install_from_url "$asset_url" "$subpath"
 }
 
-# `t> plugin update` with no name: read-only sweep over every installed
+# `a> plugin update` with no name: read-only sweep over every installed
 # plugin that has a "_source.repo" (i.e. came from plugin_install_github),
 # reporting which have a newer release out — nothing is installed here.
 plugin_update_check_all() {
@@ -8115,7 +8179,7 @@ plugin_update_check_all() {
       # see plugin_install_github — so there's nothing to diff against
       # without downloading the branch, which this sweep intentionally
       # doesn't do (it's read-only). Point at the per-plugin update instead.
-      box_line "${C_BOLD}${name}${C_RESET} — v${cur_version} ${C_MUTED}(monorepo plugin — run 't> plugin update ${name}' to sync)${C_RESET}"
+      box_line "${C_BOLD}${name}${C_RESET} — v${cur_version} ${C_MUTED}(monorepo plugin — run 'a> plugin update ${name}' to sync)${C_RESET}"
       continue
     fi
     if release_info="$(plugin_github_latest_release "$repo")"; then
@@ -8133,10 +8197,10 @@ plugin_update_check_all() {
     box_line "${C_MUTED}(no GitHub-sourced plugins installed — nothing to check)${C_RESET}"
   fi
   box_bottom "$C_ACCENT2"
-  [[ "$any" -eq 1 ]] && muted "Update one with: t> plugin update <name>"
+  [[ "$any" -eq 1 ]] && muted "Update one with: a> plugin update <name>"
 }
 
-# `t> plugin update <name>`: checks that one plugin's repo, and — only
+# `a> plugin update <name>`: checks that one plugin's repo, and — only
 # after an explicit yes/no, same trust model as installing or running a
 # plugin at all — reinstalls it if a newer release exists.
 plugin_update() {
@@ -8147,13 +8211,13 @@ plugin_update() {
   fi
   manifest="$PLUGINS_DIR/$name/plugin.json"
   if [[ ! -f "$manifest" ]]; then
-    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    err "No plugin named '$name' — run 'a> plugin list' to see what's installed."
     return 1
   fi
   repo="$(jq -r '._source.repo // empty' "$manifest" 2>/dev/null)"
   if [[ -z "$repo" ]]; then
     warn "'$name' wasn't installed from GitHub (or predates update-tracking) — nothing to check it against."
-    muted "Reinstall it from a repo with: t> plugin install github:<owner>/<repo>"
+    muted "Reinstall it from a repo with: a> plugin install github:<owner>/<repo>"
     return 1
   fi
   subpath="$(jq -r '._source.path // empty' "$manifest" 2>/dev/null)"
@@ -8194,21 +8258,21 @@ plugin_update() {
   plugin_install_github "$full"
 }
 
-# `t> plugin remove/delete <name>`: deletes an installed plugin's folder
+# `a> plugin remove/delete <name>`: deletes an installed plugin's folder
 # from disk after an explicit y/N, same trust model as everything else
-# under `t> plugin`. This only removes what plugin_install/plugin_install_*
+# under `a> plugin`. This only removes what plugin_install/plugin_install_*
 # put in $PLUGINS_DIR/<name> — it doesn't touch anything the plugin itself
 # may have written elsewhere (its own data/config dirs, if any), since
 # Aulthium has no record of that beyond the plugin's own manifest.
 plugin_remove() {
   local name="$1" dest
   if [[ -z "$name" ]]; then
-    warn "Usage: t> plugin remove <name>"
+    warn "Usage: a> plugin remove <name>"
     return 1
   fi
   dest="$PLUGINS_DIR/$name"
   if [[ ! -d "$dest" ]]; then
-    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    err "No plugin named '$name' — run 'a> plugin list' to see what's installed."
     return 1
   fi
   if ! confirm_yes_no "Remove plugin '$name' ($dest)? This can't be undone."; then
@@ -8247,10 +8311,10 @@ plugin_list() {
 
   # Hook plugins currently registered (mode:"hook", e.g. better-websearch)
   # — these run silently alongside normal chat rather than blocking the
-  # terminal, so t> plugin/plugin list is the only place their live
+  # terminal, so a> plugin/plugin list is the only place their live
   # on/off state is otherwise visible.
   if [[ "${#RUNNING_PLUGIN_ENABLED[@]}" -gt 0 ]]; then
-    local rname rstate rhook rprefix rpriority
+    local rname rstate rhook rprefix rpriority rpos
     box_line ""
     box_line "${C_MUTED}Running:${C_RESET}"
     for rname in "${!RUNNING_PLUGIN_ENABLED[@]}"; do
@@ -8258,11 +8322,14 @@ plugin_list() {
       rhook="${RUNNING_PLUGIN_HOOK[$rname]}"
       rprefix="${RUNNING_PLUGIN_TOGGLE_PREFIX[$rname]:-}"
       rpriority="${RUNNING_PLUGIN_PRIORITY[$rname]:-0}"
-      box_line "  ${C_BOLD}${rname}${C_RESET}${C_MUTED} — hook: ${rhook} (priority ${rpriority}), state: ${rstate}${C_RESET}"
+      # Chain position within this hook point, 1-indexed — so when
+      # several plugins share a hook, it's clear which one runs first.
+      rpos="$(printf '%s\n' "${HOOK_CHAIN[$rhook]:-}" | tr ' ' '\n' | grep -n -x -F "$rname" | cut -d: -f1)"
+      box_line "  ${C_BOLD}${rname}${C_RESET}${C_MUTED} — hook: ${rhook} (priority ${rpriority}, #${rpos:-?} in chain), state: ${rstate}${C_RESET}"
       if [[ -n "$rprefix" ]]; then
-        box_line "    ${C_MUTED}toggle: ${rprefix}> on|off   or   t> plugin toggle ${rname} on|off${C_RESET}"
+        box_line "    ${C_MUTED}toggle: ${rprefix}> on|off   or   a> plugin toggle ${rname} on|off${C_RESET}"
       else
-        box_line "    ${C_MUTED}toggle: t> plugin toggle ${rname} on|off${C_RESET}"
+        box_line "    ${C_MUTED}toggle: a> plugin toggle ${rname} on|off${C_RESET}"
       fi
     done
   fi
@@ -8287,25 +8354,25 @@ plugin_list() {
         box_line "${C_MUTED}Available (not installed):${C_RESET}"
         any_avail=1
       fi
-      box_line "  ${C_BOLD}${pname}${C_RESET}${C_MUTED} — t> plugin install github:${prepo}${C_RESET}"
+      box_line "  ${C_BOLD}${pname}${C_RESET}${C_MUTED} — a> plugin install github:${prepo}${C_RESET}"
     done <<< "$builtin_sources"
   fi
 
   box_bottom "$C_ACCENT2"
-  muted "Run one with: t> plugin run <name>   —   install one with: t> plugin install <path|github:owner/repo>   —   remove one with: t> plugin remove <name>"
-  muted "Scaffold a new one with the standalone aulthium-plugin-create.sh   —   tune one with: t> plugin config <name>   —   check it with: t> plugin verify <name>"
+  muted "Run one with: a> plugin run <name>   —   install one with: a> plugin install <path|github:owner/repo>   —   remove one with: a> plugin remove <name>"
+  muted "Scaffold a new one with the standalone aulthium-plugin-create.sh   —   tune one with: a> plugin config <name>   —   check it with: a> plugin verify <name>"
   muted "Plugins live in: $PLUGINS_DIR"
 }
 
 plugin_info() {
   local name="$1" manifest
   if [[ -z "$name" ]]; then
-    warn "Usage: t> plugin info <name>"
+    warn "Usage: a> plugin info <name>"
     return 1
   fi
   manifest="$PLUGINS_DIR/$name/plugin.json"
   if [[ ! -f "$manifest" ]]; then
-    err "No plugin named '$name' — run 't> plugin list' to see what's installed."
+    err "No plugin named '$name' — run 'a> plugin list' to see what's installed."
     return 1
   fi
   box_top "PLUGIN: $name" "$ICON_PLUGIN" "$C_ACCENT2"
@@ -8326,7 +8393,7 @@ plugin_info() {
     if [[ "$current" == "$stored" ]]; then
       box_line "${C_OK}integrity: OK${C_RESET} ${C_MUTED}(matches hash recorded $(jq -r '._integrity.at // "?"' "$manifest" 2>/dev/null))${C_RESET}"
     else
-      box_line "${C_ERR}integrity: MISMATCH${C_RESET} ${C_MUTED}(files changed since $(jq -r '._integrity.at // "?"' "$manifest" 2>/dev/null) — run t> plugin verify $name)${C_RESET}"
+      box_line "${C_ERR}integrity: MISMATCH${C_RESET} ${C_MUTED}(files changed since $(jq -r '._integrity.at // "?"' "$manifest" 2>/dev/null) — run a> plugin verify $name)${C_RESET}"
     fi
   else
     box_line "${C_MUTED}integrity: no hash recorded${C_RESET}"
@@ -8453,18 +8520,19 @@ plugin_unset_config_env() {
   PLUGIN_LAST_CFG_VARS=()
 }
 
-# `t> plugin run --stoprun <name>` — the counterpart to registering a hook
-# plugin. Unlike `t> plugin toggle <name> off` (which just flips it
+# `a> plugin run --stoprun <name>` — the counterpart to registering a hook
+# plugin. Unlike `a> plugin toggle <name> off` (which just flips it
 # inactive but keeps it registered, so turning it back on is instant),
 # this fully de-registers it: clears its RUNNING_PLUGIN_* entries, frees
-# its toggle prefix, and releases whichever hook point it owned. A plugin
-# stopped this way needs a fresh `t> plugin run <name>` (and re-confirmation)
+# its toggle prefix, and removes it from whichever hook point's chain it
+# was in — other plugins sharing that hook point are unaffected. A plugin
+# stopped this way needs a fresh `a> plugin run <name>` (and re-confirmation)
 # to become active again — same as a foreground plugin needing to be
 # started over after Ctrl+C.
 plugin_stoprun() {
   local name="$1"
   if [[ -z "$name" ]]; then
-    warn "Usage: t> plugin run --stoprun <name>"
+    warn "Usage: a> plugin run --stoprun <name>"
     return 1
   fi
   if [[ -z "${RUNNING_PLUGIN_ENABLED[$name]:-}" ]]; then
@@ -8474,16 +8542,16 @@ plugin_stoprun() {
 
   local prefix="${RUNNING_PLUGIN_TOGGLE_PREFIX[$name]:-}"
   [[ -n "$prefix" ]] && unset "TOGGLE_PREFIX_TO_PLUGIN[$prefix]"
-  hook_release_ownership "$name"
+  hook_chain_release "$name"
   unset "RUNNING_PLUGIN_ENABLED[$name]" "RUNNING_PLUGIN_HOOK[$name]" \
         "RUNNING_PLUGIN_ENTRY[$name]" "RUNNING_PLUGIN_DIR[$name]" \
         "RUNNING_PLUGIN_TOGGLE_PREFIX[$name]" "RUNNING_PLUGIN_PRIORITY[$name]"
   plugin_hook_state_save "$name" "stopped"
 
-  ok "Stopped '$name' — it's fully de-registered now (run it again with t> plugin run $name)."
+  ok "Stopped '$name' — it's fully de-registered now (run it again with a> plugin run $name)."
 }
 
-# `t> plugin toggle <name> <on|off>` — flips an already-*running* hook
+# `a> plugin toggle <name> <on|off>` — flips an already-*running* hook
 # plugin's active/inactive state without de-registering it. This is the
 # generic version of a plugin's own "<prefix>> on/off" shorthand (see
 # RUNNING_PLUGIN_TOGGLE_PREFIX / the main loop's prefix dispatch below) —
@@ -8492,16 +8560,16 @@ plugin_stoprun() {
 plugin_toggle() {
   local name="$1" state="$2"
   if [[ -z "$name" || -z "$state" ]]; then
-    warn "Usage: t> plugin toggle <name> <on|off>"
+    warn "Usage: a> plugin toggle <name> <on|off>"
     return 1
   fi
   state="${state,,}"
   if [[ "$state" != "on" && "$state" != "off" ]]; then
-    warn "Usage: t> plugin toggle <name> <on|off>"
+    warn "Usage: a> plugin toggle <name> <on|off>"
     return 1
   fi
   if [[ -z "${RUNNING_PLUGIN_ENABLED[$name]:-}" ]]; then
-    warn "'$name' isn't running yet — start it with 't> plugin run $name' first."
+    warn "'$name' isn't running yet — start it with 'a> plugin run $name' first."
     return 1
   fi
 
@@ -8524,7 +8592,7 @@ plugin_run() {
   local dir manifest entry runtime desc mode hook toggle_prefix status priority
 
   if [[ -z "$name" ]]; then
-    warn "Usage: t> plugin run <name>"
+    warn "Usage: a> plugin run <name>"
     return 1
   fi
 
@@ -8541,7 +8609,7 @@ plugin_run() {
         return 1
       fi
     else
-      err "No plugin named '$name'. Run 't> plugin list' to see what's installed, or 't> plugin install github:<owner>/<repo>' to fetch one."
+      err "No plugin named '$name'. Run 'a> plugin list' to see what's installed, or 'a> plugin install github:<owner>/<repo>' to fetch one."
       return 1
     fi
   fi
@@ -8564,7 +8632,7 @@ plugin_run() {
     return 1
   fi
   if [[ -z "$PROVIDER" ]]; then
-    err "No provider selected yet — run 't> provider' first, then try again."
+    err "No provider selected yet — run 'a> provider' first, then try again."
     return 1
   fi
 
@@ -8584,7 +8652,7 @@ plugin_run() {
     _current_hash="$(plugin_tree_checksum "$dir")"
     if [[ "$_current_hash" != "$_stored_hash" ]]; then
       warn "'$name' files have changed since they were installed/verified (on-disk hash no longer matches plugin.json's _integrity.sha256)."
-      warn "Run 't> plugin verify $name' for details before trusting this run."
+      warn "Run 'a> plugin verify $name' for details before trusting this run."
     fi
   fi
 
@@ -8615,14 +8683,12 @@ plugin_run() {
       err "Plugin '$name' declares an unknown hook point '$hook' — this version of Aulthium only knows: $KNOWN_HOOK_POINTS."
       return 1
     fi
-    if ! hook_claim_ownership "$name" "$hook" "$priority"; then
-      return 1
-    fi
     RUNNING_PLUGIN_PRIORITY[$name]="$priority"
+    hook_chain_add "$name" "$hook" "$priority"
 
     if [[ -n "$toggle_prefix" ]]; then
       if [[ -n "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]:-}" && "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]}" != "$name" ]]; then
-        warn "Toggle prefix '${toggle_prefix}>' is already claimed by '${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]}' — '$name' will only be toggleable via t> plugin toggle."
+        warn "Toggle prefix '${toggle_prefix}>' is already claimed by '${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]}' — '$name' will only be toggleable via a> plugin toggle."
         toggle_prefix=""
       else
         TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]="$name"
@@ -8638,9 +8704,9 @@ plugin_run() {
 
     ok "'$name' is active — it'll now handle $hook automatically. Keep chatting at User>."
     if [[ -n "$toggle_prefix" ]]; then
-      muted "Toggle it with: ${toggle_prefix}> on|off   —   or: t> plugin toggle $name on|off   —   stop it fully with: t> plugin run --stoprun $name"
+      muted "Toggle it with: ${toggle_prefix}> on|off   —   or: a> plugin toggle $name on|off   —   stop it fully with: a> plugin run --stoprun $name"
     else
-      muted "Toggle it with: t> plugin toggle $name on|off   —   stop it fully with: t> plugin run --stoprun $name"
+      muted "Toggle it with: a> plugin toggle $name on|off   —   stop it fully with: a> plugin run --stoprun $name"
     fi
     return 0
   fi
@@ -8685,7 +8751,7 @@ plugin_run() {
 plugin_install() {
   local src="$1" name dest
   if [[ -z "$src" ]]; then
-    warn "Usage: t> plugin install <path-to-plugin-folder | github:<owner>/<repo> | https://.../file.zip>"
+    warn "Usage: a> plugin install <path-to-plugin-folder | github:<owner>/<repo> | https://.../file.zip>"
     return 1
   fi
   if [[ "$src" == github:* ]]; then
@@ -8723,7 +8789,7 @@ plugin_install() {
     plugin_stamp_integrity "$dest"
     ok "Installed plugin '$name' → $dest"
     plugin_install_show_permissions "$dest/plugin.json"
-    muted "Run it with: t> plugin run $name"
+    muted "Run it with: a> plugin run $name"
   else
     err "Failed to copy plugin into $dest"
   fi
@@ -9109,7 +9175,7 @@ call_provider_with_retry() {
     err_msg="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)"
     if [[ "$err_msg" =~ per-day|per-month|daily|quota|free-models-per|RESOURCE_EXHAUSTED ]]; then
       warn "$provider_name free-tier quota exhausted: ${err_msg:-rate limit exceeded}"
-      warn "Retrying won't help until the quota resets. Switch models (t> model), check billing, or wait for the reset."
+      warn "Retrying won't help until the quota resets. Switch models (a> model), check billing, or wait for the reset."
       rm -f "$header_file"
       printf '%s' "$body"
       return 0
@@ -9235,7 +9301,7 @@ get_completion() {
     warn "This model didn't return a final answer, only its internal reasoning."
     echo "Showing that instead — treat it as a rough idea, not a finished answer:"
     printf "\n${C_DIM}${C_ACCENT}Aulthium (reasoning trace)>${C_RESET} %s\n\n" "$reasoning"
-    warn "Consider switching models with 't> model' — this one struggled with this request."
+    warn "Consider switching models with 'a> model' — this one struggled with this request."
     printf '%s' "$reasoning"
     return 0
   fi
@@ -9278,25 +9344,30 @@ run_agent_turns() {
   return 0
 }
 
-# If a "chat_pre" hook plugin is registered and toggled on, lets it
-# rewrite the user's message before it's added to conversation history and
-# sent to the model. Entry is invoked as: <entry> chat_pre <message>. Exit
-# 0 + non-empty stdout REPLACES the outgoing message (what the model sees
-# — and what gets stored in history — is the plugin's output, not what the
-# user typed). Exit 0 + empty stdout, or a non-zero exit, leaves the
-# message unchanged. There's no VETO here — a plugin that wants to block a
-# message entirely can just not be a great fit for this hook point; send
-# it back as empty-ish text instead. Always sets CHAT_PRE_HOOK_TEXT to
-# whatever should actually be sent.
+# If one or more "chat_pre" hook plugins are registered and toggled on,
+# lets EACH of them (in priority order) rewrite the user's message before
+# it's added to conversation history and sent to the model — threaded
+# through the whole chain, so the second plugin sees the first plugin's
+# rewrite, and so on. Entry is invoked as: <entry> chat_pre <message>. Per
+# plugin, exit 0 + non-empty stdout REPLACES the message for the rest of
+# the chain (and, if nothing later in the chain changes it further, is
+# what the model sees and what gets stored in history). Exit 0 + empty
+# stdout, or a non-zero exit, leaves that plugin's input unchanged and
+# moves on. There's no VETO here — a plugin that wants to block a message
+# entirely can just not be a great fit for this hook point; send it back
+# as empty-ish text instead. Always sets CHAT_PRE_HOOK_TEXT to whatever
+# should actually be sent once every active plugin has had its turn.
 chat_pre_plugin_hook() {
   local text="$1" name
   CHAT_PRE_HOOK_TEXT="$text"
-  hook_point_is_active "chat_pre" || return 0
-  name="${HOOK_OWNER[chat_pre]}"
+  hook_active_chain "chat_pre"
+  [[ "${#HOOK_ACTIVE_CHAIN[@]}" -gt 0 ]] || return 0
 
-  if plugin_hook_call "$name" "chat_pre" "$text" && [[ -n "$PLUGIN_HOOK_OUTPUT" ]]; then
-    CHAT_PRE_HOOK_TEXT="$PLUGIN_HOOK_OUTPUT"
-  fi
+  for name in "${HOOK_ACTIVE_CHAIN[@]}"; do
+    if plugin_hook_call "$name" "chat_pre" "$CHAT_PRE_HOOK_TEXT" && [[ -n "$PLUGIN_HOOK_OUTPUT" ]]; then
+      CHAT_PRE_HOOK_TEXT="$PLUGIN_HOOK_OUTPUT"
+    fi
+  done
   return 0
 }
 
@@ -9313,7 +9384,7 @@ command_router() {
   local input="$1"
   local cmd rest
 
-  cmd="${input#t>}"
+  cmd="${input#a>}"
   cmd="${cmd# }"
 
   case "$cmd" in
@@ -9327,7 +9398,7 @@ command_router() {
       rest="${cmd#model }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> model <name>"
+        warn "Usage: a> model <name>"
       else
         set_model_by_name "$rest"
       fi
@@ -9349,7 +9420,7 @@ command_router() {
       rest="${cmd#workdir }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> workdir <path>"
+        warn "Usage: a> workdir <path>"
       elif set_workspace_dir "$rest"; then
         init_history
         say "Conversation reset so the agent knows the new sandbox path."
@@ -9363,7 +9434,7 @@ command_router() {
       rest="${rest#"${rest%%[![:space:]]*}"}"
       local mcp_name="${rest%% *}" mcp_url="${rest#* }"
       if [[ -z "$mcp_name" || "$mcp_name" == "$rest" || -z "$mcp_url" ]]; then
-        warn "Usage: t> mcp add <name> <url>"
+        warn "Usage: a> mcp add <name> <url>"
       else
         mcp_add_server "$mcp_name" "$mcp_url"
       fi
@@ -9372,7 +9443,7 @@ command_router() {
       rest="${cmd#mcp remove }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> mcp remove <name>"
+        warn "Usage: a> mcp remove <name>"
       else
         mcp_remove_server "$rest"
       fi
@@ -9403,7 +9474,7 @@ command_router() {
       rest="${rest#"${rest%%[![:space:]]*}"}"
       local mcp_oauth_name="${rest%% *}" mcp_oauth_url="${rest#* }"
       if [[ -z "$mcp_oauth_name" || "$mcp_oauth_name" == "$rest" || -z "$mcp_oauth_url" ]]; then
-        warn "Usage: t> mcp oauth <name> <url>"
+        warn "Usage: a> mcp oauth <name> <url>"
       else
         mcp_add_server_oauth "$mcp_oauth_name" "$mcp_oauth_url"
       fi
@@ -9429,10 +9500,10 @@ command_router() {
       fi
       ;;
     mcp\ cred*)
-      warn "Usage: t> mcp cred [encrypt on|off | clear]"
+      warn "Usage: a> mcp cred [encrypt on|off | clear]"
       ;;
     mcp\ *)
-      warn "Unknown mcp subcommand. Usage: t> mcp [add <name> <url> | oauth <name> <url> | remove <name> | list | refresh [name] | cloudflare | github | cred ...]"
+      warn "Unknown mcp subcommand. Usage: a> mcp [add <name> <url> | oauth <name> <url> | remove <name> | list | refresh [name] | cloudflare | github | cred ...]"
       ;;
     memory)
       memory_status
@@ -9441,7 +9512,7 @@ command_router() {
       rest="${cmd#memory connect }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> memory connect <file_path>"
+        warn "Usage: a> memory connect <file_path>"
       else
         memory_connect "$rest"
       fi
@@ -9450,7 +9521,7 @@ command_router() {
       memory_disconnect
       ;;
     memory\ *)
-      warn "Unknown memory subcommand. Usage: t> memory [connect <file_path> | disconnect]"
+      warn "Unknown memory subcommand. Usage: a> memory [connect <file_path> | disconnect]"
       ;;
     confirm)
       confirm_status
@@ -9462,7 +9533,7 @@ command_router() {
       disable_confirmations
       ;;
     confirm\ *)
-      warn "Unknown confirm subcommand. Usage: t> confirm [on | off]"
+      warn "Unknown confirm subcommand. Usage: a> confirm [on | off]"
       ;;
     plugin|plugin\ list)
       plugin_list
@@ -9471,7 +9542,7 @@ command_router() {
       rest="${cmd#plugin run }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin run <name>  (or: t> plugin run --stoprun <name>)"
+        warn "Usage: a> plugin run <name>  (or: a> plugin run --stoprun <name>)"
       else
         plugin_run $rest
       fi
@@ -9480,7 +9551,7 @@ command_router() {
       rest="${cmd#plugin info }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin info <name>"
+        warn "Usage: a> plugin info <name>"
       else
         plugin_info "$rest"
       fi
@@ -9489,7 +9560,7 @@ command_router() {
       rest="${cmd#plugin install }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin install <path | github:<owner>/<repo> | url>"
+        warn "Usage: a> plugin install <path | github:<owner>/<repo> | url>"
       else
         plugin_install "$rest"
       fi
@@ -9498,7 +9569,7 @@ command_router() {
       rest="${cmd#plugin verify }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin verify <name>"
+        warn "Usage: a> plugin verify <name>"
       else
         plugin_verify "$rest"
       fi
@@ -9507,7 +9578,7 @@ command_router() {
       rest="${cmd#plugin config }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
+        warn "Usage: a> plugin config <name> [list | get <key> | set <key> <value> | unset <key>]"
       else
         plugin_config $rest
       fi
@@ -9529,7 +9600,7 @@ command_router() {
       rest="${rest#plugin delete }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin remove <name>"
+        warn "Usage: a> plugin remove <name>"
       else
         plugin_remove "$rest"
       fi
@@ -9538,13 +9609,13 @@ command_router() {
       rest="${cmd#plugin toggle }"
       rest="${rest#"${rest%%[![:space:]]*}"}"
       if [[ -z "$rest" ]]; then
-        warn "Usage: t> plugin toggle <name> <on|off>"
+        warn "Usage: a> plugin toggle <name> <on|off>"
       else
         plugin_toggle $rest
       fi
       ;;
     plugin\ *)
-      warn "Unknown plugin subcommand. Usage: t> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name] | remove <name> | toggle <name> <on|off> | config <name> ... | verify <name> | run --stoprun <name>]"
+      warn "Unknown plugin subcommand. Usage: a> plugin [list | run <name> | info <name> | install <path|github:owner/repo|url> | update [name] | remove <name> | toggle <name> <on|off> | config <name> ... | verify <name> | run --stoprun <name>]"
       ;;
     update)
       autoupdate_status_cmd
@@ -9570,7 +9641,7 @@ command_router() {
       warn "Auto-update disabled for this session."
       ;;
     update\ *)
-      warn "Unknown update subcommand. Usage: t> update [check | on | off]"
+      warn "Unknown update subcommand. Usage: a> update [check | on | off]"
       ;;
     undo)
       run_undo
@@ -9592,7 +9663,7 @@ command_router() {
       cleanup_exit
       ;;
     *)
-      warn "Unknown command. Type: t> help"
+      warn "Unknown command. Type: a> help"
       ;;
   esac
 }
@@ -9614,7 +9685,7 @@ plugin_toggle_prefix_forward() {
   local name="$1" rest="$2" dir entry output status _perm_list
 
   if [[ "${RUNNING_PLUGIN_ENABLED[$name]:-off}" != "on" ]]; then
-    warn "'$name' is toggled off — turn it on first with: t> plugin toggle $name on"
+    warn "'$name' is toggled off — turn it on first with: a> plugin toggle $name on"
     return 1
   fi
 
@@ -9642,7 +9713,7 @@ plugin_toggle_prefix_forward() {
   return $status
 }
 
-# Anything that isn't a "t> ..." command lands here. Ordinarily that's
+# Anything that isn't a "a> ..." command lands here. Ordinarily that's
 # just a chat message, but a running hook plugin with a "toggle_prefix"
 # (e.g. better-websearch's "bws") gets first look — typing "bws> on" or
 # "bws> off" at the normal chat prompt is recognized as that plugin's
@@ -9689,7 +9760,7 @@ main() {
   ask_api_key
 
   # Provider + key setup is done — wipe the "choose a provider" wizard off
-  # the screen (same effect as 't> clear') before moving on to the rest of
+  # the screen (same effect as 'a> clear') before moving on to the rest of
   # startup, so what's left on screen from here reads as one clean session
   # rather than the tail end of a multi-step prompt.
   clear
@@ -9723,10 +9794,10 @@ main() {
     [[ -z "$input" ]] && continue
 
     case "$input" in
-      t\>*)
+      a\>*)
         # Supports both:
-        #   t> help
-        #   t> model
+        #   a> help
+        #   a> model
         command_router "$input"
         ;;
       *)

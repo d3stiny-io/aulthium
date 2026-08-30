@@ -1,16 +1,17 @@
 {
   "name": "skills",
-  "description": "Routes web_search calls through a local library of Claude-style SKILL.md files, using a matching skill instead of a live search",
-  "version": "0.1.0",
+  "description": "On every chat message, checks a local library of Claude-style SKILL.md files and injects every skill that plausibly applies (not just the single best match) before the message reaches the model -- the same way Claude consults its own skills",
+  "version": "0.3.0",
   "entry": "python3 skills.py",
   "runtime": "python3",
   "mode": "hook",
-  "hook": "web_search",
+  "hook": "chat_pre",
   "toggle_prefix": "skills",
   "autostart": true,
   "permissions": ["filesystem"],
   "config": {
     "skills_dir": "~/.aulthium/skills",
-    "min_score": "2"
+    "min_score": "2",
+    "max_skills": "3"
   }
 }

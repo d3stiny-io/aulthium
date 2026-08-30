@@ -2,38 +2,76 @@
 """
 Aulthium hook plugin: "skills"
 
-Verified against aulthium.sh's actual source (web_search_query_plugin_hook
-and handle_repl_input / plugin_toggle_prefix_forward), not just
-BUILD_PLUGIN.md's prose -- the doc never nailed down the exact call shape,
-so this was guessed wrong in an earlier version. It is now:
+Verified against aulthium.sh's actual source (chat_pre_plugin_hook,
+plugin_hook_call, and handle_repl_input / plugin_toggle_prefix_forward),
+not just BUILD_PLUGIN.md's prose -- the doc never nailed down the exact
+call shapes, so earlier versions of this file guessed some of them
+wrong. It is now:
 
-Aulthium invokes `entry` with the triggering text as ONE shell-quoted
-argv argument (`entry "$text"`), in exactly two situations:
+This plugin hooks "chat_pre" (see plugin.json), not "web_search". That
+matters: web_search only fires when the model itself decides to call a
+search tool, so a skill would sit unused on most ordinary requests
+("write me a report") that never trigger a search. chat_pre fires on
+EVERY user message before it's added to history and sent to the model,
+which is what actually mirrors Claude's own behavior of checking for a
+relevant SKILL.md before starting a task, not just when searching.
 
-  1. A real web_search hook call -- the text is the search query.
-  2. A "<prefix>> ..." chat-prompt forward (added to aulthium.sh
-     alongside this plugin) -- the text is whatever followed the prefix,
-     e.g. "use my-skill" for `skills> use my-skill`.
+Two distinct, differently-shaped calls reach this script's entry:
 
-Aulthium does not tell these apart before calling entry -- both arrive
-identically, as a single argv string. This script tells them apart
-itself: if the first word of that string is one of this plugin's own
+  1. A real chat_pre hook call, via aulthium's generic plugin_hook_call:
+     `entry chat_pre "$message"` -- TWO separate, individually
+     shell-quoted argv elements, literal "chat_pre" first, the actual
+     chat message second. This is the live per-message hook.
+  2. A "<prefix>> ..." chat-prompt forward (plugin_toggle_prefix_forward)
+     -- the text is whatever followed the prefix, e.g. "use my-skill"
+     for `skills> use my-skill`, arriving as ONE shell-quoted argv
+     string. Used for this plugin's own management subcommands, and
+     also doubles as a manual way to preview what chat_pre would inject
+     for arbitrary text (`skills> summarize this contract` behaves the
+     same as that text arriving as a real chat message).
+
+main() tells these apart by shape: literal argv == ["chat_pre", <msg>]
+is case 1. Otherwise, if the first word is one of this plugin's own
 subcommands (list/add/remove/import/set/use/test), it's dispatched as a
-command; otherwise the whole string is treated as a real search query
-for the hook logic. A plain shell invocation with normal, separately
-quoted argv words (`python3 skills_hook.py list`) works the same way,
-since both shapes get rejoined into one string before that check.
+command; anything else is treated as chat_pre-style text to match
+against, the same code path case 1 uses. A plain shell invocation with
+normal, separately-quoted argv words (`python3 skills.py list`) is
+handled without rejoining+reshlexing it (that would silently mangle any
+argument containing spaces, e.g. `add name --desc "multi word desc"`);
+only a genuine single-argv-string call gets split.
 
-Exit status matters: for hook (query) calls, printing the matched
-skill and exiting 0 makes Aulthium use it as the search result; printing
-nothing and exiting non-zero makes Aulthium fall through to a real web
-search. Management/`use` commands just print plain text -- there's no
-JSON anywhere in this protocol.
+Exit status matters for the hook path: chat_pre's contract is "exit 0 +
+non-empty stdout REPLACES the message for the rest of the chain (and
+what the model ultimately sees)", so a match prints the matched
+skill(s)' content FOLLOWED BY the user's original, untouched message --
+never just the skill content alone, or the user's actual words would be
+lost from what the model receives. No match: print nothing, exit
+non-zero, so aulthium leaves the message exactly as typed. Management
+commands (list/add/use/...) just print plain text -- there's no JSON
+anywhere in this protocol except `use --json`.
 
-Known tradeoff: a search query that happens to start with exactly one
-of this plugin's subcommand words ("list ...", "use ...") will be
-misread as a command instead of a query. Not fixable from this script's
-side without Aulthium tagging the two call sites differently.
+Known tradeoff: chat text that happens to start with exactly one of
+this plugin's subcommand words ("list restaurants nearby...") will be
+misread as a command instead of chat text, when going through the
+prefix-forward path. This does NOT affect the real chat_pre hook call
+(case 1 above), which is tagged unambiguously by aulthium itself.
+
+v0.3.0: switched from the "web_search" hook to "chat_pre" (see above)
+-- this is the behavior change that makes skill matching actually run
+on every message instead of only when the model chooses to search.
+run_hook was renamed run_chat_pre_hook and now replaces the message
+(skill content + original text) rather than standing in as a fake
+search result.
+
+v0.2.0: hook matching now works the way Claude itself scans skills --
+several SKILL.md files can plausibly apply to one query, so matching no
+longer stops at the single best scorer. Every skill clearing min_score
+is returned, best first, capped at max_skills (config key, default 3)
+so a vague query doesn't dump the whole library into the chat.
+`skills> use` takes one or more names for the same reason (`use docx
+frontend-design`), joining their content with a "---" separator; the
+old single-name --json shape ({..}) is preserved for one name, and
+only becomes a [..] array when more than one name is given.
 """
 
 import argparse
@@ -102,29 +140,59 @@ def score(query, skill):
 
 # ----------------------------------------------------------------- hook
 
-def run_hook(query):
-    """Real web_search hook behavior: print + exit 0 to supply a result,
-    print nothing + exit non-zero to decline and let the real search run."""
-    skills_dir = default_skills_dir()
-    threshold = int(os.environ.get("AULTHIUM_PLUGIN_CFG_MIN_SCORE", "2"))
+def find_matches(query, skills_dir=None, threshold=None, max_skills=None):
+    """Shared matching logic: every skill scoring >= threshold against
+    query, ranked best first, capped at max_skills. Mirrors Claude
+    scanning multiple plausibly-relevant SKILL.md files for one task
+    rather than picking a single winner."""
+    skills_dir = skills_dir if skills_dir is not None else default_skills_dir()
+    if threshold is None:
+        threshold = int(os.environ.get("AULTHIUM_PLUGIN_CFG_MIN_SCORE", "2"))
+    if max_skills is None:
+        max_skills = int(os.environ.get("AULTHIUM_PLUGIN_CFG_MAX_SKILLS", "3"))
 
     skills = load_skills(skills_dir)
     if not query or not skills:
+        return []
+
+    scored = [(score(query, skill), skill) for skill in skills]
+    return sorted(
+        (pair for pair in scored if pair[0] >= threshold),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )[:max_skills]
+
+
+def run_chat_pre_hook(message):
+    """chat_pre hook: runs on every user message before aulthium adds it
+    to history and sends it to the model -- this is what makes skill
+    matching happen on ordinary requests, not just when the model
+    decides to search the web.
+
+    Per chat_pre's contract, non-empty stdout + exit 0 REPLACES the
+    message for the rest of the plugin chain and (unless a later plugin
+    changes it further) is what the model actually sees and what gets
+    stored in history. So a match must include the user's original text,
+    not just the skill content -- otherwise the user's actual request
+    would be silently dropped. No match: print nothing, exit non-zero,
+    so aulthium leaves the message exactly as the user typed it.
+    """
+    matches = find_matches(message)
+    if not matches:
         sys.exit(1)
 
-    best, best_score = None, 0
-    for skill in skills:
-        s = score(query, skill)
-        if s > best_score:
-            best, best_score = skill, s
+    parts = [
+        f"[skills plugin] {len(matches)} skill(s) matched this request "
+        "and should guide the response, most relevant first:\n"
+    ]
+    for s, skill in matches:
+        parts.append(f"--- skill: {skill['name']} (score {s}) ---\n"
+                      f"{skill['full_text'].strip()}\n")
+    parts.append("--- end of matched skills ---\n")
+    parts.append(message)
 
-    if best and best_score >= threshold:
-        print(f"[skill: {best['name']}] matched (score {best_score}) "
-              f"instead of a live web search.\n")
-        print(best["full_text"])
-        sys.exit(0)
-    else:
-        sys.exit(1)
+    print("\n".join(parts))
+    sys.exit(0)
 
 
 # -------------------------------------------------------------- CLI: list
@@ -236,15 +304,22 @@ def cmd_set(args):
 
 def cmd_use(args):
     skills = {s["name"]: s for s in load_skills(args.skills_dir)}
-    skill = skills.get(args.name)
-    if not skill:
-        sys.exit(f"error: no skill named '{args.name}' in {Path(args.skills_dir).expanduser()}")
+    missing = [n for n in args.names if n not in skills]
+    if missing:
+        sys.exit(f"error: no skill named '{missing[0]}' in {Path(args.skills_dir).expanduser()}")
+
+    selected = [skills[n] for n in args.names]
+
     if args.json:
-        print(json.dumps({"name": skill["name"], "description": skill["description"], "body": skill["body"]}))
+        payload = [{"name": s["name"], "description": s["description"], "body": s["body"]} for s in selected]
+        # Single name keeps the old {..} shape so existing callers parsing
+        # `use one-name --json` don't have to change; multiple names get a
+        # JSON array instead of silently only returning the first one.
+        print(json.dumps(payload[0] if len(payload) == 1 else payload))
     elif args.body_only:
-        print(skill["body"].strip())
+        print("\n\n---\n\n".join(s["body"].strip() for s in selected))
     else:
-        print(skill["full_text"].strip())
+        print("\n\n---\n\n".join(s["full_text"].strip() for s in selected))
 
 
 # -------------------------------------------------------------- CLI: test
@@ -293,10 +368,12 @@ def build_parser():
     sp.add_argument("value")
     sp.set_defaults(func=cmd_set)
 
-    sp = sub.add_parser("use", help="print a skill's content on demand (manual invocation)")
-    sp.add_argument("name")
+    sp = sub.add_parser("use", help="print one or more skills' content on demand (manual invocation)")
+    sp.add_argument("names", nargs="+", metavar="name",
+                     help="one or more skill names, e.g. 'use docx' or 'use docx frontend-design'")
     sp.add_argument("--body-only", action="store_true", help="omit the --- frontmatter block")
-    sp.add_argument("--json", action="store_true", help="emit {name, description, body} as JSON instead")
+    sp.add_argument("--json", action="store_true",
+                     help="emit {name, description, body} as JSON (an array when more than one name is given)")
     sp.set_defaults(func=cmd_use)
 
     sp = sub.add_parser("test", help="show which skills a query would match, ranked")
@@ -315,28 +392,61 @@ def main():
         build_parser().print_help()
         sys.exit(1)
 
-    # Rejoin whatever we got into one string. If Aulthium called us (hook
-    # query, or a "<prefix>> ..." forward), argv is already exactly one
-    # element and this is a no-op. If a human ran us from a real shell
-    # with separately quoted words, this reconstructs the same text --
-    # safe either way since the only thing that matters past this point
-    # is the first word.
-    full_text = " ".join(argv)
-    first_word = full_text.split(None, 1)[0] if full_text.strip() else ""
+    # Real chat_pre hook calls arrive as EXACTLY two argv elements, via
+    # aulthium's generic plugin_hook_call: literal "chat_pre" first, the
+    # actual chat message second. Peel this off before anything else --
+    # "chat_pre" isn't one of this plugin's own subcommands, so without
+    # this check it would fall into the generic dispatch below and get
+    # misread as chat text starting with the word "chat_pre".
+    if len(argv) == 2 and argv[0] == "chat_pre":
+        run_chat_pre_hook(argv[1])
+        return
 
-    if first_word in KNOWN_COMMANDS or first_word in ("-h", "--help"):
-        try:
-            parsed_args = shlex.split(full_text)
-        except ValueError:
-            parsed_args = full_text.split()
-        parser = build_parser()
-        args = parser.parse_args(parsed_args)
-        if not getattr(args, "func", None):
-            parser.print_help()
-            sys.exit(1)
-        args.func(args)
+    # Two distinct remaining calling conventions land here, and they
+    # can't be handled the same way:
+    #
+    #   1. Aulthium's prefix-forward convention: `entry "$text"` -- the
+    #      ENTIRE rest arrives as exactly one already-shell-quoted argv
+    #      element (a "<prefix>> ..." forward). That one string still
+    #      needs to be split into words ourselves.
+    #   2. A human running it from a real shell with normal, separately
+    #      quoted words: `skills.py add name --desc "multi word desc"`.
+    #      argv is already correctly tokenized by the shell here -- re-
+    #      joining with spaces and re-splitting (the old approach) throws
+    #      that quoting away and mangles any word containing a space, so
+    #      this path must NOT rejoin/reshlex argv.
+    #
+    # Only the single-argv-element case needs splitting; multi-element
+    # argv is used as-is.
+    if len(argv) == 1:
+        full_text = argv[0]
+        first_word = full_text.split(None, 1)[0] if full_text.strip() else ""
+        if first_word in KNOWN_COMMANDS or first_word in ("-h", "--help"):
+            try:
+                parsed_args = shlex.split(full_text)
+            except ValueError:
+                parsed_args = full_text.split()
+        else:
+            # Not a subcommand -- treat as chat_pre-style text to match
+            # against, same as the real hook path above. This lets
+            # `skills> summarize this contract` preview exactly what
+            # would get injected if that text arrived as a real message.
+            run_chat_pre_hook(full_text)
+            return
     else:
-        run_hook(full_text)
+        first_word = argv[0]
+        if first_word in KNOWN_COMMANDS or first_word in ("-h", "--help"):
+            parsed_args = argv
+        else:
+            run_chat_pre_hook(" ".join(argv))
+            return
+
+    parser = build_parser()
+    args = parser.parse_args(parsed_args)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        sys.exit(1)
+    args.func(args)
 
 
 if __name__ == "__main__":

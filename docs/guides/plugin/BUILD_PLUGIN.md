@@ -40,9 +40,10 @@ the marker-based protocol the in-chat file/shell agent uses.
 | `runtime`       | no       | a command Aulthium checks exists before running `entry` (e.g. `python3`, `node`); skip this if `entry` needs nothing special |
 | `version`       | no       | free-form string, informational only                                    |
 | `mode`          | no       | `"foreground"` (default) or `"hook"` — see [Foreground vs. hook plugins](#foreground-vs-hook-plugins) |
-| `hook`          | if `mode` is `hook` | which hook point to register at — currently only `"web_search"` is supported |
+| `hook`          | if `mode` is `hook` | which hook point to register at — one of `web_search`, `chat_pre`, `shell_exec`, `file_action`, `mcp_call`; see [Hook points and their call conventions](#hook-points-and-their-call-conventions) |
 | `toggle_prefix` | no       | hook mode only — lets `<prefix>> on`/`<prefix>> off` toggle it from the normal chat prompt |
 | `autostart`     | no       | hook mode only — `true` to launch it automatically every time Aulthium starts |
+| `priority`      | no       | hook mode only — integer, default `0`; when more than one plugin shares a hook point, higher runs earlier in the chain (ties keep insertion order) — see [Multiple plugins on one hook point](#multiple-plugins-on-one-hook-point) |
 | `permissions`   | no       | array of scopes this plugin needs — see [Permissions](#permissions) |
 | `config`        | no       | object of default config keys/values — see [Config defaults and overrides](#config-defaults-and-overrides) |
 
@@ -71,16 +72,33 @@ touching `t> plugin toggle`. Setting `"autostart": true` makes it register
 itself again automatically on every future launch, until explicitly
 stopped with `t> plugin run --stoprun <name>`.
 
-### The `web_search` hook's actual call convention
+### Hook points and their call conventions
 
-When the hook fires, Aulthium calls your `entry` command with the search
-query as **one shell-quoted argv argument** — equivalent to
-`entry "$query"`, not JSON, not stdin. Whatever your program prints to
-stdout is used as the result verbatim if it exits 0 with non-empty
-output; a nonzero exit or empty stdout means "I don't have anything for
-this," and Aulthium falls through to its normal search providers instead
-(so a plugin that doesn't want to handle a particular query should just
-print nothing and exit non-zero, rather than treating that as an error).
+There are five hook points, and **they do not all call your `entry`
+command the same way** — get this wrong and your plugin will silently
+misread its own arguments. `web_search` is the odd one out: it's the
+original hook point and predates the others, so it invokes `entry`
+directly with just the query, no hook-name argument in front. Every
+other hook point goes through a shared internal call path that always
+puts the hook's own name first, then its specific arguments after —
+so your entry script always knows which hook point a given call is for
+by looking at `argv[1]` (or `sys.argv[1]` in Python).
+
+| hook point    | call shape                              | argc | chain behavior |
+|---------------|------------------------------------------|------|-----------------|
+| `web_search`  | `entry "$query"`                          | 1    | fallback — tries each plugin in turn, stops at the first one that returns a result |
+| `chat_pre`    | `entry chat_pre "$message"`               | 2    | transform — every active plugin runs, in order, each seeing the previous one's rewrite |
+| `shell_exec`  | `entry shell_exec "$command"`             | 2    | veto/transform — every active plugin runs, in order; any one can veto and stop the chain, or rewrite the command for the rest of the chain |
+| `file_action` | `entry file_action "$action" "$path"`     | 3    | veto — every active plugin runs, in order; any one can veto and stop the chain (`$action` is one of `write`/`edit`/`create-folder`/`delete-file`/`delete-folder`) |
+| `mcp_call`    | `entry mcp_call "$server" "$tool" "$args_json"` | 4 | veto/transform — same as `shell_exec`, but a replacement must be valid JSON or it's discarded with a warning |
+
+Only one hook point can fire per `entry` invocation — Aulthium never
+sends you two hook calls merged into one. If more than one plugin is
+registered on the *same* hook point, see
+[Multiple plugins on one hook point](#multiple-plugins-on-one-hook-point)
+below for how the chain works.
+
+#### `web_search`
 
 ```python
 import sys
@@ -91,25 +109,165 @@ print(result_text)    # becomes the search result
 # sys.exit(1)
 ```
 
+Whatever your program prints to stdout is used as the result verbatim
+if it exits 0 with non-empty output; a nonzero exit or empty stdout
+means "I don't have anything for this," and Aulthium falls through to
+its normal search providers instead (so a plugin that doesn't want to
+handle a particular query should just print nothing and exit non-zero,
+rather than treating that as an error).
+
+#### `chat_pre`
+
+Fires on **every** user message, right before it's added to conversation
+history and sent to the model — the only hook point that runs on
+ordinary chat traffic rather than a specific action the user or model
+triggered. Useful for rewriting or augmenting what the model actually
+sees (a local knowledge base, a house style rewrite, injected context)
+without the user having to ask for it every time.
+
+```python
+import sys
+# sys.argv == ["chat_pre", "<the user's message>"]
+message = sys.argv[2]
+...
+print(new_message_text)   # REPLACES the message for the rest of the
+                            # chain, and (if nothing later changes it
+                            # further) what the model and history get
+sys.exit(0)
+# or, to leave the message untouched:
+# sys.exit(1)   # (or exit 0 with empty stdout)
+```
+
+If you want to *add* to the message rather than replace it outright —
+the common case — make sure your replacement still includes the
+original text somewhere in it; printing only your added content
+silently discards whatever the user typed.
+
+#### `shell_exec`
+
+Fires once, right before the user is asked to confirm a pending shell
+command.
+
+```python
+import sys
+# sys.argv == ["shell_exec", "<the pending command>"]
+cmd = sys.argv[2]
+...
+print("VETO:command touches /etc, blocking")   # blocks it; rest of the
+                                                  # line is shown as the reason
+# or:
+print(rewritten_cmd)   # replaces the command for the rest of the chain
+                        # and (if unchanged further) the confirmation box
+# or, to leave it as-is:
+# sys.exit(1)   # (or exit 0 with empty stdout)
+```
+
+#### `file_action`
+
+Fires once per single-item file mutation (write/edit/create-folder/
+delete-file/delete-folder), before the user is asked to confirm it.
+**Bulk** write/create/delete/move, `FILE_MOVE`/`FOLDER_MOVE`, and
+`ZIP_CREATE`/`ZIP_EXTRACT` are *not* currently routed through this hook.
+
+```python
+import sys
+# sys.argv == ["file_action", "<action>", "<path>"]
+action, path = sys.argv[1], sys.argv[2]
+...
+sys.exit(0)   # allow
+# or:
+print("touches a path outside the expected project root")
+sys.exit(1)   # veto — your stdout becomes the shown reason
+```
+
+Unlike the other hooks, there's no "replace" concept here — a plugin
+either allows (exit 0) or vetoes (non-zero exit, with the reason on
+stdout) a single pending action. There's no built-in review behavior to
+fall back to, so an active chain with nothing registered, or everyone
+allowing, is what lets ordinary file actions through.
+
+#### `mcp_call`
+
+Fires once per pending MCP tool call, before the user is asked to
+confirm it.
+
+```python
+import sys, json
+# sys.argv == ["mcp_call", "<server>", "<tool>", "<args-json>"]
+server, tool, args_json = sys.argv[1], sys.argv[2], sys.argv[3]
+...
+print("VETO:not an approved server")   # blocks it
+# or:
+print(json.dumps(new_args))   # replaces the arguments for the rest of
+                                # the chain — must be valid JSON, or
+                                # it's discarded (with a warning) rather
+                                # than sent on
+# or, to leave the arguments as-is:
+# sys.exit(1)   # (or exit 0 with empty stdout)
+```
+
+### Multiple plugins on one hook point
+
+Any number of plugins can register on the same hook point — there's no
+single "owner" the way there might be in a simpler plugin system. What
+"multiple plugins on one point" *means* differs by hook, matching the
+chain-behavior column in the table above:
+
+- **`web_search`** is a fallback chain: Aulthium calls each active
+  plugin in turn and stops at the first one that returns a real result,
+  falling through to its normal search providers only if every plugin
+  in the chain declines.
+- **`shell_exec`, `file_action`, `mcp_call`** are veto (review) chains:
+  every active plugin gets a look, in order, and any single one can
+  veto and stop the chain right there; `shell_exec`/`mcp_call` also let
+  a plugin rewrite the command/arguments for whichever plugins run
+  after it.
+- **`chat_pre`** is a transform chain: every active plugin runs, in
+  order, and each one sees whatever the previous plugin left the
+  message as — so a rewrite from an earlier plugin is visible to (and
+  can be further changed by) a later one.
+
+Order within a chain is decided by each plugin's `priority` (higher
+runs earlier; default `0`; ties keep insertion order) — see the
+manifest table above. A plugin that's registered but currently toggled
+`off` is skipped entirely; an empty or fully-toggled-off chain means
+every `*_plugin_hook` wrapper falls back to its built-in behavior
+(a real web search, the action goes through unmodified, etc.).
+
 ### Prefix commands beyond on/off
 
 Anything typed after `<prefix>>` that *isn't* literally `on` or `off` is
-forwarded straight to your `entry` command, using the same call
-convention the hook point itself uses: the trailing text goes in as a
-single shell-quoted argv argument, and whatever your program prints to
-stdout is shown back in the chat as-is. Aulthium doesn't parse or
-understand this text at all — your entry script decides what it means.
+forwarded straight to your `entry` command, and whatever your program
+prints to stdout is shown back in the chat as-is. Aulthium doesn't parse
+or understand this text at all — your entry script decides what it
+means.
+
+**This call shape is always the same regardless of which hook point
+your plugin is registered on**: the trailing text goes in as **one**
+shell-quoted argv argument, full stop — `entry "$rest"`. It does *not*
+follow whatever convention your hook point normally uses.
 
 ```
 skills> use my-skill        # -> entry gets invoked as: entry "use my-skill"
 ```
 
+For a plugin registered on `web_search` this happens to look identical
+to a real hook call (both are exactly one argv argument), which is why
+the two need to be told apart by content, not shape — e.g. checking
+whether the text starts with a subcommand word your plugin recognizes.
+
+For a plugin registered on any *other* hook point, the shapes are
+already different and distinguishable on sight: a real `chat_pre` call
+arrives as `entry chat_pre "<message>"` (**two** argv arguments, literal
+`chat_pre` first — see [Hook points and their call
+conventions](#hook-points-and-their-call-conventions)), while a
+`skills> ...` prefix forward always arrives as a single argument with no
+hook name in front of it. Check `len(sys.argv)` (or `argc`) and whether
+`sys.argv[1]` is literally your hook's name before assuming which kind
+of call you're handling.
+
 This only fires while the plugin is toggled **on** — `<prefix>> off`
-blocks it too, same as it blocks the hook point itself. Your entry
-script has to tell this call apart from a real hook invocation itself
-(e.g. by checking whether argv[1] starts with a subcommand word it
-recognizes) — Aulthium doesn't tag the two differently, both arrive as
-one shell-quoted argv argument.
+blocks it too, same as it blocks the hook point itself.
 
 ## Permissions
 
@@ -212,6 +370,7 @@ this way. Useful flags:
 --version <x.y.z>          default: 0.1.0
 --mode foreground|hook     default: foreground
 --hook <point>             required for --mode hook; default: web_search
+                           (one of web_search/chat_pre/shell_exec/file_action/mcp_call)
 --toggle-prefix <p>        hook-mode shorthand, e.g. 'bws' for 'bws> on'
 --autostart                hook-mode: launch automatically every start
 --runtime bash|python3|node|none   default: bash

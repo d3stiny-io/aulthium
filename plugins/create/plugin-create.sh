@@ -7,6 +7,7 @@ set -u
 # ordinary shell prompt:
 #
 #   ./aulthium-plugin-create.sh <name> [flags...]
+#   ./aulthium-plugin-create.sh                    # interactive wizard
 #
 # It writes the exact same plugin.json / entry-script / README shape the
 # main aulthium.sh REPL expects under $PLUGINS_DIR, so anything scaffolded
@@ -18,6 +19,13 @@ set -u
 # exactly what was just written. There is no flag anywhere in this script
 # that makes 'verify' report a match it didn't actually compute — that
 # would defeat the entire point of having a fingerprint in the first place.
+#
+# Run with no arguments at all on a real terminal and you get an
+# interactive wizard instead of the flags above — one prompt per field,
+# aulthium-style ("name> ", same as the main REPL's "User> "), defaults
+# shown inline, Ctrl+C cancels cleanly at any point (same as the main
+# aulthium.sh REPL's own Ctrl+C behavior). Piped/non-interactive input with
+# no flags just gets the usage text instead of hanging on a prompt.
 #
 # Examples:
 #   ./aulthium-plugin-create.sh mytool --security-print --verify
@@ -40,9 +48,10 @@ KNOWN_PLUGIN_PERMISSIONS="network filesystem shell mcp secrets"
 # ── Colors / icons (only used on a real terminal) ───────────────────────
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+  C_ACCENT=$'\033[1;36m'  # cyan — matches aulthium.sh's "User>"-style prompts
   C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'; C_ERR=$'\033[1;31m'; C_MUTED=$'\033[2;37m'
 else
-  C_RESET=""; C_BOLD=""; C_OK=""; C_WARN=""; C_ERR=""; C_MUTED=""
+  C_RESET=""; C_BOLD=""; C_ACCENT=""; C_OK=""; C_WARN=""; C_ERR=""; C_MUTED=""
 fi
 ICON_OK="✓"; ICON_WARN="⚠"; ICON_ERR="✗"
 
@@ -51,6 +60,60 @@ err()  { printf "${C_ERR}${ICON_ERR} %s${C_RESET}\n" "$*" >&2; }
 ok()   { printf "${C_OK}${ICON_OK} %s${C_RESET}\n" "$*"; }
 muted(){ printf "${C_MUTED}%s${C_RESET}\n" "$*"; }
 box()  { printf '%s\n' "── $* ──"; }
+
+# Same idea as aulthium.sh's own `trap cleanup_exit INT` on the main REPL:
+# Ctrl+C anywhere in this script — mid-wizard, or at the plain "overwrite
+# existing plugin?" confirmation below — cancels cleanly with a short
+# message instead of dumping a raw interrupt/traceback. Nothing destructive
+# happens before the user has answered every prompt (the plugin directory
+# isn't touched until after all input is gathered), so a Ctrl+C here never
+# leaves a half-written plugin behind.
+cancelled() {
+  printf '\n'
+  warn "Cancelled."
+  exit 130
+}
+trap cancelled INT
+
+# prompt_read <varname> <label> [default]
+# Reads one line of freeform input with an aulthium-style "<label>> "
+# prompt, colored the same as aulthium.sh's own "User>"/"model>" prompts.
+# Blank input falls back to <default> (if given). A failed read (EOF /
+# Ctrl+D) is treated the same as Ctrl+C — cancels the whole run, rather
+# than leaving the caller to deal with an unset variable.
+prompt_read() {
+  local __var="$1" __label="$2" __default="${3:-}" __ans
+  if ! read -r -p "$(printf "${C_ACCENT}%s>${C_RESET} " "$__label")" __ans; then
+    cancelled
+  fi
+  [[ -z "$__ans" ]] && __ans="$__default"
+  printf -v "$__var" '%s' "$__ans"
+}
+
+# prompt_confirm <label> [default: y|n] — same [y/N]-style confirmation
+# aulthium.sh itself uses. Returns 0 for yes, 1 for no/default.
+prompt_confirm() {
+  local __label="$1" __default="${2:-n}" __ans
+  if ! read -r -p "$(printf "${C_ACCENT}?${C_RESET} %s ${C_MUTED}[y/N]${C_RESET} " "$__label")" __ans; then
+    cancelled
+  fi
+  [[ -z "$__ans" ]] && __ans="$__default"
+  [[ "${__ans,,}" == y || "${__ans,,}" == yes ]]
+}
+
+# Shared by both the interactive wizard's config loop and the --config flag
+# in flag mode, so "key=value" parsing/merging only lives in one place.
+merge_config_kv() {
+  local json="$1" pair="$2" k v merged
+  if [[ "$pair" != *=* ]]; then
+    warn "Ignoring malformed config '$pair' (expected key=value)."
+    printf '%s' "$json"
+    return
+  fi
+  k="${pair%%=*}"; v="${pair#*=}"
+  merged="$(printf '%s' "$json" | jq --arg k "$k" --arg v "$v" '.[$k] = $v' 2>/dev/null)"
+  printf '%s' "${merged:-$json}"
+}
 
 check_deps() {
   local missing=()
@@ -269,12 +332,14 @@ $APP_NAME $APP_VERSION
 
 Usage:
   $(basename "$0") <name> [flags...]
+  $(basename "$0")                    interactive wizard (needs a real terminal)
 
 Flags:
   --desc "<text>"            short description (may contain spaces)
   --version <x.y.z>          default: 0.1.0
   --mode foreground|hook     default: foreground
   --hook <point>             required for --mode hook; default: web_search
+                             (one of web_search/chat_pre/shell_exec/file_action/mcp_call)
   --toggle-prefix <p>        hook-mode shorthand, e.g. 'bws' for 'bws> on'
   --autostart                hook-mode: launch automatically every start
   --runtime bash|python3|node|none   default: bash
@@ -283,6 +348,10 @@ Flags:
   --force                    overwrite an existing plugin of the same name
   --security-print           print the integrity hash right after creating
   --verify                   immediately verify the new plugin's files
+
+Running with no flags at all (and a real terminal on stdin) drops you into
+an interactive wizard that asks for each of the above one at a time —
+Ctrl+C cancels it cleanly at any point, same as the main aulthium.sh REPL.
 
 Plugins are written under: \$AULTHIUM_PLUGINS_DIR or ~/.aulthium/plugins
 (currently: $PLUGINS_DIR)
@@ -293,7 +362,7 @@ EOF
 }
 
 main() {
-  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -eq 0 ]]; then
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
   fi
@@ -303,59 +372,128 @@ main() {
   local name="" desc="" version="0.1.0" mode="foreground" hook="" toggle_prefix=""
   local runtime="bash" dir manifest entry perms=() cfg_json="{}" autostart="false"
   local force=0 do_secprint=0 do_verify=0
-  local -a tokens=("$@")
-  local n="${#tokens[@]}" i=0 t flag val k v
-  local BOOL_FLAGS=" --autostart --security-print --verify --force "
 
-  while (( i < n )); do
-    t="${tokens[$i]}"
-    case "$t" in
-      --*)
-        if [[ "$BOOL_FLAGS" == *" $t "* ]]; then
-          case "$t" in
-            --autostart)       autostart="true" ;;
-            --security-print)  do_secprint=1 ;;
-            --verify)          do_verify=1 ;;
-            --force)           force=1 ;;
-          esac
-          ((i++))
-        else
-          flag="$t"; val=""
-          ((i++))
-          while (( i < n )) && [[ "${tokens[$i]}" != --* ]]; do
-            val+="${val:+ }${tokens[$i]}"
+  if (( $# == 0 )); then
+    # No args at all: drop into an interactive, aulthium-style wizard
+    # instead of just printing usage. Only makes sense with a real
+    # terminal on stdin — a non-interactive caller (piped/scripted, no
+    # tty) gets the usual usage text instead of hanging on a read.
+    if [[ ! -t 0 ]]; then
+      usage
+      exit 1
+    fi
+
+    box "AULTHIUM PLUGIN — interactive setup"
+    muted "Leave a prompt blank to accept its default. Ctrl+C cancels anytime."
+    printf '\n'
+
+    while :; do
+      prompt_read name "name"
+      if [[ -z "$name" ]]; then
+        err "A plugin name is required."
+      elif [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        err "Plugin name must contain only letters, numbers, - or _."
+      else
+        break
+      fi
+    done
+
+    prompt_read desc "description (blank for none)"
+    prompt_read version "version" "0.1.0"
+
+    while :; do
+      prompt_read mode "mode [foreground/hook]" "foreground"
+      mode="${mode,,}"
+      case "$mode" in
+        foreground|hook) break ;;
+        *) err "Enter 'foreground' or 'hook'." ;;
+      esac
+    done
+
+    if [[ "$mode" == "hook" ]]; then
+      muted "Hook points: web_search, chat_pre, shell_exec, file_action, mcp_call"
+      while :; do
+        prompt_read hook "hook point" "web_search"
+        case "$hook" in
+          web_search|chat_pre|shell_exec|file_action|mcp_call) break ;;
+          *) err "Enter one of: web_search, chat_pre, shell_exec, file_action, mcp_call." ;;
+        esac
+      done
+      prompt_read toggle_prefix "toggle prefix (blank to skip)"
+      prompt_confirm "autostart this plugin on every launch?" "n" && autostart="true"
+    fi
+
+    while :; do
+      prompt_read runtime "runtime [bash/python3/node/none]" "bash"
+      runtime="${runtime,,}"
+      case "$runtime" in
+        bash|python3|python|node|none) break ;;
+        *) err "Enter one of: bash, python3, node, none." ;;
+      esac
+    done
+
+    local perms_line
+    prompt_read perms_line "permissions, space-separated (network filesystem shell mcp secrets; blank for none)"
+    [[ -n "$perms_line" ]] && read -r -a perms <<< "$perms_line"
+
+    muted "Config defaults — enter key=value, blank line to finish."
+    while :; do
+      local cfg_pair
+      prompt_read cfg_pair "config"
+      [[ -z "$cfg_pair" ]] && break
+      cfg_json="$(merge_config_kv "$cfg_json" "$cfg_pair")"
+    done
+
+    prompt_confirm "print the security fingerprint after creating?" "n" && do_secprint=1
+    prompt_confirm "verify files after creating?" "n" && do_verify=1
+    printf '\n'
+  else
+    local -a tokens=("$@")
+    local n="${#tokens[@]}" i=0 t flag val k v
+    local BOOL_FLAGS=" --autostart --security-print --verify --force "
+
+    while (( i < n )); do
+      t="${tokens[$i]}"
+      case "$t" in
+        --*)
+          if [[ "$BOOL_FLAGS" == *" $t "* ]]; then
+            case "$t" in
+              --autostart)       autostart="true" ;;
+              --security-print)  do_secprint=1 ;;
+              --verify)          do_verify=1 ;;
+              --force)           force=1 ;;
+            esac
             ((i++))
-          done
-          case "$flag" in
-            --name)          name="$val" ;;
-            --desc)          desc="$val" ;;
-            --version)       [[ -n "$val" ]] && version="$val" ;;
-            --mode)          [[ -n "$val" ]] && mode="$val" ;;
-            --hook)          hook="$val" ;;
-            --toggle-prefix) toggle_prefix="$val" ;;
-            --runtime)       [[ -n "$val" ]] && runtime="$val" ;;
-            --perm)          [[ -n "$val" ]] && perms+=("$val") ;;
-            --config)
-              if [[ "$val" == *=* ]]; then
-                k="${val%%=*}"; v="${val#*=}"
-                cfg_json="$(printf '%s' "$cfg_json" | jq --arg k "$k" --arg v "$v" '.[$k] = $v' 2>/dev/null)"
-                [[ -z "$cfg_json" ]] && cfg_json="{}"
-              else
-                warn "Ignoring malformed --config '$val' (expected key=value)."
-              fi
-              ;;
-            *)
-              warn "Unknown flag '$flag' — ignoring."
-              ;;
-          esac
-        fi
-        ;;
-      *)
-        [[ -z "$name" ]] && name="$t"
-        ((i++))
-        ;;
-    esac
-  done
+          else
+            flag="$t"; val=""
+            ((i++))
+            while (( i < n )) && [[ "${tokens[$i]}" != --* ]]; do
+              val+="${val:+ }${tokens[$i]}"
+              ((i++))
+            done
+            case "$flag" in
+              --name)          name="$val" ;;
+              --desc)          desc="$val" ;;
+              --version)       [[ -n "$val" ]] && version="$val" ;;
+              --mode)          [[ -n "$val" ]] && mode="$val" ;;
+              --hook)          hook="$val" ;;
+              --toggle-prefix) toggle_prefix="$val" ;;
+              --runtime)       [[ -n "$val" ]] && runtime="$val" ;;
+              --perm)          [[ -n "$val" ]] && perms+=("$val") ;;
+              --config)        [[ -n "$val" ]] && cfg_json="$(merge_config_kv "$cfg_json" "$val")" ;;
+              *)
+                warn "Unknown flag '$flag' — ignoring."
+                ;;
+            esac
+          fi
+          ;;
+        *)
+          [[ -z "$name" ]] && name="$t"
+          ((i++))
+          ;;
+      esac
+    done
+  fi
 
   if [[ -z "$name" ]]; then
     usage
@@ -392,12 +530,11 @@ main() {
   if [[ -d "$dir" ]]; then
     if [[ "$force" -eq 1 ]]; then
       rm -rf -- "$dir"
+    elif prompt_confirm "A plugin named '$name' already exists at $dir — overwrite it?" "n"; then
+      rm -rf -- "$dir"
     else
-      read -r -p "A plugin named '$name' already exists at $dir — overwrite it? [y/N] " ans
-      case "${ans,,}" in
-        y|yes) rm -rf -- "$dir" ;;
-        *) warn "Cancelled."; exit 1 ;;
-      esac
+      warn "Cancelled."
+      exit 1
     fi
   fi
 
