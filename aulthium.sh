@@ -84,11 +84,36 @@ MCP_PROTO_VERSIONS=() # protocolVersion the server actually negotiated at initia
 MCP_TOOLS_JSON=()   # one JSON array of {name,description,inputSchema} per server; "[]" until discovered
 MCP_RPC_NEXT_ID=1
 
+# Auth method per configured server, index-aligned with MCP_NAMES: "none",
+# "apikey" (bearer key sitting in MCP_KEYS, same as before), or "oauth"
+# (bearer key for each request is pulled live from the credential store via
+# oauth_get_valid_token — see the OAUTH 2.1 CLIENT section below). Existing
+# servers registered before this existed default to "apikey"/"none" so old
+# behavior is untouched — see mcp_register_server.
+MCP_AUTH_TYPES=()
+# Credential-store id for this server's OAuth tokens ("" unless auth type is
+# "oauth"). Deliberately NOT the server name itself, so a server can be
+# removed and re-added under the same name without colliding with leftover
+# credentials from a previous, differently-scoped connection.
+MCP_OAUTH_CRED_IDS=()
+
 # Servers can be pre-configured at launch via the MCP_SERVERS env var:
 #   MCP_SERVERS="name1=https://host1/mcp,name2=https://host2/mcp"
 # with an optional per-server bearer key picked up from
 # MCP_<NAME>_KEY (name uppercased, non-alphanumeric chars turned into "_").
 # Anything beyond that is managed at runtime with 't> mcp add/remove/list/refresh'.
+
+# ── Credential storage (OAuth tokens, etc.) ─────────────────────────────
+# See CREDENTIAL STORE section below for the implementation and its
+# documented security model. Directory is created lazily (0700) on first
+# use, not at startup, so a pure API-key session never touches disk.
+CRED_STORE_DIR="${AULTHIUM_CRED_DIR:-$HOME/.aulthium/credentials}"
+# "plain" (default: 0600-permissioned JSON files) or "encrypted" (AES-256
+# via openssl, passphrase held in memory only) — see cred_store_init.
+# 't> mcp cred encrypt on' switches this on for the rest of the session.
+CRED_STORE_MODE="plain"
+CRED_STORE_PASSPHRASE="" # session-only; never written to disk. Encrypted mode only.
+CRED_STORE_INITIALIZED=0
 
 # ── Auto-update ──────────────────────────────────────────────────────────
 # Point AULTHIUM_UPDATE_URL at a raw copy of this same script (e.g. a
@@ -181,11 +206,11 @@ PLUGIN_INSTALL_SOURCE_REPO=""
 # one (e.g. webchat). A hook plugin doesn't take over the terminal when
 # run: `t> plugin run <name>` just registers it here and hands control
 # straight back to the normal "User>" prompt. It's invoked on-demand,
-# per call, at whatever hook point its manifest names (currently only
-# "web_search" — see WEB_SEARCH_HOOK_PLUGIN / web_search_query_plugin_hook)
-# instead of running continuously as a background process.
+# per call, at whatever hook point its manifest names — see
+# KNOWN_HOOK_POINTS below for the full list — instead of running
+# continuously as a background process.
 #
-# All five arrays are keyed by plugin name and stay in lockstep — a name
+# All six arrays are keyed by plugin name and stay in lockstep — a name
 # is "running" iff it has an entry in RUNNING_PLUGIN_ENABLED. Session-only,
 # same as everything else here: nothing here survives a restart, so a
 # hook plugin needs `t> plugin run <name>` again after one.
@@ -193,18 +218,127 @@ declare -A RUNNING_PLUGIN_ENABLED=()      # name -> "on" | "off"
 declare -A RUNNING_PLUGIN_HOOK=()         # name -> hook point, e.g. "web_search"
 declare -A RUNNING_PLUGIN_ENTRY=()        # name -> manifest "entry" command
 declare -A RUNNING_PLUGIN_DIR=()          # name -> plugin's install dir
-declare -A RUNNING_PLUGIN_TOGGLE_PREFIX=()# name -> its "<prefix>>" shorthand, if any
+declare -A RUNNING_PLUGIN_TOGGLE_PREFIX=()  # name -> its "<prefix>>" shorthand, if any
+declare -A RUNNING_PLUGIN_PRIORITY=()     # name -> manifest "priority" int (default 0)
 
 # Reverse lookup for the REPL: "<prefix>>" input text -> plugin name, so
 # typing e.g. "bws> on" at the main prompt is recognized without scanning
 # all of RUNNING_PLUGIN_TOGGLE_PREFIX on every keystroke loop.
 declare -A TOGGLE_PREFIX_TO_PLUGIN=()
 
-# Which registered hook plugin (if any) currently owns the "web_search"
-# hook point. Only one plugin can own a given hook point at a time —
-# running a second one for the same point replaces the first (with a
-# warning), rather than trying to chain/merge two search backends.
-WEB_SEARCH_HOOK_PLUGIN=""
+# Hook points this version of Aulthium knows about. A plugin's manifest
+# "hook" field must be one of these (checked by hook_point_is_known) to
+# actually register, though plugin_manifest_validate only warns (not
+# blocks) on install for an unrecognized one, same as it does for unknown
+# permission strings — a future Aulthium version may add more points.
+#   web_search  — see web_search_query_plugin_hook (built in from the start)
+#   shell_exec  — see shell_exec_plugin_hook, called from handle_shell_run_action
+#   file_action — see file_action_plugin_hook, called from the core single-item
+#                 file mutation handlers (write/edit/create-folder/delete-file/
+#                 delete-folder). NOTE: bulk write/create/delete/move, FILE_MOVE/
+#                 FOLDER_MOVE, and the ZIP_CREATE/ZIP_EXTRACT actions are NOT
+#                 currently routed through this hook.
+#   mcp_call    — see mcp_call_plugin_hook, called from handle_mcp_call_action
+#   chat_pre    — see chat_pre_plugin_hook, called from send_chat
+KNOWN_HOOK_POINTS="web_search shell_exec file_action mcp_call chat_pre"
+
+# hook_name -> name of the plugin that currently owns it. Only one plugin
+# can own a given hook point at a time — see hook_claim_ownership for the
+# priority-based rule used when a second plugin wants the same point.
+declare -A HOOK_OWNER=()
+
+# True (exit 0) iff $1 is one of KNOWN_HOOK_POINTS.
+hook_point_is_known() {
+  local h=" $KNOWN_HOOK_POINTS "
+  [[ "$h" == *" $1 "* ]]
+}
+
+# Attempts to give plugin $1 ownership of hook point $2 at priority $3
+# (integer; higher = stronger claim, default/undeclared is 0). If the
+# point is unclaimed, or already owned by $1 itself (re-registration),
+# takes it immediately. If owned by a different plugin:
+#   - equal or lower incumbent priority: the incumbent is stopped
+#     (plugin_stoprun) and $1 takes over, with a warning naming what
+#     was replaced — this is the original "last one in wins" behavior,
+#     now scoped to same-or-lower priority so a plugin that cares can
+#     opt out of being casually bumped by declaring a higher "priority"
+#     in its plugin.json.
+#   - strictly higher incumbent priority: refuses and warns; $1 does
+#     NOT take the point. Returns 1.
+# Callers (plugin_run, plugins_autostart) still need to set
+# RUNNING_PLUGIN_PRIORITY[$1] themselves after a successful claim.
+hook_claim_ownership() {
+  local name="$1" hook="$2" priority="${3:-0}" incumbent incumbent_priority
+  incumbent="${HOOK_OWNER[$hook]:-}"
+  if [[ -z "$incumbent" || "$incumbent" == "$name" ]]; then
+    HOOK_OWNER[$hook]="$name"
+    return 0
+  fi
+  incumbent_priority="${RUNNING_PLUGIN_PRIORITY[$incumbent]:-0}"
+  if (( priority < incumbent_priority )); then
+    warn "'$name' wants the $hook hook but '$incumbent' already holds it at a higher priority (${incumbent_priority} > ${priority}) — skipped."
+    return 1
+  fi
+  warn "Replacing '$incumbent' as the active $hook hook with '$name'."
+  plugin_stoprun "$incumbent"
+  HOOK_OWNER[$hook]="$name"
+  return 0
+}
+
+# Releases whatever hook point $1 currently owns, if any. Called from
+# plugin_stoprun so a stopped plugin never leaves a dangling HOOK_OWNER
+# entry pointing at a name that's no longer running.
+hook_release_ownership() {
+  local name="$1" hook="${RUNNING_PLUGIN_HOOK[$name]:-}"
+  [[ -n "$hook" && "${HOOK_OWNER[$hook]:-}" == "$name" ]] && unset "HOOK_OWNER[$hook]"
+}
+
+# Shells out to hook plugin $1's entry command with "$2..." appended as
+# individually shell-quoted arguments — the shared invocation core behind
+# every specific *_plugin_hook wrapper below (web_search_query_plugin_hook
+# has its own inline copy of this for historical reasons and is untouched).
+# Exports the same env a foreground `t> plugin run` gets (provider/model/
+# key, config overrides, secrets only if the plugin's permissions include
+# "secrets") around the single call and cleans it up after, exactly like
+# plugin_toggle_prefix_forward does for its "<prefix>> ..." shorthand calls.
+# Prints nothing itself; leaves the plugin's stdout in PLUGIN_HOOK_OUTPUT
+# and returns its exit status. Callers decide what a non-zero status means
+# for their hook point — see the wrapper functions for each one's contract.
+plugin_hook_call() {
+  local name="$1" dir entry status _perm_list
+  shift
+  dir="${RUNNING_PLUGIN_DIR[$name]}"
+  entry="${RUNNING_PLUGIN_ENTRY[$name]}"
+  local -a quoted_args=()
+  local a
+  for a in "$@"; do quoted_args+=("$(printf '%q' "$a")"); done
+
+  _perm_list="$(jq -r '.permissions // [] | join(" ")' "$dir/plugin.json" 2>/dev/null)"
+  [[ " $_perm_list " == *" secrets "* ]] && PLUGIN_EXPORT_SECRETS=1 || PLUGIN_EXPORT_SECRETS=0
+  plugin_export_env
+  plugin_export_config_env "$name" "$dir"
+  PLUGIN_HOOK_OUTPUT="$(cd "$dir" && eval "$entry" "${quoted_args[@]}" 2>/dev/null)"
+  status=$?
+  unset AULTHIUM_API_KEY AULTHIUM_API_URL AULTHIUM_API_KIND AULTHIUM_PROVIDER \
+        AULTHIUM_PROVIDER_LABEL AULTHIUM_MODEL AULTHIUM_WORKSPACE_DIR \
+        AULTHIUM_APP_NAME AULTHIUM_APP_VERSION AULTHIUM_SKIP_CONFIRMATIONS \
+        AULTHIUM_MAX_RATE_LIMIT_RETRIES AULTHIUM_MAX_RATE_LIMIT_WAIT \
+        AULTHIUM_SHELL_TIMEOUT_SECS
+  plugin_unset_config_env
+  PLUGIN_EXPORT_SECRETS=0
+  return $status
+}
+
+# True (0) iff hook point $1 currently has an owner that's also toggled on
+# — the common "is there actually anyone to call" guard shared by every
+# *_plugin_hook wrapper below, so a hook point with no plugin, or one
+# that's registered but toggled off, is indistinguishable to a call site
+# from "hook not active" without each of them re-deriving it.
+hook_point_is_active() {
+  local name="${HOOK_OWNER[$1]:-}"
+  [[ -n "$name" ]] || return 1
+  [[ "${RUNNING_PLUGIN_ENABLED[$name]:-off}" == "on" ]]
+}
 
 # In-memory conversation history only.
 # We keep the system prompt in the history from the start.
@@ -359,20 +493,20 @@ full content of the second file
 (any number of ITEM blocks, each with its own path and full content — same content rules as FILE_WRITE, and
 missing parent folders are created automatically per item, same as FILE_WRITE)
 
-To create several empty folders at once, output a block EXACTLY like this — one relative path per line,
-nothing else on each line:
+To create several empty folders at once, output a block EXACTLY like this — one ITEM line per entry, and
+nothing else in the block besides ITEM lines:
 <<<BULK_FOLDER_CREATE>>>
-relative/folder/one
-relative/folder/two
-relative/folder/three
+<<<ITEM path="relative/folder/one">>>
+<<<ITEM path="relative/folder/two">>>
+<<<ITEM path="relative/folder/three">>>
 <<<END_BULK_FOLDER_CREATE>>>
 
-To delete several files and/or folders at once, output a block EXACTLY like this — one relative path per
-line. You do NOT need to know or say whether each path is a file or a folder; that's detected automatically
-and the right kind of removal is applied to each:
+To delete several files and/or folders at once, output a block EXACTLY like this — one ITEM line per entry,
+and nothing else in the block besides ITEM lines. You do NOT need to know or say whether each path is a
+file or a folder; that's detected automatically and the right kind of removal is applied to each:
 <<<BULK_DELETE>>>
-relative/path/to/old-file.txt
-relative/path/to/old-folder
+<<<ITEM path="relative/path/to/old-file.txt">>>
+<<<ITEM path="relative/path/to/old-folder">>>
 <<<END_BULK_DELETE>>>
 
 To move or rename several files and/or folders at once, output a block EXACTLY like this — one ITEM line per
@@ -772,6 +906,23 @@ check_deps() {
     warn "flock not found — DDG Lite's rate limiter will run without cross-process locking (fine for normal single-session use)."
   fi
 
+  # base64 (coreutils) is required for OAuth PKCE (RFC 7636) and for
+  # encoding token-store contents — without it, "t> mcp add" can still add
+  # apikey/none-auth servers, but OAuth-based connections are disabled.
+  HAVE_BASE64=1
+  want_cmd base64 || HAVE_BASE64=0
+  [[ "$HAVE_BASE64" -eq 0 ]] && warn "base64 not found — OAuth-based MCP connections will be unavailable (API-key and unauthenticated servers are unaffected)."
+
+  # nc (netcat) is what the OAuth loopback callback listener uses to
+  # receive the browser redirect. Not required — if it's missing,
+  # oauth_run_flow (see oauth_callback_method) falls back to a python3
+  # one-shot HTTP server instead, offering to install python first if
+  # neither is present, and only drops to a manual paste-the-redirect-URL
+  # prompt if that's declined or fails.
+  HAVE_NC=1
+  want_cmd nc || HAVE_NC=0
+  [[ "$HAVE_NC" -eq 0 ]] && warn "nc (netcat) not found — OAuth logins will use a python3 fallback listener instead (installing python if needed), or ask you to paste the redirect URL manually if that's unavailable."
+
   # Web search parses HTML results (3 SearXNG instances, then DuckDuckGo
   # Lite — see web_search_query) with PCRE (grep -P, needed for \K and non-greedy
   # matching) when available; otherwise it falls back to a plain POSIX-ERE
@@ -1138,6 +1289,33 @@ default_workspace_dir() {
   return 0
 }
 
+# Rejects strings that read like a sentence rather than a plausible relative
+# path. Exists specifically because BULK_FOLDER_CREATE and BULK_DELETE parse
+# as "one path per line, nothing else" with no <<<ITEM>>> wrapper and no
+# regex on the line at all (see process_agent_reply) — every other marker
+# at least requires matching a path="..." attribute inside <<<...>>> before
+# a string is treated as a path. If a model ever slips ordinary prose inside
+# one of those two blocks instead of sticking to bare paths (seen mostly
+# from smaller/free models improvising near the edges of the format), that
+# sentence — or, worse, each individual word if it gets line-wrapped one
+# token per line — would otherwise sail straight through as a literal
+# folder to create or a target to delete. This is deliberately loose about
+# what a path can contain (spaces, dots, hyphens are all fine); it only
+# filters the combination of "several words" and/or punctuation that real
+# relative paths essentially never have.
+looks_like_plausible_path() {
+  local p="$1" wc
+
+  case "$p" in
+    *[\!\?\"\'\`\;]*) return 1 ;;
+  esac
+
+  wc=$(wc -w <<< "$p")
+  (( wc > 6 )) && return 1
+
+  return 0
+}
+
 # Resolves a model-proposed relative path against the workspace and guarantees
 # the result stays inside it. This is the single choke point that keeps every
 # file action confined to the sandbox — absolute paths, "..", and symlink
@@ -1156,6 +1334,11 @@ resolve_safe_path() {
       return 1
       ;;
   esac
+
+  if ! looks_like_plausible_path "$rel"; then
+    err "Rejected — looks like free text, not a real path: $rel"
+    return 1
+  fi
 
   abs="$(realpath -m "$WORKSPACE_DIR/$rel" 2>/dev/null)" || {
     err "Could not resolve path: $rel"
@@ -1406,10 +1589,13 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir" "show the current sandbox folder"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> workdir <path>" "change the sandbox folder"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp" "list connected MCP servers and their tools"
-  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp add <n> <url>" "connect a remote MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp add <n> <url>" "connect a remote MCP server (API key or none)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp oauth <n> <url>" "connect via OAuth 2.1 + PKCE (opens your browser)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp remove <name>" "disconnect an MCP server"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp refresh [name]" "re-discover tools (one server, or all)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp cloudflare" "quick-pick from Cloudflare's managed MCP servers"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp github" "quick-connect to GitHub's official remote MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> mcp cred ..." "encrypt on/off | clear — manage stored OAuth tokens"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin" "list installed plugins"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run <name>" "launch a plugin (needs a y/N permissions grant)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "t> plugin run --stoprun <n>" "fully stop/de-register a running hook plugin"
@@ -1494,6 +1680,9 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       managed MCP servers (docs, Workers bindings, Radar, AI\n"
   printf "${C_MUTED}│${C_RESET}       Gateway, ...) by name instead of typing out a URL — once\n"
   printf "${C_MUTED}│${C_RESET}       added they're ordinary MCP servers like any other.\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> mcp github${C_MUTED} quick-connects to GitHub's official\n"
+  printf "${C_MUTED}│${C_RESET}       remote MCP server (repos, issues, PRs, Actions, ...) via\n"
+  printf "${C_MUTED}│${C_RESET}       a personal access token or browser OAuth.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
   printf "\n${C_ACCENT2}┌─ PLUGINS ─────────────────────────────────────${C_RESET}\n"
@@ -1514,6 +1703,14 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}\n"
   printf "${C_MUTED}│${C_RESET}       Write your own by reading BUILD_PLUGIN.md, then\n"
   printf "${C_MUTED}│${C_RESET}       ${C_RESET}t> plugin install <folder|github:owner/repo|url>${C_MUTED}.\n"
+  printf "${C_MUTED}│${C_RESET}\n"
+  printf "${C_MUTED}│${C_RESET}       A \"hook\" plugin (${C_RESET}\"mode\": \"hook\"${C_MUTED} in its manifest)\n"
+  printf "${C_MUTED}│${C_RESET}       registers for one hook point and is invoked on-demand\n"
+  printf "${C_MUTED}│${C_RESET}       instead of taking over the terminal. Known hook points:\n"
+  printf "${C_MUTED}│${C_RESET}       %s\n" "$KNOWN_HOOK_POINTS"
+  printf "${C_MUTED}│${C_RESET}       Only one plugin can own a given point at a time — an\n"
+  printf "${C_MUTED}│${C_RESET}       optional integer ${C_RESET}\"priority\"${C_MUTED} in plugin.json (default 0)\n"
+  printf "${C_MUTED}│${C_RESET}       decides who wins if two plugins want the same one.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n\n"
 }
 
@@ -2480,10 +2677,39 @@ undo_status() {
 }
 
 
+# If a "file_action" hook plugin is registered and toggled on, gives it a
+# look at a pending file mutation before the user is even asked to confirm
+# it. Entry is invoked as: <entry> file_action <action> <path>, where
+# action is one of write/edit/create-folder/delete-file/delete-folder (see
+# KNOWN_HOOK_POINTS comment for which call sites this does and doesn't
+# cover). UNLIKE web_search's hook, a non-zero exit here is a deliberate
+# VETO, not "the hook failed" — there's no built-in file-review behavior
+# to fall back to, so silence/success (exit 0) is the only way to mean
+# "allow". Sets FILE_ACTION_HOOK_VETO_REASON to the plugin's stdout (or a
+# generic fallback if it printed nothing) when it vetoes. No hook
+# registered, or one that's toggled off, always allows (returns 0) — a
+# missing hook plugin should never block ordinary file actions.
+file_action_plugin_hook() {
+  local action="$1" path="$2" name
+  hook_point_is_active "file_action" || return 0
+  name="${HOOK_OWNER[file_action]}"
+
+  if plugin_hook_call "$name" "file_action" "$action" "$path"; then
+    return 0
+  fi
+  FILE_ACTION_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT:-'$name' declined this action without a reason}"
+  return 1
+}
+
 handle_write_action() {
   local rel="$1" content_file="$2" abs lines parent_dir missing_dirs
 
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe write proposal: $rel"; return; }
+
+  if ! file_action_plugin_hook "write" "$abs"; then
+    warn "Skipped write: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    return
+  fi
 
   parent_dir="$(dirname "$abs")"
   missing_dirs=""
@@ -2527,6 +2753,11 @@ handle_edit_action() {
   local abs total old_lines tmpfile
 
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe edit proposal: $rel"; return; }
+
+  if ! file_action_plugin_hook "edit" "$abs"; then
+    warn "Skipped edit: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    return
+  fi
 
   if [[ ! -e "$abs" ]]; then
     err "Cannot edit, file does not exist (use FILE_WRITE to create it first): $abs"
@@ -2617,6 +2848,11 @@ handle_folder_create_action() {
 
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe folder proposal: $rel"; return; }
 
+  if ! file_action_plugin_hook "create-folder" "$abs"; then
+    warn "Skipped folder creation: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    return
+  fi
+
   if [[ -e "$abs" ]]; then
     if [[ -d "$abs" ]]; then
       warn "Folder already exists, nothing to do: $abs"
@@ -2648,6 +2884,11 @@ handle_delete_action() {
   local rel="$1" abs
 
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe delete proposal: $rel"; return; }
+
+  if ! file_action_plugin_hook "delete-file" "$abs"; then
+    warn "Skipped delete: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    return
+  fi
 
   if [[ -d "$abs" ]]; then
     err "Refusing to delete a directory (only single files are allowed): $abs"
@@ -2872,6 +3113,11 @@ handle_folder_delete_action() {
   local rel="$1" abs entry_count
 
   abs="$(resolve_safe_path "$rel")" || { warn "Skipped unsafe folder delete proposal: $rel"; return; }
+
+  if ! file_action_plugin_hook "delete-folder" "$abs"; then
+    warn "Skipped folder delete: $rel (blocked by hook plugin — $FILE_ACTION_HOOK_VETO_REASON)"
+    return
+  fi
 
   # Extra guard on top of resolve_safe_path/is_dangerous_root: never allow
   # this to resolve to the workspace root itself — only real subfolders.
@@ -4276,7 +4522,7 @@ web_search_query_scrape_ddglite() {
 # disabled hook plugin never blocks search outright.
 web_search_query_plugin_hook() {
   local query="$1" name dir entry output status
-  name="$WEB_SEARCH_HOOK_PLUGIN"
+  name="${HOOK_OWNER[web_search]:-}"
   [[ -n "$name" ]] || return 1
   [[ "${RUNNING_PLUGIN_ENABLED[$name]:-off}" == "on" ]] || {
     WEB_SEARCH_LAST_ERROR="hook plugin '$name' is installed but toggled off (t> plugin toggle $name on to re-enable)."
@@ -4506,11 +4752,33 @@ mcp_rpc() {
 # Full connect sequence for server index $1: initialize, (best-effort)
 # notifications/initialized, tools/list. Updates MCP_SESSION_IDS and
 # MCP_TOOLS_JSON for that index in place. Prints a status box either way.
+# Resolves the bearer token to actually send for server index $1, whatever
+# its auth type: a static key for "apikey"/"none" (unchanged from before
+# OAuth existed), or a live, auto-refreshed access token pulled from the
+# credential store for "oauth". Returns 2 (distinct from 1/"no token") when
+# an oauth server's token is unrecoverably expired, so callers can tell the
+# user to reconnect rather than just report a generic auth failure.
+mcp_resolve_key() {
+  local idx="$1" auth_type="${MCP_AUTH_TYPES[$idx]:-apikey}" tok rc
+  if [[ "$auth_type" == "oauth" ]]; then
+    tok="$(oauth_get_valid_token "${MCP_OAUTH_CRED_IDS[$idx]}")"; rc=$?
+    if [[ $rc -eq 2 ]]; then
+      warn "OAuth session for \"${MCP_NAMES[$idx]}\" has expired and can't be refreshed — run: t> mcp oauth ${MCP_NAMES[$idx]} ${MCP_URLS[$idx]}"
+      return 1
+    fi
+    [[ $rc -ne 0 ]] && return 1
+    printf '%s' "$tok"
+    return 0
+  fi
+  printf '%s' "${MCP_KEYS[$idx]}"
+  return 0
+}
+
 mcp_connect_server() {
   local idx="$1" name url key params tools count negotiated
   name="${MCP_NAMES[$idx]}"
   url="${MCP_URLS[$idx]}"
-  key="${MCP_KEYS[$idx]}"
+  key="$(mcp_resolve_key "$idx")" || key=""
 
   box_top "MCP CONNECT" "$ICON_MCP" "$C_ACCENT2"
   box_line "$name -> $url"
@@ -4554,10 +4822,13 @@ mcp_connect_server() {
 
 # Pushes a new server into the parallel arrays and connects it — the shared
 # tail end of every "add a server" path (manual t> mcp add, MCP_SERVERS
-# bootstrap, the Cloudflare quick-pick below), so they can't drift out of
-# sync with each other. Returns mcp_connect_server's status.
+# bootstrap, the Cloudflare quick-pick below, and now t> mcp oauth), so
+# they can't drift out of sync with each other. auth_type/oauth_cred_id
+# default to the pre-OAuth "apikey"/"" shape so every existing call site
+# above keeps working unchanged. Returns mcp_connect_server's status.
 mcp_register_server() {
-  local name="$1" url="$2" key="$3" idx
+  local name="$1" url="$2" key="$3" auth_type="${4:-apikey}" oauth_cred_id="${5:-}" idx
+  [[ -z "$key" && "$auth_type" == "apikey" ]] && auth_type="none"
   idx="${#MCP_NAMES[@]}"
   MCP_NAMES[$idx]="$name"
   MCP_URLS[$idx]="$url"
@@ -4565,6 +4836,8 @@ mcp_register_server() {
   MCP_SESSION_IDS[$idx]=""
   MCP_PROTO_VERSIONS[$idx]=""
   MCP_TOOLS_JSON[$idx]="[]"
+  MCP_AUTH_TYPES[$idx]="$auth_type"
+  MCP_OAUTH_CRED_IDS[$idx]="$oauth_cred_id"
   mcp_connect_server "$idx"
 }
 
@@ -4600,9 +4873,56 @@ mcp_add_server() {
   fi
 }
 
+# 't> mcp oauth <name> <url>' — same shape as 't> mcp add' but authenticates
+# via the generic OAuth 2.1 + PKCE flow (oauth_run_flow) instead of a
+# static bearer key. The resulting tokens are stored under a fresh
+# credential id (not the server name — see MCP_OAUTH_CRED_IDS comment)
+# so removing and re-adding the server never collides with a stale token.
+mcp_add_server_oauth() {
+  local name="$1" url="$2" cred_id token_json
+  if [[ -z "$name" || -z "$url" ]]; then
+    warn "Usage: t> mcp oauth <name> <url>"
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    warn "Server name must be alphanumeric (- and _ allowed), no spaces: $name"
+    return 1
+  fi
+  if mcp_find_index "$name" >/dev/null; then
+    warn "A server named \"$name\" is already configured — 't> mcp remove $name' first to replace it."
+    return 1
+  fi
+  if [[ "${HAVE_BASE64:-1}" -eq 0 ]]; then
+    err "OAuth requires base64 (coreutils), which isn't installed."
+    return 1
+  fi
+
+  token_json="$(oauth_run_flow "$url" "$name")"
+  if [[ -z "$token_json" ]]; then
+    err "OAuth connection to \"$name\" failed: ${OAUTH_FLOW_ERROR:-unknown error}"
+    return 1
+  fi
+
+  cred_id="oauth-${name}-$(date +%s)-$$"
+  if ! cred_save "$cred_id" "$token_json"; then
+    err "Got a token for \"$name\" but couldn't save it to the credential store — aborting rather than run session-only."
+    return 1
+  fi
+
+  if mcp_register_server "$name" "$url" "" "oauth" "$cred_id"; then
+    init_history
+    say "Conversation reset so the agent can see the new MCP tools."
+  else
+    cred_delete "$cred_id"
+  fi
+}
+
 mcp_remove_server() {
-  local name="$1" idx
+  local name="$1" idx cred_id
   idx="$(mcp_find_index "$name")" || { warn "No MCP server named \"$name\" configured."; return 1; }
+
+  cred_id="${MCP_OAUTH_CRED_IDS[$idx]:-}"
+  [[ -n "$cred_id" ]] && cred_delete "$cred_id"
 
   MCP_NAMES=("${MCP_NAMES[@]:0:$idx}" "${MCP_NAMES[@]:$((idx+1))}")
   MCP_URLS=("${MCP_URLS[@]:0:$idx}" "${MCP_URLS[@]:$((idx+1))}")
@@ -4610,6 +4930,8 @@ mcp_remove_server() {
   MCP_SESSION_IDS=("${MCP_SESSION_IDS[@]:0:$idx}" "${MCP_SESSION_IDS[@]:$((idx+1))}")
   MCP_PROTO_VERSIONS=("${MCP_PROTO_VERSIONS[@]:0:$idx}" "${MCP_PROTO_VERSIONS[@]:$((idx+1))}")
   MCP_TOOLS_JSON=("${MCP_TOOLS_JSON[@]:0:$idx}" "${MCP_TOOLS_JSON[@]:$((idx+1))}")
+  MCP_AUTH_TYPES=("${MCP_AUTH_TYPES[@]:0:$idx}" "${MCP_AUTH_TYPES[@]:$((idx+1))}")
+  MCP_OAUTH_CRED_IDS=("${MCP_OAUTH_CRED_IDS[@]:0:$idx}" "${MCP_OAUTH_CRED_IDS[@]:$((idx+1))}")
 
   ok "Removed MCP server \"$name\"."
   init_history
@@ -4647,8 +4969,9 @@ mcp_list_servers() {
   for i in "${!MCP_NAMES[@]}"; do
     name="${MCP_NAMES[$i]}"
     url="${MCP_URLS[$i]}"
+    auth="${MCP_AUTH_TYPES[$i]:-apikey}"
     count="$(jq 'length' <<< "${MCP_TOOLS_JSON[$i]:-[]}" 2>/dev/null || echo 0)"
-    box_line "${C_BOLD}$name${C_RESET} -> $url ${C_MUTED}($count tool(s))${C_RESET}"
+    box_line "${C_BOLD}$name${C_RESET} -> $url ${C_MUTED}($count tool(s), auth: $auth)${C_RESET}"
     if [[ "$count" -gt 0 ]]; then
       jq -r '.[] | "    - " + .name' <<< "${MCP_TOOLS_JSON[$i]}" 2>/dev/null | while IFS= read -r tl; do box_line "$tl"; done
     fi
@@ -4683,6 +5006,1025 @@ mcp_bootstrap_from_env() {
     key="${!key_var:-}"
     mcp_register_server "$name" "$url" "$key"
   done
+}
+
+########################################################################
+# CREDENTIAL STORE
+#
+# A small save/get/delete/exists/clear abstraction over disk storage for
+# OAuth tokens (and anything else worth persisting between runs — this app
+# was memory-only before now; OAuth is the first thing that actually needs
+# to survive a restart, since re-doing a full browser authorization every
+# launch would make OAuth-based MCP servers unusable in practice).
+#
+# SECURITY MODEL — read this before assuming more than it provides:
+#
+#   There is no portable, dependency-free OS keychain this script can rely
+#   on across both plain Linux and Termux. Termux apps do NOT have access
+#   to the Android Keystore from a shell context (that requires a signed
+#   Android app with JNI/AndroidKeyStore API calls — not reachable from
+#   bash/curl/jq), and there's no equivalent of macOS Keychain or the
+#   Secret Service (org.freedesktop.secrets, used by gnome-keyring/KWallet)
+#   guaranteed to be present. So:
+#
+#   - "plain" mode (default): each credential is one JSON file under
+#     CRED_STORE_DIR, chmod 600, in a chmod 700 directory. On Termux this
+#     directory lives inside the app's private storage
+#     (/data/data/com.termux/files/home/...), which other Android apps
+#     cannot read without root — the OS sandbox is doing the real work
+#     there, not this script. On a shared multi-user Linux box, 600/700
+#     permissions stop other unprivileged users from reading it. What this
+#     does NOT protect against: another process running as the same user,
+#     root, a full disk/backup image, or a device-unlock bypass. This is
+#     the same tier of protection tools like `gh` and `gcloud` fall back to
+#     when no OS keychain is available.
+#
+#   - "encrypted" mode (opt-in, 't> mcp cred encrypt on', requires
+#     openssl): the same JSON is instead stored AES-256-CBC-encrypted
+#     (PBKDF2, 200k iterations, random salt) under a passphrase that is
+#     ONLY ever held in memory for the running session — never written to
+#     disk, never logged. You will be re-prompted for it every new session
+#     before any OAuth-authenticated MCP server can be used. This raises
+#     the bar to "attacker needs the passphrase too", at the cost of typing
+#     it in each time you restart Aulthium.
+#
+#   Whichever mode is active, secrets are never written to: application
+#   logs, terminal output, error messages, debug output, git repositories,
+#   the generated system prompt, or anywhere else the model or a
+#   subsequent `git add .` could pick them up. Grep this file for
+#   `cred_save` call sites if you want to audit that claim yourself.
+########################################################################
+
+# Lazily creates CRED_STORE_DIR (0700) the first time it's actually needed,
+# and — if AULTHIUM_CRED_ENCRYPT=1 was set before launch, or the user
+# already flipped CRED_STORE_MODE this session — makes sure openssl is
+# actually available before promising encrypted storage. Falls back to
+# "plain" with a warning rather than silently pretending to encrypt.
+cred_store_init() {
+  [[ "$CRED_STORE_INITIALIZED" -eq 1 ]] && return 0
+  mkdir -p -m 700 "$CRED_STORE_DIR" 2>/dev/null || {
+    err "Could not create credential store directory: $CRED_STORE_DIR"
+    return 1
+  }
+  chmod 700 "$CRED_STORE_DIR" 2>/dev/null
+
+  if [[ "${AULTHIUM_CRED_ENCRYPT:-0}" == "1" && "$CRED_STORE_MODE" == "plain" ]]; then
+    CRED_STORE_MODE="encrypted"
+  fi
+  if [[ "$CRED_STORE_MODE" == "encrypted" ]] && ! command -v openssl >/dev/null 2>&1; then
+    warn "Encrypted credential storage requested but openssl isn't installed — falling back to permission-restricted plaintext storage."
+    CRED_STORE_MODE="plain"
+  fi
+  CRED_STORE_INITIALIZED=1
+  return 0
+}
+
+# Prompts once per session (cached in memory only) for the passphrase used
+# by encrypted mode. Confirms on first-ever use (no existing files yet) so
+# a typo doesn't lock the user out of their own tokens moments later.
+cred_ensure_passphrase() {
+  [[ "$CRED_STORE_MODE" != "encrypted" ]] && return 0
+  [[ -n "$CRED_STORE_PASSPHRASE" ]] && return 0
+  local p1 p2 has_existing=0
+  compgen -G "$CRED_STORE_DIR/*.cred" >/dev/null 2>&1 && has_existing=1
+
+  read -r -s -p "Credential store passphrase: " p1; echo
+  if [[ "$has_existing" -eq 0 ]]; then
+    read -r -s -p "Confirm passphrase: " p2; echo
+    if [[ "$p1" != "$p2" ]]; then
+      err "Passphrases did not match."
+      return 1
+    fi
+  fi
+  if [[ -z "$p1" ]]; then
+    err "Passphrase cannot be empty in encrypted mode."
+    return 1
+  fi
+  CRED_STORE_PASSPHRASE="$p1"
+  return 0
+}
+
+# Turns a credential id into a safe filename — ids come from this script
+# (server names, oauth-<random>), never raw user text, but this keeps
+# path traversal structurally impossible regardless.
+cred_store_path() {
+  local id="$1" safe
+  safe="$(printf '%s' "$id" | tr -c 'A-Za-z0-9_.-' '_')"
+  printf '%s/%s.cred' "$CRED_STORE_DIR" "$safe"
+}
+
+# cred_save <id> <json>  — writes (overwriting) the credential for <id>.
+cred_save() {
+  local id="$1" json="$2" path
+  cred_store_init || return 1
+  path="$(cred_store_path "$id")"
+  if [[ "$CRED_STORE_MODE" == "encrypted" ]]; then
+    cred_ensure_passphrase || return 1
+    if ! printf '%s' "$json" | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+         -pass "pass:$CRED_STORE_PASSPHRASE" -out "$path" 2>/dev/null; then
+      err "Failed to write encrypted credential for \"$id\"."
+      return 1
+    fi
+  else
+    printf '%s' "$json" > "$path" 2>/dev/null || {
+      err "Failed to write credential for \"$id\"."
+      return 1
+    }
+  fi
+  chmod 600 "$path" 2>/dev/null
+  return 0
+}
+
+# cred_get <id>  — prints the stored JSON on stdout, returns 1 if missing
+# or (encrypted mode) the passphrase was wrong.
+cred_get() {
+  local id="$1" path
+  cred_store_init || return 1
+  path="$(cred_store_path "$id")"
+  [[ -f "$path" ]] || return 1
+  if [[ "$CRED_STORE_MODE" == "encrypted" ]]; then
+    cred_ensure_passphrase || return 1
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+      -pass "pass:$CRED_STORE_PASSPHRASE" -in "$path" 2>/dev/null || {
+      err "Could not decrypt credential for \"$id\" — wrong passphrase?"
+      return 1
+    }
+  else
+    cat "$path" 2>/dev/null
+  fi
+  return 0
+}
+
+cred_exists() {
+  local path
+  path="$(cred_store_path "$1")"
+  [[ -f "$path" ]]
+}
+
+cred_delete() {
+  local path
+  path="$(cred_store_path "$1")"
+  [[ -f "$path" ]] || return 0
+  rm -f "$path" 2>/dev/null
+}
+
+# Wipes every stored credential — 't> mcp cred clear', confirmed by the
+# caller before this runs.
+cred_clear() {
+  [[ -d "$CRED_STORE_DIR" ]] || return 0
+  find "$CRED_STORE_DIR" -maxdepth 1 -name '*.cred' -type f -exec rm -f {} + 2>/dev/null
+}
+
+########################################################################
+# OAUTH 2.1 CLIENT (generic — not GitHub/Cloudflare/Notion-specific)
+#
+# Implements the MCP authorization spec's flow for any compliant remote
+# MCP server: Protected Resource Metadata discovery (RFC 9728) ->
+# Authorization Server Metadata discovery (RFC 8414, with an OIDC
+# discovery fallback) -> Dynamic Client Registration (RFC 7591, when the
+# server offers a registration_endpoint and we don't have a client_id for
+# it yet) -> PKCE authorization-code flow (RFC 7636) -> token exchange ->
+# refresh. No provider ever needs special-cased auth code here — a
+# "preset" is just a name + URL that gets fed into this same pipeline (see
+# the small preset registry further below).
+#
+# Every function below is provider-agnostic. GitHub/Cloudflare-specific
+# knowledge, where it exists at all, lives only in the preset table, never
+# in this section.
+########################################################################
+
+# ── PKCE / random primitives (RFC 7636) ─────────────────────────────────
+# Uses only coreutils already required elsewhere in this script
+# (sha256sum, base64, tr) — no python/openssl dependency for the crypto
+# primitives themselves, matching the rest of Aulthium's minimal-deps
+# philosophy. openssl is only pulled in, optionally, for encrypted
+# credential storage above.
+
+# Base64url-encodes raw stdin (strips padding, swaps +/ for -_).
+oauth_b64url_encode() {
+  base64 | tr '+/' '-_' | tr -d '=\n'
+}
+
+# n random bytes, base64url-encoded. Used for code_verifier and state.
+oauth_random_b64url() {
+  local nbytes="$1"
+  head -c "$nbytes" /dev/urandom | oauth_b64url_encode
+}
+
+# RFC 7636 code_verifier: 43-128 chars from [A-Za-z0-9-._~]. 32 random
+# bytes -> 43 base64url chars, right at the low end of the allowed range
+# but comfortably high-entropy (256 bits).
+oauth_gen_code_verifier() {
+  oauth_random_b64url 32
+}
+
+# CSRF state token / PKCE-adjacent nonce.
+oauth_gen_state() {
+  oauth_random_b64url 24
+}
+
+# S256 code_challenge = base64url(sha256(code_verifier)). sha256sum only
+# gives a hex digest, so this hand-converts hex -> raw bytes via printf's
+# %b (backslash-escape interpretation) rather than pulling in xxd/openssl,
+# then base64url-encodes those raw bytes.
+oauth_code_challenge_s256() {
+  local verifier="$1" hex esc i
+  hex="$(printf '%s' "$verifier" | sha256sum | awk '{print $1}')"
+  esc=""
+  for (( i = 0; i < ${#hex}; i += 2 )); do
+    esc+="\\x${hex:i:2}"
+  done
+  printf '%b' "$esc" | oauth_b64url_encode
+}
+
+# ── HTTP helpers ─────────────────────────────────────────────────────────
+# Plain GET/POST with response body + HTTP status captured separately, and
+# HTTPS enforced (see oauth_require_https) — used for every discovery,
+# registration, and token-endpoint call below. Deliberately does NOT
+# reuse mcp_http_post, which is shaped around JSON-RPC framing and
+# MCP-specific headers (Mcp-Session-Id, MCP-Protocol-Version) that don't
+# apply to plain OAuth/OIDC metadata and token endpoints.
+OAUTH_HTTP_BODY=""
+OAUTH_HTTP_CODE=""
+
+oauth_require_https() {
+  # http://localhost / http://127.0.0.1 is the one well-known exception
+  # (RFC 8252 loopback interactive clients) — needed for the callback URI
+  # we hand servers, and for testing against a local dev MCP server.
+  case "$1" in
+    https://*) return 0 ;;
+    http://localhost*|http://127.0.0.1*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+oauth_http_get() {
+  local url="$1" headers_tmp body_tmp code
+  oauth_require_https "$url" || { OAUTH_HTTP_BODY=""; OAUTH_HTTP_CODE="000"; return 1; }
+  headers_tmp="$(mktemp)"; body_tmp="$(mktemp)"
+  code="$(curl -sS --connect-timeout 8 --max-time 20 \
+            -D "$headers_tmp" -o "$body_tmp" -w '%{http_code}' \
+            -H "Accept: application/json" "$url" 2>/dev/null)"
+  OAUTH_HTTP_CODE="${code:-000}"
+  OAUTH_HTTP_BODY="$(cat "$body_tmp" 2>/dev/null)"
+  rm -f "$headers_tmp" "$body_tmp"
+  [[ "$OAUTH_HTTP_CODE" == 2* ]]
+}
+
+# form-encoded POST (every OAuth token/registration endpoint expects this,
+# per RFC 6749, except DCR which is JSON per RFC 7591 — see
+# oauth_http_post_json below for that one).
+oauth_http_post_form() {
+  local url="$1"; shift
+  local headers_tmp body_tmp code data=()
+  oauth_require_https "$url" || { OAUTH_HTTP_BODY=""; OAUTH_HTTP_CODE="000"; return 1; }
+  headers_tmp="$(mktemp)"; body_tmp="$(mktemp)"
+  while [[ $# -gt 0 ]]; do data+=(--data-urlencode "$1"); shift; done
+  code="$(curl -sS --connect-timeout 8 --max-time 20 \
+            -D "$headers_tmp" -o "$body_tmp" -w '%{http_code}' \
+            -H "Accept: application/json" \
+            -X POST "$url" "${data[@]}" 2>/dev/null)"
+  OAUTH_HTTP_CODE="${code:-000}"
+  OAUTH_HTTP_BODY="$(cat "$body_tmp" 2>/dev/null)"
+  rm -f "$headers_tmp" "$body_tmp"
+  [[ "$OAUTH_HTTP_CODE" == 2* ]]
+}
+
+oauth_http_post_json() {
+  local url="$1" json="$2" headers_tmp body_tmp code
+  oauth_require_https "$url" || { OAUTH_HTTP_BODY=""; OAUTH_HTTP_CODE="000"; return 1; }
+  headers_tmp="$(mktemp)"; body_tmp="$(mktemp)"
+  code="$(curl -sS --connect-timeout 8 --max-time 20 \
+            -D "$headers_tmp" -o "$body_tmp" -w '%{http_code}' \
+            -H "Content-Type: application/json" -H "Accept: application/json" \
+            -X POST "$url" --data-binary "$json" 2>/dev/null)"
+  OAUTH_HTTP_CODE="${code:-000}"
+  OAUTH_HTTP_BODY="$(cat "$body_tmp" 2>/dev/null)"
+  rm -f "$headers_tmp" "$body_tmp"
+  [[ "$OAUTH_HTTP_CODE" == 2* ]]
+}
+
+# ── Discovery (RFC 9728 + RFC 8414, with a same-origin well-known fallback) ──
+# Sets: OAUTH_AUTHZ_ENDPOINT, OAUTH_TOKEN_ENDPOINT,
+#       OAUTH_REGISTRATION_ENDPOINT (may be empty — not every server
+#       supports DCR), OAUTH_SCOPES (space-separated, may be empty).
+OAUTH_AUTHZ_ENDPOINT=""
+OAUTH_TOKEN_ENDPOINT=""
+OAUTH_REGISTRATION_ENDPOINT=""
+OAUTH_SCOPES=""
+
+# origin (scheme://host[:port]) of a URL, no path.
+oauth_origin_of() {
+  printf '%s' "$1" | sed -E 's#^(https?://[^/]+).*#\1#'
+}
+
+# Step 1 (RFC 9728): find the Protected Resource Metadata document for the
+# MCP server itself. Compliant servers advertise it via a WWW-Authenticate
+# header on an unauthenticated 401; this hits the MCP endpoint directly
+# first (cheapest, most spec-correct) and falls back to the same-origin
+# well-known path if that doesn't turn one up.
+# Prints the authorization_server base URL on stdout, or nothing.
+oauth_discover_resource_metadata() {
+  local mcp_url="$1" origin resource_meta_url www_auth headers_tmp probe_body
+  origin="$(oauth_origin_of "$mcp_url")"
+
+  headers_tmp="$(mktemp)"
+  curl -sS --connect-timeout 8 --max-time 15 -D "$headers_tmp" -o /dev/null \
+       -X POST "$mcp_url" -H "Content-Type: application/json" \
+       -H "Accept: application/json, text/event-stream" \
+       --data-binary '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+       2>/dev/null >/dev/null
+  www_auth="$(grep -i '^WWW-Authenticate:' "$headers_tmp" 2>/dev/null | tail -n1)"
+  rm -f "$headers_tmp"
+
+  resource_meta_url="$(printf '%s' "$www_auth" | grep -oE 'resource_metadata="[^"]+"' | sed -E 's/resource_metadata="([^"]+)"/\1/')"
+  [[ -z "$resource_meta_url" ]] && resource_meta_url="$origin/.well-known/oauth-protected-resource"
+
+  if oauth_http_get "$resource_meta_url" && jq -e . >/dev/null 2>&1 <<< "$OAUTH_HTTP_BODY"; then
+    jq -r '.authorization_servers[0] // empty' <<< "$OAUTH_HTTP_BODY" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
+
+# Step 2 (RFC 8414, OIDC-discovery fallback): fetch authorization server
+# metadata for $1 (an authorization-server base URL). Populates the
+# OAUTH_*_ENDPOINT / OAUTH_SCOPES globals above.
+oauth_discover_as_metadata() {
+  local as_base="$1" meta_url
+  for meta_url in \
+      "$as_base/.well-known/oauth-authorization-server" \
+      "$as_base/.well-known/openid-configuration"; do
+    if oauth_http_get "$meta_url" && jq -e . >/dev/null 2>&1 <<< "$OAUTH_HTTP_BODY"; then
+      OAUTH_AUTHZ_ENDPOINT="$(jq -r '.authorization_endpoint // empty' <<< "$OAUTH_HTTP_BODY")"
+      OAUTH_TOKEN_ENDPOINT="$(jq -r '.token_endpoint // empty' <<< "$OAUTH_HTTP_BODY")"
+      OAUTH_REGISTRATION_ENDPOINT="$(jq -r '.registration_endpoint // empty' <<< "$OAUTH_HTTP_BODY")"
+      OAUTH_SCOPES="$(jq -r '(.scopes_supported // []) | join(" ")' <<< "$OAUTH_HTTP_BODY")"
+      if [[ -n "$OAUTH_AUTHZ_ENDPOINT" && -n "$OAUTH_TOKEN_ENDPOINT" ]]; then
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+# Full discovery for MCP server URL $1. Returns 0 and populates the
+# OAUTH_* globals on success.
+oauth_discover() {
+  local mcp_url="$1" as_base
+  OAUTH_AUTHZ_ENDPOINT=""; OAUTH_TOKEN_ENDPOINT=""; OAUTH_REGISTRATION_ENDPOINT=""; OAUTH_SCOPES=""
+  as_base="$(oauth_discover_resource_metadata "$mcp_url")"
+  [[ -z "$as_base" ]] && as_base="$(oauth_origin_of "$mcp_url")"
+  oauth_discover_as_metadata "$as_base"
+}
+
+# ── Dynamic Client Registration (RFC 7591) ──────────────────────────────
+# Registers Aulthium as a public OAuth client with the authorization
+# server if it offers a registration_endpoint and we don't already have a
+# client_id cached for it. Sets OAUTH_CLIENT_ID (and OAUTH_CLIENT_SECRET,
+# usually empty for a public/native client using PKCE).
+OAUTH_CLIENT_ID=""
+OAUTH_CLIENT_SECRET=""
+
+oauth_dynamic_register() {
+  local registration_endpoint="$1" redirect_uri="$2" req
+  [[ -z "$registration_endpoint" ]] && return 1
+  req="$(jq -nc --arg name "Aulthium" --arg uri "$redirect_uri" \
+    '{client_name:$name, redirect_uris:[$uri], grant_types:["authorization_code","refresh_token"], response_types:["code"], token_endpoint_auth_method:"none"}')"
+  if oauth_http_post_json "$registration_endpoint" "$req" && jq -e . >/dev/null 2>&1 <<< "$OAUTH_HTTP_BODY"; then
+    OAUTH_CLIENT_ID="$(jq -r '.client_id // empty' <<< "$OAUTH_HTTP_BODY")"
+    OAUTH_CLIENT_SECRET="$(jq -r '.client_secret // empty' <<< "$OAUTH_HTTP_BODY")"
+    [[ -n "$OAUTH_CLIENT_ID" ]]
+    return $?
+  fi
+  return 1
+}
+
+# ── Browser launch (cross-platform, Termux included) ────────────────────
+# Tries every opener this script might plausibly be running under, in
+# order, and falls through to printing the URL for manual copy/paste if
+# none work headlessly — that fallback is what keeps this from ever
+# hard-failing the flow just because no opener was found.
+oauth_open_browser() {
+  local url="$1"
+  if command -v termux-open-url >/dev/null 2>&1; then
+    termux-open-url "$url" >/dev/null 2>&1 && return 0
+  fi
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 & disown 2>/dev/null; return 0
+  fi
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 & disown 2>/dev/null; return 0
+  fi
+  if command -v am >/dev/null 2>&1; then
+    # Bare Termux without termux-api installed still usually has Android's
+    # `am` (activity manager) on PATH.
+    am start -a android.intent.action.VIEW -d "$url" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# ── Loopback OAuth callback (RFC 8252 §7.3) ──────────────────────────────
+# Android/Termux note: this is NOT desktop-only despite appearances. The
+# system browser and Termux both run on the same device/network
+# namespace, and mobile browsers (Chrome included) treat http://127.0.0.1
+# as a secure-context exception the same way desktop browsers do — so a
+# loopback redirect genuinely round-trips through the Termux app back to
+# this listener on real Android devices, not just on a desktop OS. This is
+# the same technique termux-api-free tools like `gh auth login` rely on.
+#
+# It still needs a raw TCP listener, which this script gets from `nc`
+# (netcat) rather than bash's /dev/tcp (which can only make outbound
+# connections, not listen) — `nc` is common but not universal, especially
+# on a minimal Termux install, so oauth_run_flow falls back to a manual
+# paste-the-redirect-URL prompt (oauth_manual_callback) whenever `nc`
+# isn't available or the listener doesn't receive a hit in time.
+#
+# Sets OAUTH_CALLBACK_CODE / OAUTH_CALLBACK_STATE / OAUTH_CALLBACK_ERROR.
+OAUTH_CALLBACK_CODE=""
+OAUTH_CALLBACK_STATE=""
+OAUTH_CALLBACK_ERROR=""
+
+# Picks a local port to listen on. No fixed port is reserved system-wide,
+# so this just tries a small fixed pool and takes the first one `nc` can
+# actually bind — good enough for a short-lived, one-shot listener.
+oauth_pick_callback_port() {
+  local p
+  for p in 8765 8766 8964 9876 43219; do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+      printf '%s' "$p"
+      return 0
+    fi
+    exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+  done
+  printf '%s' 8765 # give up gracefully; caller will just see it fail to bind
+}
+
+oauth_have_callback_listener() {
+  command -v nc >/dev/null 2>&1
+}
+
+# Python fallback for the loopback listener, used when `nc` isn't
+# installed. Requires python3 specifically — the listener script below
+# uses the py3-only http.server/socketserver modules, so a bare `python`
+# that turns out to be python2 is deliberately not accepted here rather
+# than risking a cryptic traceback mid-OAuth-flow. Checked live (not
+# cached) so a python install triggered moments ago by
+# oauth_offer_install_python is picked up immediately without
+# restarting Aulthium.
+oauth_python_bin() {
+  if command -v python3 >/dev/null 2>&1; then
+    printf 'python3'
+  elif command -v python >/dev/null 2>&1 && python -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+    printf 'python'
+  fi
+}
+
+oauth_have_python() {
+  [[ -n "$(oauth_python_bin)" ]]
+}
+
+# Which mechanism (if any) can receive the browser's loopback redirect
+# right now: "nc" (preferred — lightest weight), "python" (fallback), or
+# "" if neither is available and oauth_run_flow should fall back to the
+# manual paste-the-redirect-URL prompt instead.
+oauth_callback_method() {
+  if oauth_have_callback_listener; then
+    printf 'nc'
+  elif oauth_have_python; then
+    printf 'python'
+  else
+    printf ''
+  fi
+}
+
+# Neither `nc` nor python found — before giving up on the automatic
+# callback path and falling back to manual paste, offer to install
+# python (it's far more commonly packaged than an OAuth-capable nc, and
+# a one-shot HTTP server is easy to write portably in it). Always asks
+# first via confirm_yes_no; never installs anything silently. Detects
+# whichever package manager is actually on this box; if none is
+# recognized, or the user declines, or the install fails, this just
+# returns 1 and oauth_run_flow proceeds to the manual fallback exactly
+# as it did before this existed — the automatic path is a bonus, never
+# a requirement.
+oauth_offer_install_python() {
+  local mgr=""
+  if command -v pkg >/dev/null 2>&1 && [[ -n "${PREFIX:-}" || -d "/data/data/com.termux" ]]; then
+    mgr="pkg"
+  elif command -v apt-get >/dev/null 2>&1; then
+    mgr="apt-get"
+  elif command -v dnf >/dev/null 2>&1; then
+    mgr="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    mgr="yum"
+  elif command -v apk >/dev/null 2>&1; then
+    mgr="apk"
+  elif command -v pacman >/dev/null 2>&1; then
+    mgr="pacman"
+  elif command -v brew >/dev/null 2>&1; then
+    mgr="brew"
+  fi
+
+  if [[ -z "$mgr" ]]; then
+    warn "Python isn't installed and no supported package manager was found to install it automatically — falling back to manual redirect entry."
+    return 1
+  fi
+
+  if ! confirm_yes_no "Python isn't installed. Installing it lets this OAuth login complete automatically instead of pasting a redirect URL by hand — install it now?"; then
+    return 1
+  fi
+
+  local sudo_cmd=""
+  if [[ "$mgr" != "pkg" && "$mgr" != "brew" && "$(id -u 2>/dev/null)" != "0" ]] && command -v sudo >/dev/null 2>&1; then
+    sudo_cmd="sudo"
+  fi
+
+  say "Installing python..."
+  case "$mgr" in
+    pkg)      pkg install -y python >/dev/null 2>&1 ;;
+    apt-get)  $sudo_cmd apt-get update -y >/dev/null 2>&1; $sudo_cmd apt-get install -y python3 >/dev/null 2>&1 ;;
+    dnf)      $sudo_cmd dnf install -y python3 >/dev/null 2>&1 ;;
+    yum)      $sudo_cmd yum install -y python3 >/dev/null 2>&1 ;;
+    apk)      $sudo_cmd apk add --no-cache python3 >/dev/null 2>&1 ;;
+    pacman)   $sudo_cmd pacman -Sy --noconfirm python >/dev/null 2>&1 ;;
+    brew)     brew install python3 >/dev/null 2>&1 ;;
+  esac
+
+  if oauth_have_python; then
+    ok "Python installed."
+    return 0
+  fi
+  warn "Python install failed — falling back to manual redirect entry."
+  return 1
+}
+
+# Blocks (up to $2 seconds) for exactly one HTTP GET on 127.0.0.1:$1,
+# parses ?code=&state= (or an error=) off the request line, and writes a
+# minimal human-readable HTML response before closing the connection.
+oauth_run_callback_listener() {
+  local port="$1" timeout="${2:-180}" req request_line query
+  OAUTH_CALLBACK_CODE=""; OAUTH_CALLBACK_STATE=""; OAUTH_CALLBACK_ERROR=""
+
+  local resp_ok='HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Aulthium: authorization received.</h2><p>You can close this tab and return to the terminal.</p></body></html>'
+  local resp_err='HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Aulthium: authorization was not completed.</h2><p>You can close this tab and return to the terminal.</p></body></html>'
+
+  request_line="$( { printf '%b' "$resp_ok" | timeout "${timeout}"s nc -l -q1 127.0.0.1 "$port" 2>/dev/null || true; } | head -n1 | tr -d '\r' )"
+  [[ -z "$request_line" ]] && { OAUTH_CALLBACK_ERROR="Timed out waiting for the browser redirect."; return 1; }
+
+  query="$(printf '%s' "$request_line" | awk '{print $2}')"
+  query="${query#*\?}"
+  [[ "$query" == "$request_line"* ]] && query=""
+
+  OAUTH_CALLBACK_CODE="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="code"{print $2; exit}')"
+  OAUTH_CALLBACK_STATE="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="state"{print $2; exit}')"
+  local err_param
+  err_param="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="error"{print $2; exit}')"
+  if [[ -n "$err_param" ]]; then
+    OAUTH_CALLBACK_ERROR="$(printf '%s' "$err_param" | sed 's/+/ /g')"
+    return 1
+  fi
+  [[ -z "$OAUTH_CALLBACK_CODE" ]] && { OAUTH_CALLBACK_ERROR="No authorization code in the callback."; return 1; }
+  return 0
+}
+
+# Fallback when no loopback listener is usable: ask the user to paste
+# either the full redirect URL their browser landed on, or just the
+# `code` value out of it.
+oauth_manual_callback() {
+  local pasted query
+  OAUTH_CALLBACK_CODE=""; OAUTH_CALLBACK_STATE=""; OAUTH_CALLBACK_ERROR=""
+  echo
+  muted "No local callback listener available (nc not found)."
+  muted "After you authorize in the browser, it will redirect to a URL that may fail to load — that's expected."
+  read -r -p "Paste that full URL (or just the code= value) here: " pasted
+  if [[ "$pasted" == *"code="* ]]; then
+    query="${pasted#*\?}"
+    OAUTH_CALLBACK_CODE="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="code"{print $2; exit}')"
+    OAUTH_CALLBACK_STATE="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="state"{print $2; exit}')"
+  else
+    OAUTH_CALLBACK_CODE="$pasted"
+  fi
+  [[ -z "$OAUTH_CALLBACK_CODE" ]] && { OAUTH_CALLBACK_ERROR="No code provided."; return 1; }
+  return 0
+}
+
+# Python equivalent of oauth_run_callback_listener above, used when `nc`
+# isn't installed (see oauth_callback_method / oauth_offer_install_python).
+# Same contract: blocks up to $2 seconds for one HTTP GET on
+# 127.0.0.1:$1, sets OAUTH_CALLBACK_CODE / _STATE / _ERROR the same way,
+# so oauth_run_flow doesn't need to know or care which listener actually
+# served the request.
+#
+# The whole one-shot server is a single inline python script fed via
+# heredoc rather than a scratch file on disk — nothing to clean up, and
+# it runs identically whether the interpreter is python3 or (rare, old
+# systems) python2's http.server-less "SimpleHTTPServer" naming, which is
+# why this pins to the python3-only http.server/socketserver names and
+# just requires python3 specifically (oauth_python_bin prefers python3;
+# see there).
+oauth_run_callback_listener_python() {
+  local port="$1" timeout="${2:-180}" pybin query
+  OAUTH_CALLBACK_CODE=""; OAUTH_CALLBACK_STATE=""; OAUTH_CALLBACK_ERROR=""
+
+  pybin="$(oauth_python_bin)"
+  if [[ -z "$pybin" ]]; then
+    OAUTH_CALLBACK_ERROR="No working Python 3 interpreter found."
+    return 1
+  fi
+
+  query="$("$pybin" - "$port" "$timeout" <<'PYEOF'
+import sys
+import http.server
+import socketserver
+import urllib.parse
+
+port = int(sys.argv[1])
+timeout = float(sys.argv[2])
+
+RESP_OK = ("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+           "<html><body><h2>Aulthium: authorization received.</h2>"
+           "<p>You can close this tab and return to the terminal.</p></body></html>")
+RESP_ERR = ("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+            "<html><body><h2>Aulthium: authorization was not completed.</h2>"
+            "<p>You can close this tab and return to the terminal.</p></body></html>")
+
+captured = {"query": ""}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        captured["query"] = parsed.query
+        params = urllib.parse.parse_qs(parsed.query)
+        body = RESP_ERR if "error" in params else RESP_OK
+        try:
+            self.wfile.write(body.encode("utf-8"))
+        except Exception:
+            pass
+
+    # Silence the default per-request access log to stderr — Aulthium's
+    # own status lines are the only output this should produce.
+    def log_message(self, format, *args):
+        pass
+
+class OneShotServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+try:
+    srv = OneShotServer(("127.0.0.1", port), Handler)
+    srv.timeout = timeout
+    srv.handle_request()
+    srv.server_close()
+except Exception:
+    pass
+
+print(captured["query"])
+PYEOF
+)"
+
+  [[ -z "$query" ]] && { OAUTH_CALLBACK_ERROR="Timed out waiting for the browser redirect."; return 1; }
+
+  OAUTH_CALLBACK_CODE="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="code"{print $2; exit}')"
+  OAUTH_CALLBACK_STATE="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="state"{print $2; exit}')"
+  local err_param
+  err_param="$(printf '%s' "$query" | tr '&' '\n' | awk -F= '$1=="error"{print $2; exit}')"
+  if [[ -n "$err_param" ]]; then
+    OAUTH_CALLBACK_ERROR="$(printf '%s' "$err_param" | sed 's/+/ /g')"
+    return 1
+  fi
+  [[ -z "$OAUTH_CALLBACK_CODE" ]] && { OAUTH_CALLBACK_ERROR="No authorization code in the callback."; return 1; }
+  return 0
+}
+
+# ── Token exchange / refresh ─────────────────────────────────────────────
+# Sets OAUTH_TOKEN_JSON to the full token response (access_token,
+# refresh_token if given, expires_in, etc.) as compact JSON.
+OAUTH_TOKEN_JSON=""
+
+oauth_exchange_code() {
+  local token_endpoint="$1" code="$2" redirect_uri="$3" verifier="$4" client_id="$5" client_secret="$6"
+  local -a args=(grant_type=authorization_code code="$code" redirect_uri="$redirect_uri" \
+                  code_verifier="$verifier" client_id="$client_id")
+  local access_token_check
+  [[ -n "$client_secret" ]] && args+=(client_secret="$client_secret")
+
+  if ! oauth_http_post_form "$token_endpoint" "${args[@]}"; then
+    OAUTH_RPC_ERROR="No response from token endpoint (HTTP ${OAUTH_HTTP_CODE:-000})."
+    return 1
+  fi
+
+  # Validate the body is a single well-formed JSON document BEFORE trusting
+  # any field out of it. This used to be a bare truthiness check
+  # (`jq -e '.access_token'`) with stderr thrown away, which meant a
+  # malformed/non-JSON body (HTML error page, form-urlencoded response,
+  # trailing garbage, etc.) could silently slip through here and only blow
+  # up later when individual fields were re-extracted — by which point the
+  # caller had already moved on as if the exchange had succeeded, and ended
+  # up saving/using a blank access_token. Fail loudly and immediately here
+  # instead, with a snippet of the actual body so it's debuggable.
+  if ! jq -e . >/dev/null 2>/tmp/aulthium_jq_err.$$ <<< "$OAUTH_HTTP_BODY"; then
+    OAUTH_RPC_ERROR="Token endpoint returned a non-JSON or malformed response (HTTP ${OAUTH_HTTP_CODE:-000}): $(printf '%s' "$OAUTH_HTTP_BODY" | head -c 200)"
+    rm -f "/tmp/aulthium_jq_err.$$" 2>/dev/null
+    return 1
+  fi
+  rm -f "/tmp/aulthium_jq_err.$$" 2>/dev/null
+
+  # Body parses fine as JSON — now make sure access_token is actually a
+  # non-empty string rather than just "truthy" (jq treats any non-null,
+  # non-false value as truthy, which previously let an empty string ""
+  # through as a "success").
+  access_token_check="$(jq -r '.access_token // empty' <<< "$OAUTH_HTTP_BODY" 2>/dev/null)"
+  if [[ -z "$access_token_check" ]]; then
+    OAUTH_RPC_ERROR="$(jq -r '.error_description // .error // "Token endpoint response had no access_token."' <<< "$OAUTH_HTTP_BODY" 2>/dev/null)"
+    return 1
+  fi
+
+  OAUTH_TOKEN_JSON="$OAUTH_HTTP_BODY"
+  return 0
+}
+
+oauth_refresh_token() {
+  local token_endpoint="$1" refresh_token="$2" client_id="$3" client_secret="$4"
+  local -a args=(grant_type=refresh_token refresh_token="$refresh_token" client_id="$client_id")
+  [[ -n "$client_secret" ]] && args+=(client_secret="$client_secret")
+  if oauth_http_post_form "$token_endpoint" "${args[@]}" && jq -e '.access_token' >/dev/null 2>&1 <<< "$OAUTH_HTTP_BODY"; then
+    OAUTH_TOKEN_JSON="$OAUTH_HTTP_BODY"
+    return 0
+  fi
+  return 1
+}
+
+# ── Manual OAuth client (servers without RFC 7591 registration) ─────────
+# Some authorization servers — GitHub's github.com/login/oauth is the
+# common one an MCP client will actually hit — don't support Dynamic
+# Client Registration at all, so there's no way to get a client_id
+# automatically. The user has to register their own OAuth App with the
+# provider and hand Aulthium its client_id (GitHub also requires a
+# client_secret at the token endpoint even for a PKCE-using public
+# client — see github.com/github/github-mcp-server/blob/main/docs/oauth-login.md,
+# which confirms this and notes the secret can't be kept truly
+# confidential in a distributed client like this one; PKCE, not secrecy
+# of that value, is what actually secures the exchange).
+#
+# Cached in the credential store keyed by the authorization server's
+# host (oauth_manual_client_cred_id) rather than per-MCP-server, since
+# every server sharing one authorization server (e.g. every GitHub MCP
+# endpoint uses the same github.com/login/oauth) can reuse the same
+# OAuth App credentials — one registration covers all of them.
+oauth_manual_client_cred_id() {
+  local host
+  host="$(printf '%s' "$1" | sed -E 's#^[a-zA-Z]+://##; s#[/:].*##')"
+  printf 'oauth-client-%s' "${host:-unknown}"
+}
+
+OAUTH_MANUAL_CLIENT_ID=""
+OAUTH_MANUAL_CLIENT_SECRET=""
+
+oauth_get_manual_client() {
+  local label="$1" cred_id cred cached_id cached_secret entered_id entered_secret
+  OAUTH_MANUAL_CLIENT_ID=""; OAUTH_MANUAL_CLIENT_SECRET=""
+  cred_id="$(oauth_manual_client_cred_id "$OAUTH_AUTHZ_ENDPOINT")"
+
+  if cred="$(cred_get "$cred_id" 2>/dev/null)" && jq -e '.client_id' >/dev/null 2>&1 <<< "$cred"; then
+    cached_id="$(jq -r '.client_id // empty' <<< "$cred")"
+    if [[ -n "$cached_id" ]]; then
+      cached_secret="$(jq -r '.client_secret // empty' <<< "$cred")"
+      OAUTH_MANUAL_CLIENT_ID="$cached_id"
+      OAUTH_MANUAL_CLIENT_SECRET="$cached_secret"
+      return 0
+    fi
+  fi
+
+  box_top "MANUAL OAUTH CLIENT NEEDED" "$ICON_MCP" "$C_WARN"
+  box_line "$label's authorization server doesn't support automatic client"
+  box_line "registration — register Aulthium as an OAuth App yourself and"
+  box_line "paste in its credentials (only needed once per provider)."
+  if [[ "$OAUTH_AUTHZ_ENDPOINT" == *"github.com"* ]]; then
+    box_line ""
+    box_line "For GitHub: github.com/settings/developers -> OAuth Apps ->"
+    box_line "New OAuth App. Homepage URL can be anything you like. Set"
+    box_line "the Authorization callback URL to: http://127.0.0.1/callback"
+    box_line "(GitHub doesn't require the port in the callback to match"
+    box_line "the one actually used at login time, so this works no"
+    box_line "matter which local port Aulthium happens to pick). Then"
+    box_line "generate a client secret — GitHub requires one at the token"
+    box_line "endpoint even though this flow already uses PKCE."
+  fi
+  box_bottom "$C_WARN"
+
+  read -r -p "Client ID (blank to cancel): " entered_id
+  if [[ -z "$entered_id" ]]; then
+    OAUTH_FLOW_ERROR="No client ID entered."
+    return 1
+  fi
+  read -r -s -p "Client secret (leave blank if this provider doesn't need one): " entered_secret
+  echo
+
+  OAUTH_MANUAL_CLIENT_ID="$entered_id"
+  OAUTH_MANUAL_CLIENT_SECRET="$entered_secret"
+
+  if confirm_yes_no "Save these for next time? (reused for every server on this same provider)"; then
+    if cred_save "$cred_id" "$(jq -nc --arg cid "$entered_id" --arg cs "$entered_secret" \
+        '{client_id:$cid, client_secret:($cs|select(length>0))}')"; then
+      ok "Saved."
+    else
+      warn "Couldn't save — you'll be asked again next session."
+    fi
+  fi
+  return 0
+}
+
+# ── Full authorization-code + PKCE flow orchestrator ─────────────────────
+# oauth_run_flow <mcp_url> <server_label> -> on success, prints a
+# credential-store JSON blob to stdout (caller decides the cred id and
+# calls cred_save). On failure, prints nothing and returns 1 — caller
+# reads OAUTH_FLOW_ERROR for why.
+OAUTH_FLOW_ERROR=""
+
+oauth_run_flow() {
+  local mcp_url="$1" label="$2"
+  local verifier challenge state port redirect_uri client_id client_secret
+  local used_listener=0
+  OAUTH_FLOW_ERROR=""
+
+  say "Discovering OAuth configuration for $label..."
+  if ! oauth_discover "$mcp_url"; then
+    OAUTH_FLOW_ERROR="Could not discover OAuth authorization/token endpoints for this server (checked RFC 9728 protected-resource metadata and RFC 8414/OIDC authorization-server metadata)."
+    return 1
+  fi
+
+  port="$(oauth_pick_callback_port)"
+  redirect_uri="http://127.0.0.1:${port}/callback"
+
+  client_id="${OAUTH_PRESET_CLIENT_ID:-}"
+  client_secret="${OAUTH_PRESET_CLIENT_SECRET:-}"
+  if [[ -z "$client_id" ]]; then
+    if [[ -n "$OAUTH_REGISTRATION_ENDPOINT" ]]; then
+      say "Registering Aulthium as a client with this server (RFC 7591)..."
+      if ! oauth_dynamic_register "$OAUTH_REGISTRATION_ENDPOINT" "$redirect_uri"; then
+        OAUTH_FLOW_ERROR="Dynamic client registration failed and no client_id was pre-configured for this server."
+        return 1
+      fi
+      client_id="$OAUTH_CLIENT_ID"
+      client_secret="$OAUTH_CLIENT_SECRET"
+    else
+      # No RFC 7591 registration endpoint — GitHub's own MCP server is the
+      # common case here (github.com/login/oauth advertises no
+      # registration_endpoint at all; see
+      # github.com/github/github-mcp-server/blob/main/docs/oauth-login.md).
+      # Rather than hard-failing, fall back to asking the user for their
+      # own OAuth App's client_id/secret — see oauth_get_manual_client,
+      # which also caches the answer so this is only needed once per
+      # authorization server, not once per MCP server on it.
+      if ! oauth_get_manual_client "$label"; then
+        OAUTH_FLOW_ERROR="${OAUTH_FLOW_ERROR:-This server has no dynamic client registration endpoint and no client_id is pre-configured for it.}"
+        return 1
+      fi
+      client_id="$OAUTH_MANUAL_CLIENT_ID"
+      client_secret="$OAUTH_MANUAL_CLIENT_SECRET"
+    fi
+  fi
+
+  verifier="$(oauth_gen_code_verifier)"
+  challenge="$(oauth_code_challenge_s256 "$verifier")"
+  state="$(oauth_gen_state)"
+
+  local authz_url scope_param=""
+  [[ -n "$OAUTH_SCOPES" ]] && scope_param="&scope=$(url_encode_fallback "$OAUTH_SCOPES")"
+  authz_url="${OAUTH_AUTHZ_ENDPOINT}?response_type=code&client_id=$(url_encode_fallback "$client_id")&redirect_uri=$(url_encode_fallback "$redirect_uri")&state=$(url_encode_fallback "$state")&code_challenge=$(url_encode_fallback "$challenge")&code_challenge_method=S256${scope_param}"
+
+  box_top "OAUTH" "$ICON_MCP" "$C_ACCENT2"
+  box_line "Opening your browser to authorize $label..."
+  box_line "If it doesn't open, visit this URL manually:"
+  box_line "$authz_url"
+  box_bottom "$C_ACCENT2"
+  oauth_open_browser "$authz_url" >/dev/null 2>&1
+
+  local callback_method
+  callback_method="$(oauth_callback_method)"
+  if [[ -z "$callback_method" ]]; then
+    # Neither nc nor python is on this box — offer to install python
+    # once before falling back to manual paste, so a minimal install
+    # (common on fresh Termux) doesn't silently lose the automatic path.
+    oauth_offer_install_python && callback_method="$(oauth_callback_method)"
+  fi
+
+  case "$callback_method" in
+    nc)
+      used_listener=1
+      oauth_run_callback_listener "$port" 180
+      ;;
+    python)
+      used_listener=1
+      oauth_run_callback_listener_python "$port" 180
+      ;;
+    *)
+      oauth_manual_callback
+      ;;
+  esac
+
+  if [[ -n "$OAUTH_CALLBACK_ERROR" || -z "$OAUTH_CALLBACK_CODE" ]]; then
+    OAUTH_FLOW_ERROR="${OAUTH_CALLBACK_ERROR:-Authorization was not completed.}"
+    return 1
+  fi
+  # State validation (CSRF protection) — skipped only for the manual-paste
+  # fallback path when the user pasted a bare code with no state to check;
+  # any listener-based callback MUST match.
+  if [[ "$used_listener" -eq 1 && "$OAUTH_CALLBACK_STATE" != "$state" ]]; then
+    OAUTH_FLOW_ERROR="State mismatch on OAuth callback — possible CSRF, aborting."
+    return 1
+  fi
+
+  say "Exchanging authorization code for a token..."
+  if ! oauth_exchange_code "$OAUTH_TOKEN_ENDPOINT" "$OAUTH_CALLBACK_CODE" "$redirect_uri" "$verifier" "$client_id" "$client_secret"; then
+    OAUTH_FLOW_ERROR="${OAUTH_RPC_ERROR:-Token exchange failed.}"
+    return 1
+  fi
+
+  local access_token refresh_token expires_in obtained_at
+  access_token="$(jq -r '.access_token // empty' <<< "$OAUTH_TOKEN_JSON" 2>/dev/null)"
+  refresh_token="$(jq -r '.refresh_token // empty' <<< "$OAUTH_TOKEN_JSON" 2>/dev/null)"
+  expires_in="$(jq -r '.expires_in // empty' <<< "$OAUTH_TOKEN_JSON" 2>/dev/null)"
+  obtained_at="$(date +%s)"
+
+  # Belt and suspenders: oauth_exchange_code already refuses to report
+  # success without a non-empty access_token, but this is the point where
+  # a credential blob actually gets constructed and handed back to the
+  # caller (who saves it and immediately tries to use it as a bearer
+  # token) — so refuse here too rather than ever emitting
+  # {"access_token":"", ...} as if it were a good credential. That's what
+  # was previously happening: a blank token got saved and used, and every
+  # server connection then failed with an opaque HTTP 401 instead of a
+  # clear "the OAuth flow didn't actually get you a token" message.
+  if [[ -z "$access_token" ]]; then
+    OAUTH_FLOW_ERROR="Token exchange reported success but no access_token was present in the response — not saving a broken credential."
+    return 1
+  fi
+
+  jq -nc --arg at "$access_token" --arg rt "$refresh_token" --arg exp "$expires_in" \
+         --arg obtained "$obtained_at" --arg te "$OAUTH_TOKEN_ENDPOINT" \
+         --arg cid "$client_id" --arg cs "$client_secret" \
+    '{access_token:$at, refresh_token:($rt|select(length>0)),
+      expires_in:($exp|select(length>0)|tonumber?),
+      obtained_at:($obtained|tonumber), token_endpoint:$te,
+      client_id:$cid, client_secret:($cs|select(length>0))}'
+  return 0
+}
+
+# ── Live token retrieval, with transparent refresh ───────────────────────
+# oauth_get_valid_token <cred_id> -> prints a valid access_token on
+# stdout, refreshing first if it's expired (or within 60s of expiring)
+# and a refresh_token is available. This is the one function the MCP
+# request path (mcp_http_post) will call for "oauth"-type servers.
+oauth_get_valid_token() {
+  local cred_id="$1" cred access_token expires_in obtained_at now age refresh_token token_endpoint client_id client_secret
+  cred="$(cred_get "$cred_id")" || return 1
+  access_token="$(jq -r '.access_token // empty' <<< "$cred")"
+  expires_in="$(jq -r '.expires_in // empty' <<< "$cred")"
+  obtained_at="$(jq -r '.obtained_at // empty' <<< "$cred")"
+
+  if [[ -n "$expires_in" && -n "$obtained_at" ]]; then
+    now="$(date +%s)"
+    age=$(( now - obtained_at ))
+    if [[ $(( age + 60 )) -ge $expires_in ]]; then
+      refresh_token="$(jq -r '.refresh_token // empty' <<< "$cred")"
+      token_endpoint="$(jq -r '.token_endpoint // empty' <<< "$cred")"
+      client_id="$(jq -r '.client_id // empty' <<< "$cred")"
+      client_secret="$(jq -r '.client_secret // empty' <<< "$cred")"
+      if [[ -n "$refresh_token" && -n "$token_endpoint" ]]; then
+        if oauth_refresh_token "$token_endpoint" "$refresh_token" "$client_id" "$client_secret"; then
+          local new_access new_refresh new_expires
+          new_access="$(jq -r '.access_token' <<< "$OAUTH_TOKEN_JSON")"
+          new_refresh="$(jq -r '.refresh_token // empty' <<< "$OAUTH_TOKEN_JSON")"
+          [[ -z "$new_refresh" ]] && new_refresh="$refresh_token" # some servers omit it on refresh; keep the old one
+          new_expires="$(jq -r '.expires_in // empty' <<< "$OAUTH_TOKEN_JSON")"
+          local updated
+          updated="$(jq -nc --arg at "$new_access" --arg rt "$new_refresh" --arg exp "$new_expires" \
+                            --arg obtained "$(date +%s)" --arg te "$token_endpoint" \
+                            --arg cid "$client_id" --arg cs "$client_secret" \
+            '{access_token:$at, refresh_token:($rt|select(length>0)),
+              expires_in:($exp|select(length>0)|tonumber?),
+              obtained_at:($obtained|tonumber), token_endpoint:$te,
+              client_id:$cid, client_secret:($cs|select(length>0))}')"
+          cred_save "$cred_id" "$updated" || true
+          printf '%s' "$new_access"
+          return 0
+        else
+          # Refresh failed — token is stale/expired and unrecoverable
+          # without a fresh interactive authorization. Surface that
+          # distinctly from "not connected at all" so the caller can tell
+          # the user to reconnect rather than just "add" again.
+          return 2
+        fi
+      fi
+      # Expired with no refresh_token to use — same "needs reauth" signal.
+      return 2
+    fi
+  fi
+
+  [[ -z "$access_token" ]] && return 1
+  printf '%s' "$access_token"
+  return 0
 }
 
 ########################################################################
@@ -4744,10 +6086,12 @@ CF_MCP_DESCS=(
 )
 
 # 't> mcp cloudflare' — lists the catalog above, lets the user pick one or
-# more (comma-separated numbers, or "all"), asks once for a Cloudflare API
-# token, then registers each pick exactly like a manual 't> mcp add'.
+# more (comma-separated numbers, or "all"), then registers each pick either
+# via browser OAuth (each Cloudflare service authorizes separately, so this
+# opens the browser once per pick) or a single Cloudflare API token reused
+# across the whole batch — mirrors the same choice 't> mcp github' offers.
 mcp_pick_cloudflare() {
-  local i sel token entered any_added=0
+  local i sel choice token entered any_added=0
   local -a raw_parts=() picks=()
 
   box_top "CLOUDFLARE MCP SERVERS" "$ICON_MCP" "$C_ACCENT2"
@@ -4755,14 +6099,9 @@ mcp_pick_cloudflare() {
     box_line "$(printf '%2d) %-16s %s' "$((i + 1))" "${CF_MCP_NAMES[$i]}" "${CF_MCP_DESCS[$i]}")"
   done
   box_bottom "$C_ACCENT2"
-  muted "Cloudflare's own docs lead with browser OAuth, which this script can't do — instead it sends a Cloudflare API token as a bearer key, which Cloudflare also supports (user or account tokens). Some servers may work without one."
 
   read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Pick number(s), comma-separated, or 'all' ${C_MUTED}(blank to cancel)${C_RESET} ")" sel
   [[ -z "$sel" ]] && { muted "Cancelled."; return 0; }
-
-  read -r -s -p "Cloudflare API token to use for the picked server(s) (blank to try without one): " entered
-  echo
-  token="$entered"
 
   if [[ "$sel" == "all" ]]; then
     for i in "${!CF_MCP_NAMES[@]}"; do picks+=("$i"); done
@@ -4782,6 +6121,33 @@ mcp_pick_cloudflare() {
     return 1
   fi
 
+  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Auth via (o)Auth in browser or (t)oken? ${C_MUTED}(o/t, blank to cancel)${C_RESET} ")" choice
+  case "${choice,,}" in
+    o|oauth)
+      local pidx name url
+      for pidx in "${picks[@]}"; do
+        name="${CF_MCP_NAMES[$pidx]}"
+        url="${CF_MCP_URLS[$pidx]}"
+        if mcp_find_index "$name" >/dev/null; then
+          warn "\"$name\" is already configured — skipping (t> mcp remove $name first to re-add)."
+          continue
+        fi
+        mcp_add_server_oauth "$name" "$url" && any_added=1
+      done
+      # mcp_add_server_oauth already resets history/says so per server.
+      return 0
+      ;;
+    t|token)
+      read -r -s -p "Cloudflare API token to use for the picked server(s) (blank to try without one): " entered
+      echo
+      token="$entered"
+      ;;
+    *)
+      muted "Cancelled."
+      return 0
+      ;;
+  esac
+
   local pidx name url key_var key
   for pidx in "${picks[@]}"; do
     name="${CF_MCP_NAMES[$pidx]}"
@@ -4799,6 +6165,70 @@ mcp_pick_cloudflare() {
     init_history
     say "Conversation reset so the agent can see the new MCP tools."
   fi
+}
+
+########################################################################
+# GITHUB MCP QUICK-CONNECT
+#
+# GitHub runs one official remote MCP server (see
+# https://github.com/github/github-mcp-server and
+# https://docs.github.com/en/copilot/how-tos/provide-context/model-context-protocol/using-the-github-mcp-server)
+# at GH_MCP_URL below, exposing repos/issues/PRs/actions/etc as tools. Unlike
+# the Cloudflare picker above there's no catalog to choose from — this is
+# just a named shortcut so the URL doesn't have to be typed out, registered
+# exactly like any 't> mcp add <name> <url>' server (same arrays, same
+# 't> mcp list/remove/refresh').
+#
+# GitHub's server supports two auth styles: a fine-grained Personal Access
+# Token sent as a bearer key (simplest, works headless), or full OAuth 2.1 +
+# PKCE via this script's generic OAuth client (mcp_add_server_oauth) if the
+# user would rather authorize through the browser than paste a token.
+########################################################################
+GH_MCP_NAME="github"
+GH_MCP_URL="https://api.githubcopilot.com/mcp/"
+
+# 't> mcp github' — offers PAT-or-OAuth, then registers GH_MCP_NAME/GH_MCP_URL
+# exactly like a manual 't> mcp add' / 't> mcp oauth' would.
+mcp_pick_github() {
+  local choice token entered key_var
+
+  if mcp_find_index "$GH_MCP_NAME" >/dev/null; then
+    warn "\"$GH_MCP_NAME\" is already configured — 't> mcp remove $GH_MCP_NAME' first to reconnect."
+    return 1
+  fi
+
+  box_top "GITHUB MCP SERVER" "$ICON_MCP" "$C_ACCENT2"
+  box_line "$GH_MCP_URL"
+  box_line "Repos, issues, PRs, Actions, code search, and more"
+  box_bottom "$C_ACCENT2"
+
+  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Auth via (p)ersonal access token or (o)Auth in browser? ${C_MUTED}(p/o, blank to cancel)${C_RESET} ")" choice
+  case "${choice,,}" in
+    p|pat)
+      key_var="$(mcp_env_key_for "$GH_MCP_NAME")"
+      token="${!key_var:-}"
+      if [[ -z "$token" ]]; then
+        read -r -s -p "GitHub personal access token (fine-grained recommended): " entered
+        echo
+        token="$entered"
+      fi
+      if [[ -z "$token" ]]; then
+        warn "No token entered — cancelled."
+        return 1
+      fi
+      if mcp_register_server "$GH_MCP_NAME" "$GH_MCP_URL" "$token"; then
+        init_history
+        say "Conversation reset so the agent can see the new MCP tools."
+      fi
+      ;;
+    o|oauth)
+      mcp_add_server_oauth "$GH_MCP_NAME" "$GH_MCP_URL"
+      ;;
+    *)
+      muted "Cancelled."
+      return 0
+      ;;
+  esac
 }
 
 # Builds the chunk of the system prompt describing connected MCP servers'
@@ -4846,6 +6276,40 @@ $listing
 MCPPROMPT
 }
 
+# If an "mcp_call" hook plugin is registered and toggled on, gives it a
+# look at the pending server/tool/arguments before the user is asked to
+# confirm the call. Entry is invoked as: <entry> mcp_call <server> <tool>
+# <args-json>. Same VETO:/transform/pass-through contract as
+# shell_exec_plugin_hook: exit 0 + "VETO:<reason>" blocks the call, exit 0
+# + other non-empty (and valid-JSON) stdout replaces the argument object,
+# exit 0 + empty stdout or a non-zero exit leaves the arguments unchanged.
+# If the replacement stdout isn't valid JSON it's discarded with a warning
+# rather than sent on to the server. Always sets MCP_CALL_HOOK_ARGS to
+# whatever arguments should actually be sent.
+mcp_call_plugin_hook() {
+  local server="$1" tool="$2" args="$3" name
+  MCP_CALL_HOOK_ARGS="$args"
+  hook_point_is_active "mcp_call" || return 0
+  name="${HOOK_OWNER[mcp_call]}"
+
+  if ! plugin_hook_call "$name" "mcp_call" "$server" "$tool" "$args"; then
+    return 0
+  fi
+  if [[ "$PLUGIN_HOOK_OUTPUT" == VETO:* ]]; then
+    MCP_CALL_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT#VETO:}"
+    MCP_CALL_HOOK_VETO_REASON="${MCP_CALL_HOOK_VETO_REASON# }"
+    return 1
+  fi
+  if [[ -n "$PLUGIN_HOOK_OUTPUT" ]]; then
+    if jq -e . >/dev/null 2>&1 <<< "$PLUGIN_HOOK_OUTPUT"; then
+      MCP_CALL_HOOK_ARGS="$PLUGIN_HOOK_OUTPUT"
+    else
+      warn "Hook plugin '$name' returned non-JSON for mcp_call — ignoring its output, using the original arguments."
+    fi
+  fi
+  return 0
+}
+
 # MCP_CALL — invokes tools/call on a connected server. These are external
 # services the user explicitly connected, but unlike WEB_SEARCH/FILE_READ
 # they can have real side effects (the server decides, not this script), so
@@ -4856,6 +6320,13 @@ handle_mcp_call_action() {
 
   args_text="$(cat "$args_file")"
   [[ -z "$(printf '%s' "$args_text" | tr -d '[:space:]')" ]] && args_text="{}"
+
+  if ! mcp_call_plugin_hook "$server" "$tool" "$args_text"; then
+    warn "MCP_CALL $server.$tool blocked by hook plugin — ${MCP_CALL_HOOK_VETO_REASON:-no reason given}."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[MCP_CALL $server.$tool]: blocked by hook plugin (${MCP_CALL_HOOK_VETO_REASON:-no reason given})."
+    return
+  fi
+  args_text="$MCP_CALL_HOOK_ARGS"
 
   box_top "MCP CALL" "$ICON_MCP" "$C_ACCENT2"
   box_line "$server.$tool"
@@ -4889,7 +6360,12 @@ handle_mcp_call_action() {
   box_line "$server.$tool — running"
 
   url="${MCP_URLS[$idx]}"
-  key="${MCP_KEYS[$idx]}"
+  key="$(mcp_resolve_key "$idx")" || {
+    box_bottom "$C_ERR"
+    warn "MCP_CALL $server.$tool failed: OAuth session expired and needs reconnecting (t> mcp oauth $server ${MCP_URLS[$idx]})."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[MCP_CALL $server.$tool]: call failed (OAuth session expired — reconnect with t> mcp oauth $server)."
+    return
+  }
   session="${MCP_SESSION_IDS[$idx]}"
   proto_version="${MCP_PROTO_VERSIONS[$idx]}"
   params="$(jq -nc --arg name "$tool" --argjson args "$args_text" '{name:$name, arguments:$args}')"
@@ -4948,6 +6424,36 @@ handle_web_search_action() {
   AGENT_TOOL_OUTPUT+=$'\n\n'"[WEB_SEARCH \"$query\"] (results may be out of date the instant they're fetched — treat as a snapshot, not ground truth):"$'\n'"$results"
 }
 
+# If a "shell_exec" hook plugin is registered and toggled on, gives it a
+# look at the pending command before the user is asked to confirm it.
+# Entry is invoked as: <entry> shell_exec <command>. On exit 0:
+#   - stdout starting with "VETO:" blocks the command entirely — the rest
+#     of that line is the reason, surfaced to the user.
+#   - any other non-empty stdout REPLACES the command that will actually
+#     run (and gets shown in the confirmation box, not the original).
+#   - empty stdout leaves the command unchanged.
+# A non-zero exit (hook errored, crashed, etc) is treated as "no opinion"
+# — same fallback-to-unmodified behavior as web_search's hook when it
+# fails, so a flaky hook plugin never silently blocks shell access.
+# Always sets SHELL_EXEC_HOOK_CMD to whatever should actually run.
+shell_exec_plugin_hook() {
+  local cmd="$1" name
+  SHELL_EXEC_HOOK_CMD="$cmd"
+  hook_point_is_active "shell_exec" || return 0
+  name="${HOOK_OWNER[shell_exec]}"
+
+  if ! plugin_hook_call "$name" "shell_exec" "$cmd"; then
+    return 0
+  fi
+  if [[ "$PLUGIN_HOOK_OUTPUT" == VETO:* ]]; then
+    SHELL_EXEC_HOOK_VETO_REASON="${PLUGIN_HOOK_OUTPUT#VETO:}"
+    SHELL_EXEC_HOOK_VETO_REASON="${SHELL_EXEC_HOOK_VETO_REASON# }"
+    return 1
+  fi
+  [[ -n "$PLUGIN_HOOK_OUTPUT" ]] && SHELL_EXEC_HOOK_CMD="$PLUGIN_HOOK_OUTPUT"
+  return 0
+}
+
 # SHELL_RUN — requires explicit confirmation. Runs with cwd = WORKSPACE_DIR
 # but is NOT path-sandboxed like the file actions: the command itself can
 # reference anything the user's shell can reach. The confirmation prompt says
@@ -4956,6 +6462,13 @@ handle_shell_run_action() {
   local cmd_file="$1" cmd_text output exit_code exit_color
 
   cmd_text="$(cat "$cmd_file")"
+
+  if ! shell_exec_plugin_hook "$cmd_text"; then
+    warn "Shell command blocked by hook plugin — ${SHELL_EXEC_HOOK_VETO_REASON:-no reason given}."
+    AGENT_TOOL_OUTPUT+=$'\n\n'"[SHELL_RUN]: blocked by hook plugin (${SHELL_EXEC_HOOK_VETO_REASON:-no reason given})."
+    return
+  fi
+  cmd_text="$SHELL_EXEC_HOOK_CMD"
 
   box_top "SHELL RUN" "$ICON_SHELL" "$C_ERR"
   box_line "${C_DIM}cwd:${C_RESET} $WORKSPACE_DIR"
@@ -5525,18 +7038,41 @@ process_agent_reply() {
         mode="text"
         continue
       fi
-      if [[ -n "$line" ]]; then
-        bulk_folder_paths+=("$line")
-        cleaned+="${C_DIM}  + $line${C_RESET}"$'\n'
+      # Requires an explicit <<<ITEM path="...">>> line, same as BULK_WRITE
+      # and BULK_MOVE — a bare line used to be accepted as a path outright
+      # (see git history / CHANGELOG), which meant a model that ever slipped
+      # ordinary commentary inside this block — or worse, line-wrapped a
+      # sentence one word per line — had every one of those words silently
+      # queued up as a folder to create. Requiring the marker means free
+      # text can never syntactically match, no matter how path-like a
+      # single stray word happens to look.
+      if [[ "$line" =~ ^\<\<\<ITEM\ path=\"([^\"]*)\"\>\>\>$ ]]; then
+        bulk_folder_paths+=("${BASH_REMATCH[1]}")
+        cleaned+="${C_DIM}  + ${BASH_REMATCH[1]}${C_RESET}"$'\n'
+      elif [[ "$line" =~ path=[\"\']([^\"\']*)[\"\'] ]]; then
+        # Near-miss (single-quoted, extra whitespace, etc.) — same
+        # tolerance shim pattern used elsewhere in this parser.
+        bulk_folder_paths+=("${BASH_REMATCH[1]}")
+        cleaned+="${C_DIM}  + ${BASH_REMATCH[1]}${C_RESET}"$'\n'
+      elif [[ -n "$line" ]]; then
+        warn "Non-ITEM line inside BULK_FOLDER_CREATE, skipped: $line"
+        cleaned+="${C_WARN}${ICON_WARN} not a valid ITEM line, skipped: $line${C_RESET}"$'\n'
       fi
     elif [[ "$mode" == "bulkdelete" ]]; then
       if [[ "$line" == '<<<END_BULK_DELETE>>>' ]]; then
         mode="text"
         continue
       fi
-      if [[ -n "$line" ]]; then
-        bulk_delete_paths+=("$line")
-        cleaned+="${C_DIM}  + $line${C_RESET}"$'\n'
+      # See BULK_FOLDER_CREATE above — same fix, same reasoning.
+      if [[ "$line" =~ ^\<\<\<ITEM\ path=\"([^\"]*)\"\>\>\>$ ]]; then
+        bulk_delete_paths+=("${BASH_REMATCH[1]}")
+        cleaned+="${C_DIM}  + ${BASH_REMATCH[1]}${C_RESET}"$'\n'
+      elif [[ "$line" =~ path=[\"\']([^\"\']*)[\"\'] ]]; then
+        bulk_delete_paths+=("${BASH_REMATCH[1]}")
+        cleaned+="${C_DIM}  + ${BASH_REMATCH[1]}${C_RESET}"$'\n'
+      elif [[ -n "$line" ]]; then
+        warn "Non-ITEM line inside BULK_DELETE, skipped: $line"
+        cleaned+="${C_WARN}${ICON_WARN} not a valid ITEM line, skipped: $line${C_RESET}"$'\n'
       fi
     elif [[ "$mode" == "bulkmove" ]]; then
       # Trim incidental leading/trailing whitespace before comparing the
@@ -5904,7 +7440,7 @@ plugin_hook_state_save() {
 # result); failures (missing runtime, hook collision, bad manifest) print
 # a warning but never block the rest of startup.
 plugins_autostart() {
-  local dir name manifest mode hook toggle_prefix runtime entry autostart state
+  local dir name manifest mode hook toggle_prefix runtime entry autostart state priority
 
   for dir in "$PLUGINS_DIR"/*/; do
     manifest="${dir}plugin.json"
@@ -5924,6 +7460,8 @@ plugins_autostart() {
     entry="$(jq -r '.entry // empty' "$manifest" 2>/dev/null)"
     runtime="$(jq -r '.runtime // empty' "$manifest" 2>/dev/null)"
     toggle_prefix="$(jq -r '.toggle_prefix // empty' "$manifest" 2>/dev/null)"
+    priority="$(jq -r '.priority // 0' "$manifest" 2>/dev/null)"
+    [[ "$priority" =~ ^-?[0-9]+$ ]] || priority=0
 
     if [[ -z "$hook" || -z "$entry" ]]; then
       warn "Autostart: '$name' has an incomplete hook manifest (missing entry/hook) — skipped."
@@ -5934,19 +7472,13 @@ plugins_autostart() {
       continue
     fi
 
-    case "$hook" in
-      web_search)
-        if [[ -n "$WEB_SEARCH_HOOK_PLUGIN" ]]; then
-          warn "Autostart: '$name' also wants the web_search hook, already taken by '$WEB_SEARCH_HOOK_PLUGIN' — skipped."
-          continue
-        fi
-        WEB_SEARCH_HOOK_PLUGIN="$name"
-        ;;
-      *)
-        warn "Autostart: '$name' declares an unknown hook point '$hook' — skipped."
-        continue
-        ;;
-    esac
+    if ! hook_point_is_known "$hook"; then
+      warn "Autostart: '$name' declares an unknown hook point '$hook' — skipped. Known hook points: $KNOWN_HOOK_POINTS"
+      continue
+    fi
+    if ! hook_claim_ownership "$name" "$hook" "$priority"; then
+      continue
+    fi
 
     if [[ -n "$toggle_prefix" ]]; then
       if [[ -n "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]:-}" ]]; then
@@ -5962,6 +7494,7 @@ plugins_autostart() {
     RUNNING_PLUGIN_ENTRY[$name]="$entry"
     RUNNING_PLUGIN_DIR[$name]="$dir"
     RUNNING_PLUGIN_TOGGLE_PREFIX[$name]="$toggle_prefix"
+    RUNNING_PLUGIN_PRIORITY[$name]="$priority"
   done
 }
 
@@ -6098,6 +7631,9 @@ plugin_manifest_validate() {
     if [[ -z "$hook" ]]; then
       err "\"mode\": \"hook\" needs a \"hook\" field naming the hook point (e.g. \"web_search\")."
       return 1
+    fi
+    if ! hook_point_is_known "$hook"; then
+      warn "plugin.json declares hook point '$hook', which this version of Aulthium doesn't know (known: $KNOWN_HOOK_POINTS) — it'll fail to register until that's fixed or a future version adds it."
     fi
   fi
   perms="$(jq -r '.permissions[]? // empty' "$manifest" 2>/dev/null)"
@@ -6714,14 +8250,15 @@ plugin_list() {
   # terminal, so t> plugin/plugin list is the only place their live
   # on/off state is otherwise visible.
   if [[ "${#RUNNING_PLUGIN_ENABLED[@]}" -gt 0 ]]; then
-    local rname rstate rhook rprefix
+    local rname rstate rhook rprefix rpriority
     box_line ""
     box_line "${C_MUTED}Running:${C_RESET}"
     for rname in "${!RUNNING_PLUGIN_ENABLED[@]}"; do
       rstate="${RUNNING_PLUGIN_ENABLED[$rname]}"
       rhook="${RUNNING_PLUGIN_HOOK[$rname]}"
       rprefix="${RUNNING_PLUGIN_TOGGLE_PREFIX[$rname]:-}"
-      box_line "  ${C_BOLD}${rname}${C_RESET}${C_MUTED} — hook: ${rhook}, state: ${rstate}${C_RESET}"
+      rpriority="${RUNNING_PLUGIN_PRIORITY[$rname]:-0}"
+      box_line "  ${C_BOLD}${rname}${C_RESET}${C_MUTED} — hook: ${rhook} (priority ${rpriority}), state: ${rstate}${C_RESET}"
       if [[ -n "$rprefix" ]]; then
         box_line "    ${C_MUTED}toggle: ${rprefix}> on|off   or   t> plugin toggle ${rname} on|off${C_RESET}"
       else
@@ -6937,10 +8474,10 @@ plugin_stoprun() {
 
   local prefix="${RUNNING_PLUGIN_TOGGLE_PREFIX[$name]:-}"
   [[ -n "$prefix" ]] && unset "TOGGLE_PREFIX_TO_PLUGIN[$prefix]"
-  [[ "$WEB_SEARCH_HOOK_PLUGIN" == "$name" ]] && WEB_SEARCH_HOOK_PLUGIN=""
+  hook_release_ownership "$name"
   unset "RUNNING_PLUGIN_ENABLED[$name]" "RUNNING_PLUGIN_HOOK[$name]" \
         "RUNNING_PLUGIN_ENTRY[$name]" "RUNNING_PLUGIN_DIR[$name]" \
-        "RUNNING_PLUGIN_TOGGLE_PREFIX[$name]"
+        "RUNNING_PLUGIN_TOGGLE_PREFIX[$name]" "RUNNING_PLUGIN_PRIORITY[$name]"
   plugin_hook_state_save "$name" "stopped"
 
   ok "Stopped '$name' — it's fully de-registered now (run it again with t> plugin run $name)."
@@ -6984,7 +8521,7 @@ plugin_run() {
   fi
 
   local name="$1"; shift || true
-  local dir manifest entry runtime desc mode hook toggle_prefix status
+  local dir manifest entry runtime desc mode hook toggle_prefix status priority
 
   if [[ -z "$name" ]]; then
     warn "Usage: t> plugin run <name>"
@@ -7015,6 +8552,8 @@ plugin_run() {
   mode="$(jq -r '.mode // "foreground"' "$manifest" 2>/dev/null)"
   hook="$(jq -r '.hook // empty' "$manifest" 2>/dev/null)"
   toggle_prefix="$(jq -r '.toggle_prefix // empty' "$manifest" 2>/dev/null)"
+  priority="$(jq -r '.priority // 0' "$manifest" 2>/dev/null)"
+  [[ "$priority" =~ ^-?[0-9]+$ ]] || priority=0
 
   if [[ -z "$entry" ]]; then
     err "Plugin '$name' has no \"entry\" command in its plugin.json — can't run it."
@@ -7072,19 +8611,14 @@ plugin_run() {
       return 1
     fi
 
-    case "$hook" in
-      web_search)
-        if [[ -n "$WEB_SEARCH_HOOK_PLUGIN" && "$WEB_SEARCH_HOOK_PLUGIN" != "$name" ]]; then
-          warn "Replacing '$WEB_SEARCH_HOOK_PLUGIN' as the active web_search hook with '$name'."
-          plugin_stoprun "$WEB_SEARCH_HOOK_PLUGIN"
-        fi
-        WEB_SEARCH_HOOK_PLUGIN="$name"
-        ;;
-      *)
-        err "Plugin '$name' declares an unknown hook point '$hook' — this version of Aulthium only knows: web_search."
-        return 1
-        ;;
-    esac
+    if ! hook_point_is_known "$hook"; then
+      err "Plugin '$name' declares an unknown hook point '$hook' — this version of Aulthium only knows: $KNOWN_HOOK_POINTS."
+      return 1
+    fi
+    if ! hook_claim_ownership "$name" "$hook" "$priority"; then
+      return 1
+    fi
+    RUNNING_PLUGIN_PRIORITY[$name]="$priority"
 
     if [[ -n "$toggle_prefix" ]]; then
       if [[ -n "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]:-}" && "${TOGGLE_PREFIX_TO_PLUGIN[$toggle_prefix]}" != "$name" ]]; then
@@ -7744,9 +9278,33 @@ run_agent_turns() {
   return 0
 }
 
+# If a "chat_pre" hook plugin is registered and toggled on, lets it
+# rewrite the user's message before it's added to conversation history and
+# sent to the model. Entry is invoked as: <entry> chat_pre <message>. Exit
+# 0 + non-empty stdout REPLACES the outgoing message (what the model sees
+# — and what gets stored in history — is the plugin's output, not what the
+# user typed). Exit 0 + empty stdout, or a non-zero exit, leaves the
+# message unchanged. There's no VETO here — a plugin that wants to block a
+# message entirely can just not be a great fit for this hook point; send
+# it back as empty-ish text instead. Always sets CHAT_PRE_HOOK_TEXT to
+# whatever should actually be sent.
+chat_pre_plugin_hook() {
+  local text="$1" name
+  CHAT_PRE_HOOK_TEXT="$text"
+  hook_point_is_active "chat_pre" || return 0
+  name="${HOOK_OWNER[chat_pre]}"
+
+  if plugin_hook_call "$name" "chat_pre" "$text" && [[ -n "$PLUGIN_HOOK_OUTPUT" ]]; then
+    CHAT_PRE_HOOK_TEXT="$PLUGIN_HOOK_OUTPUT"
+  fi
+  return 0
+}
+
 send_chat() {
   local user_text="$1"
   check_chat_limit
+  chat_pre_plugin_hook "$user_text"
+  user_text="$CHAT_PRE_HOOK_TEXT"
   append_message "user" "$user_text"
   run_agent_turns
 }
@@ -7837,8 +9395,44 @@ command_router() {
     mcp\ cloudflare|mcp\ cf)
       mcp_pick_cloudflare
       ;;
+    mcp\ github|mcp\ gh)
+      mcp_pick_github
+      ;;
+    mcp\ oauth\ *)
+      rest="${cmd#mcp oauth }"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      local mcp_oauth_name="${rest%% *}" mcp_oauth_url="${rest#* }"
+      if [[ -z "$mcp_oauth_name" || "$mcp_oauth_name" == "$rest" || -z "$mcp_oauth_url" ]]; then
+        warn "Usage: t> mcp oauth <name> <url>"
+      else
+        mcp_add_server_oauth "$mcp_oauth_name" "$mcp_oauth_url"
+      fi
+      ;;
+    mcp\ cred\ encrypt\ on)
+      if ! command -v openssl >/dev/null 2>&1; then
+        err "openssl isn't installed — can't enable encrypted credential storage."
+      else
+        CRED_STORE_MODE="encrypted"
+        CRED_STORE_PASSPHRASE=""
+        ok "Encrypted credential storage enabled — you'll be prompted for a passphrase on first use this session."
+      fi
+      ;;
+    mcp\ cred\ encrypt\ off)
+      CRED_STORE_MODE="plain"
+      CRED_STORE_PASSPHRASE=""
+      warn "Credential storage set back to plain (permission-restricted) mode. Existing encrypted credentials won't be readable until you turn encryption back on."
+      ;;
+    mcp\ cred\ clear)
+      if confirm_action "Delete ALL stored MCP credentials (OAuth tokens) from disk?"; then
+        cred_clear
+        ok "Cleared the credential store."
+      fi
+      ;;
+    mcp\ cred*)
+      warn "Usage: t> mcp cred [encrypt on|off | clear]"
+      ;;
     mcp\ *)
-      warn "Unknown mcp subcommand. Usage: t> mcp [add <name> <url> | remove <name> | list | refresh [name] | cloudflare]"
+      warn "Unknown mcp subcommand. Usage: t> mcp [add <name> <url> | oauth <name> <url> | remove <name> | list | refresh [name] | cloudflare | github | cred ...]"
       ;;
     memory)
       memory_status
