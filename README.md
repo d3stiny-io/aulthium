@@ -5,11 +5,11 @@
 <h1 align="center">Aulthium</h1>
 
 <p align="center">
-  <strong>Your open-source AI agent, built for the terminal.</strong>
+  <strong>The open-source AI agent that runs anywhere you have a terminal — including your phone.</strong>
 </p>
 
 <p align="center">
-  Code • Search • Automate • Extend
+  Code • Search • Automate • Extend — on Linux, macOS, or Android (Termux)
 </p>
 
 <p align="center">
@@ -50,13 +50,17 @@
 
 ## ⚡ What is Aulthium?
 
-**Aulthium** is a free and open-source AI agent designed to work directly from your terminal.
+**Aulthium** is a free and open-source AI agent designed to work directly from your terminal — no editor lock-in, no subscription, no desktop required.
 
 It can understand your project, work with files, execute commands, search the web, connect to MCP servers, and now **extend itself through plugins**.
 
-Whether you're on a desktop, a server, or **Termux on Android**, Aulthium gives you an AI agent that stays close to your environment.
+Most AI coding agents assume you're at a desk. Aulthium doesn't. Install it on a Linux box, a macOS laptop, a remote server, or straight onto your Android phone via **Termux** — same agent, same plugins, same control, wherever your terminal is.
 
 > **AI proposes. You stay in control.**
+
+<p align="center">
+  <a href="#-quick-start"><strong>Get started in one command →</strong></a>
+</p>
 
 ---
 
@@ -88,6 +92,14 @@ Bring your own tools.
 Bring your own plugins.
 
 **Make the agent yours.**
+
+| | Typical AI coding tools | Aulthium |
+| :--- | :--- | :--- |
+| Runs on | Desktop editor / IDE | Linux, macOS, server, **Android (Termux)** |
+| Provider | Locked to one vendor | Bring your own key — OpenRouter, Google, Mistral, HF, NVIDIA, custom |
+| Extending it | Wait for a feature request | Build a plugin yourself |
+| Execution | Varies | Every shell command needs your explicit `[y/N]` |
+| Cost | Subscription | Free, open-source (GPL-3.0) |
 
 ---
 
