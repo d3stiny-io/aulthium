@@ -203,11 +203,13 @@ Your phone can be your development environment.
 
 Track Aulthium's GitHub stars over time. This chart is generated dynamically, so it updates automatically as the repository gains stars.
 
-<p align="center">
-  <a href="https://star-history.com/#d3stiny-io/aulthium&Date">
-    <img src="https://api.star-history.com/svg?repos=d3stiny-io/aulthium&type=Date" alt="Aulthium Star History">
-  </a>
-</p>
+<a href="https://www.star-history.com/?repos=d3stiny-io%2Faulthium&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=d3stiny-io/aulthium&type=date&theme=dark&legend=top-left&sealed_token=8bavlmFKzb7v6V33efnihYf8yocVNSr2wNrIGlDeeTlDVPEL6U2mbY2cIAWWvvYhiolVBZ6SidyIZoWzrtWkFRsYn-gEN9JqHoMx7bOHIheSCVD-n8ySiA" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=d3stiny-io/aulthium&type=date&legend=top-left&sealed_token=8bavlmFKzb7v6V33efnihYf8yocVNSr2wNrIGlDeeTlDVPEL6U2mbY2cIAWWvvYhiolVBZ6SidyIZoWzrtWkFRsYn-gEN9JqHoMx7bOHIheSCVD-n8ySiA" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=d3stiny-io/aulthium&type=date&legend=top-left&sealed_token=8bavlmFKzb7v6V33efnihYf8yocVNSr2wNrIGlDeeTlDVPEL6U2mbY2cIAWWvvYhiolVBZ6SidyIZoWzrtWkFRsYn-gEN9JqHoMx7bOHIheSCVD-n8ySiA" />
+ </picture>
+</a>
 
 ---
 
