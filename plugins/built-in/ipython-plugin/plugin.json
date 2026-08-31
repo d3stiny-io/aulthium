@@ -1,0 +1,15 @@
+{
+  "name": "ipython-plugin",
+  "description": "Routes the AI's Python SHELL_RUN commands through one persistent IPython kernel per terminal session, so variables/imports survive between calls, errors come back with IPython's verbose per-frame-locals tracebacks, and magics like %%writefile, %history, %who, %time, and ! shell-escapes all work.",
+  "version": "1.0.0",
+  "mode": "hook",
+  "hook": "shell_exec",
+  "entry": "python3 ipy_run.py",
+  "runtime": "python3",
+  "autostart": true,
+  "toggle_prefix": "ipy",
+  "permissions": ["filesystem", "shell"],
+  "config": {
+    "idle_timeout_minutes": 120
+  }
+}

@@ -199,6 +199,18 @@ Your phone can be your development environment.
 
 ---
 
+# 📊 Star History
+
+Track Aulthium's GitHub stars over time. This chart is generated dynamically, so it updates automatically as the repository gains stars.
+
+<p align="center">
+  <a href="https://star-history.com/#d3stiny-io/aulthium&Date">
+    <img src="https://api.star-history.com/svg?repos=d3stiny-io/aulthium&type=Date" alt="Aulthium Star History">
+  </a>
+</p>
+
+---
+
 # 🧩 Plugins
 
 ## Aulthium is extensible.
