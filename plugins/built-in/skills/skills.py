@@ -56,6 +56,38 @@ misread as a command instead of chat text, when going through the
 prefix-forward path. This does NOT affect the real chat_pre hook call
 (case 1 above), which is tagged unambiguously by aulthium itself.
 
+v0.4.0: five real bugs fixed after actual testing, not just review:
+  - `use`/`remove`/`set` disagreed on what "name" means: `use` looked
+    skills up by their editable frontmatter `name:` field, while
+    remove/set/add looked them up by folder name. Renaming a skill via
+    `set <folder> name <new>` (or two skills sharing a frontmatter name)
+    made `use` fail or silently shadow one of them. Every lookup now
+    keys off "slug" (the folder name) consistently; `list`/`test` now
+    print slug as the identifier to pass to other commands.
+  - `find_matches` crashed uncaught if AULTHIUM_PLUGIN_CFG_MIN_SCORE /
+    _MAX_SKILLS held anything non-integer (blank, "2.5", a typo). Since
+    aulthium.sh discards this script's stderr on the real chat_pre call,
+    that crash was completely invisible -- skill matching would just
+    silently stop firing on every message from then on. Parsing is now
+    tolerant and always falls back to the built-in default.
+  - `import` of a .zip containing more than one skill only installed the
+    first SKILL.md found and reported success, silently dropping every
+    other skill in the bundle. Now installs all of them.
+  - A value containing a literal newline (e.g. a pasted multi-line
+    description via `set`) silently truncated at the newline on the
+    next read, with no error. Frontmatter values are now sanitized to a
+    single line on write.
+  - `set`/`remove`/`use` on a name that's actually one of this plugin's
+    own config keys (min_score/max_skills/skills_dir -- which are NOT
+    set via this file's `set` at all, but via
+    `a> plugin config skills set <key> <value>`) now hints at the
+    correct command instead of just "no skill named 'min_score'".
+  - `--skills-dir X <command>` (X before the subcommand -- the normal,
+    argparse-legal order) had the whole call silently misrouted as
+    chat_pre-style text instead of running <command>, because dispatch
+    only ever checked the very first token. Now skips a leading
+    --skills-dir <value> pair before checking what subcommand follows.
+
 v0.3.0: switched from the "web_search" hook to "chat_pre" (see above)
 -- this is the behavior change that makes skill matching actually run
 on every message instead of only when the model chooses to search.
@@ -105,7 +137,13 @@ def parse_frontmatter(text):
 
 
 def render_frontmatter(meta, body):
-    front = "\n".join(f"{k}: {v}" for k, v in meta.items())
+    # Frontmatter here is a flat "key: value" line per field -- a value
+    # containing a literal newline would silently truncate at that
+    # newline on the next parse (parse_frontmatter reads line-by-line and
+    # drops any continuation line that has no ":" in it), quietly losing
+    # part of what was written with no error anywhere. Collapse newlines
+    # in every value before writing so that can't happen.
+    front = "\n".join(f"{k}: {' '.join(str(v).splitlines())}" for k, v in meta.items())
     return f"---\n{front}\n---\n{body}"
 
 
@@ -120,6 +158,14 @@ def load_skills(skills_dir):
             text = skill_file.read_text(encoding="utf-8", errors="replace")
             meta, body = parse_frontmatter(text)
             skills.append({
+                # "slug" is the folder name -- the actual, unique, stable
+                # identifier every other command (remove/set/use) looks
+                # skills up by. "name" is just the frontmatter's own
+                # `name:` field, which is free-text and editable via
+                # `set <slug> name <anything>` -- it can drift from the
+                # folder name, or collide with another skill's name, so
+                # it must never be used as a lookup key (see cmd_use).
+                "slug": entry.name,
                 "name": meta.get("name", entry.name),
                 "description": meta.get("description", ""),
                 "path": str(skill_file),
@@ -140,6 +186,28 @@ def score(query, skill):
 
 # ----------------------------------------------------------------- hook
 
+def _cfg_int(env_var, default):
+    """Parse a AULTHIUM_PLUGIN_CFG_* env var as an int, tolerantly.
+    These come from user-edited config (a> plugin config skills set ...),
+    so a typo (blank, "2.5", "abc") is a realistic, not hypothetical,
+    input. On the real chat_pre hook path, aulthium.sh discards this
+    script's stderr entirely -- an uncaught exception here doesn't show
+    an error anywhere, it just makes the plugin silently stop matching
+    on every single message from then on. Always return an int; never
+    raise.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return default
+
+
 def find_matches(query, skills_dir=None, threshold=None, max_skills=None):
     """Shared matching logic: every skill scoring >= threshold against
     query, ranked best first, capped at max_skills. Mirrors Claude
@@ -147,9 +215,10 @@ def find_matches(query, skills_dir=None, threshold=None, max_skills=None):
     rather than picking a single winner."""
     skills_dir = skills_dir if skills_dir is not None else default_skills_dir()
     if threshold is None:
-        threshold = int(os.environ.get("AULTHIUM_PLUGIN_CFG_MIN_SCORE", "2"))
+        threshold = _cfg_int("AULTHIUM_PLUGIN_CFG_MIN_SCORE", 2)
     if max_skills is None:
-        max_skills = int(os.environ.get("AULTHIUM_PLUGIN_CFG_MAX_SKILLS", "3"))
+        max_skills = _cfg_int("AULTHIUM_PLUGIN_CFG_MAX_SKILLS", 3)
+    max_skills = max(0, max_skills)
 
     skills = load_skills(skills_dir)
     if not query or not skills:
@@ -197,13 +266,35 @@ def run_chat_pre_hook(message):
 
 # -------------------------------------------------------------- CLI: list
 
+# Config keys this plugin itself reads (see plugin.json's "config" and
+# find_matches' _cfg_int above). Not skill names -- these live in the
+# plugin's own config.json, changed via `a> plugin config skills set ...`,
+# not through any subcommand in this file. Used only to give a pointed
+# hint when someone tries to `set`/`remove`/`use` one of these by
+# mistake instead (an easy mix-up: this file also has its own unrelated
+# `set` subcommand, for editing a *skill's* frontmatter).
+PLUGIN_CONFIG_KEYS = {"min_score", "max_skills", "skills_dir"}
+
+
+def _config_hint(name):
+    if name not in PLUGIN_CONFIG_KEYS:
+        return ""
+    return (f" ('{name}' is one of this plugin's own settings, not a skill -- "
+            f"change it with: a> plugin config skills set {name} <value>)")
+
+
 def cmd_list(args):
     skills = load_skills(args.skills_dir)
     if not skills:
         print(f"No skills in {Path(args.skills_dir).expanduser()}")
         return
     for s in skills:
-        print(f"{s['name']}")
+        print(f"{s['slug']}")
+        if s["name"] != s["slug"]:
+            # set <slug> name ... can point the frontmatter name away
+            # from the folder it actually lives in and is looked up by
+            # -- flag that here so it's never a silent trap.
+            print(f"    (displayed as '{s['name']}' -- still use '{s['slug']}' with remove/set/use)")
         print(f"    {s['description']}")
         print(f"    {s['path']}")
 
@@ -228,7 +319,7 @@ def cmd_remove(args):
     root = Path(args.skills_dir).expanduser()
     target = root / args.name
     if not target.is_dir():
-        sys.exit(f"error: no skill named '{args.name}' in {root}")
+        sys.exit(f"error: no skill named '{args.name}' in {root}{_config_hint(args.name)}")
     if not args.yes:
         resp = input(f"Remove skill '{args.name}' at {target}? [y/N] ").strip().lower()
         if resp != "y":
@@ -241,6 +332,9 @@ def cmd_remove(args):
 # ------------------------------------------------------------ CLI: import
 
 def _install_skill_dir(skill_dir, root, force, rename=None):
+    """Installs one skill folder and returns the name it was installed
+    under (callers that install several skills at once, e.g. a multi-skill
+    zip, use the return value to print a summary)."""
     meta, _ = parse_frontmatter((skill_dir / "SKILL.md").read_text())
     name = rename or meta.get("name") or skill_dir.name
     dest = root / name
@@ -250,6 +344,7 @@ def _install_skill_dir(skill_dir, root, force, rename=None):
         shutil.rmtree(dest)
     shutil.copytree(skill_dir, dest)
     print(f"imported skill '{name}' -> {dest}")
+    return name
 
 
 def cmd_import(args):
@@ -261,10 +356,20 @@ def cmd_import(args):
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(src) as zf:
                 zf.extractall(tmp)
-            found = list(Path(tmp).rglob("SKILL.md"))
+            # A zip can bundle more than one skill (e.g. a whole
+            # skills/ library, or several SKILL.md at different
+            # nesting depths) -- installing only the first one found
+            # and calling it done silently drops the rest with no
+            # warning at all. Install every one found instead.
+            found = sorted(Path(tmp).rglob("SKILL.md"))
             if not found:
                 sys.exit("error: no SKILL.md found inside that zip")
-            _install_skill_dir(found[0].parent, root, args.force, args.name)
+            if len(found) > 1 and args.name:
+                sys.exit(f"error: that zip contains {len(found)} skills -- "
+                         f"--name only makes sense for a zip with exactly one")
+            installed = [_install_skill_dir(f.parent, root, args.force, args.name) for f in found]
+            if len(installed) > 1:
+                print(f"({len(installed)} skills imported from {src.name}: {', '.join(installed)})")
 
     elif src.is_dir():
         if not (src / "SKILL.md").is_file():
@@ -293,7 +398,9 @@ def cmd_set(args):
     root = Path(args.skills_dir).expanduser()
     skill_md = root / args.name / "SKILL.md"
     if not skill_md.is_file():
-        sys.exit(f"error: no skill named '{args.name}'")
+        sys.exit(f"error: no skill named '{args.name}'{_config_hint(args.name)}")
+    if ":" in args.key or "\n" in args.key:
+        sys.exit("error: key cannot contain ':' or a newline")
     meta, body = parse_frontmatter(skill_md.read_text())
     meta[args.key] = args.value
     skill_md.write_text(render_frontmatter(meta, body))
@@ -303,10 +410,21 @@ def cmd_set(args):
 # --------------------------------------------------------------- CLI: use
 
 def cmd_use(args):
-    skills = {s["name"]: s for s in load_skills(args.skills_dir)}
+    # Keyed by slug (folder name), NOT by frontmatter "name" -- the
+    # latter is free-text, editable via `set <slug> name ...`, and can
+    # drift away from the slug or collide between two different skills.
+    # Keying this dict by "name" used to mean: rename a skill via `set`,
+    # and every later `use <original-folder-name>` would fail with "no
+    # skill named ...", while every other command (remove/set) still
+    # only ever accepted the original folder name. slug is unique by
+    # construction (it's a real directory name) and is what remove/set
+    # already expect, so this makes all four commands agree on what
+    # "name" means.
+    skills = {s["slug"]: s for s in load_skills(args.skills_dir)}
     missing = [n for n in args.names if n not in skills]
     if missing:
-        sys.exit(f"error: no skill named '{missing[0]}' in {Path(args.skills_dir).expanduser()}")
+        sys.exit(f"error: no skill named '{missing[0]}' in "
+                 f"{Path(args.skills_dir).expanduser()}{_config_hint(missing[0])}")
 
     selected = [skills[n] for n in args.names]
 
@@ -331,7 +449,9 @@ def cmd_test(args):
         return
     ranked = sorted(((score(args.query, s), s) for s in skills), key=lambda x: -x[0])
     for sc, s in ranked[:5]:
-        print(f"{sc:>3}  {s['name']:<24} {s['description']}")
+        # slug, not the (possibly renamed, possibly non-unique)
+        # frontmatter name -- slug is what use/remove/set actually take.
+        print(f"{sc:>3}  {s['slug']:<24} {s['description']}")
 
 
 # ------------------------------------------------------------------ main
@@ -386,6 +506,25 @@ def build_parser():
 KNOWN_COMMANDS = {"list", "add", "remove", "import", "set", "use", "test"}
 
 
+def _effective_first_word(tokens):
+    """What "first word" should mean when deciding whether tokens opens
+    with one of this plugin's own subcommands, vs. is chat_pre-style
+    free text. Plain tokens[0] gets this wrong for a perfectly ordinary,
+    argparse-legal invocation like `skills.py --skills-dir /tmp/x list`
+    -- --skills-dir is this parser's one top-level flag and is
+    documented as usable before the subcommand, but naively checking
+    tokens[0] sees "--skills-dir", finds it's not a known subcommand,
+    and silently misroutes the entire call as chat text instead of
+    dispatching "list". Skip over a leading --skills-dir <value> pair
+    first. (Doesn't handle a --skills-dir value that itself needs
+    quoting/contains spaces -- a rare case for a flag that's mainly used
+    for local testing, not worth the extra complexity here.)
+    """
+    if len(tokens) >= 3 and tokens[0] == "--skills-dir":
+        return tokens[2]
+    return tokens[0] if tokens else ""
+
+
 def main():
     argv = sys.argv[1:]
     if not argv:
@@ -420,7 +559,7 @@ def main():
     # argv is used as-is.
     if len(argv) == 1:
         full_text = argv[0]
-        first_word = full_text.split(None, 1)[0] if full_text.strip() else ""
+        first_word = _effective_first_word(full_text.split())
         if first_word in KNOWN_COMMANDS or first_word in ("-h", "--help"):
             try:
                 parsed_args = shlex.split(full_text)
@@ -434,7 +573,7 @@ def main():
             run_chat_pre_hook(full_text)
             return
     else:
-        first_word = argv[0]
+        first_word = _effective_first_word(argv)
         if first_word in KNOWN_COMMANDS or first_word in ("-h", "--help"):
             parsed_args = argv
         else:

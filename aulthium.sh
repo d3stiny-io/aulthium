@@ -298,7 +298,8 @@ hook_chain_add() {
 # from hook_chain_add itself so re-registering moves rather than
 # duplicates an entry.
 hook_chain_remove() {
-  local name="$1" hook="$2" chain="${HOOK_CHAIN[$hook]:-}"
+  local name="$1" hook="$2"
+  local chain="${HOOK_CHAIN[$hook]:-}"
   [[ -n "$chain" ]] || return 0
   local -a members=() new_members=()
   read -r -a members <<< "$chain"
@@ -316,7 +317,8 @@ hook_chain_remove() {
 # Releases whatever hook point plugin $1 is registered on, if any. Called
 # from plugin_stoprun.
 hook_chain_release() {
-  local name="$1" hook="${RUNNING_PLUGIN_HOOK[$name]:-}"
+  local name="$1"
+  local hook="${RUNNING_PLUGIN_HOOK[$name]:-}"
   [[ -n "$hook" ]] && hook_chain_remove "$name" "$hook"
 }
 
@@ -326,7 +328,8 @@ hook_chain_release() {
 # silently — a hook point with nothing active in it (empty result here) means every
 # *_plugin_hook wrapper below falls through to its built-in behavior.
 hook_active_chain() {
-  local hook="$1" chain="${HOOK_CHAIN[$hook]:-}" m
+  local hook="$1" m
+  local chain="${HOOK_CHAIN[$hook]:-}"
   HOOK_ACTIVE_CHAIN=()
   [[ -n "$chain" ]] || return 0
   for m in $chain; do
@@ -1623,8 +1626,13 @@ show_help() {
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp oauth <n> <url>" "connect via OAuth 2.1 + PKCE (opens your browser)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp remove <name>" "disconnect an MCP server"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp refresh [name]" "re-discover tools (one server, or all)"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp catalog" "list every quick-connect provider (Cloudflare, GitHub, ...)"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp cloudflare" "quick-pick from Cloudflare's managed MCP servers"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp github" "quick-connect to GitHub's official remote MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp notion" "quick-connect to Notion's official remote MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp resend" "quick-connect to Resend's official remote MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp linear" "quick-connect to Linear's official remote MCP server"
+  printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp stripe" "quick-connect to Stripe's official remote MCP server"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> mcp cred ..." "encrypt on/off | clear — manage stored OAuth tokens"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin" "list installed plugins"
   printf "${C_MUTED}│${C_RESET} %-22s %s\n" "a> plugin run <name>" "launch a plugin (needs a y/N permissions grant)"
@@ -1712,7 +1720,10 @@ show_help() {
   printf "${C_MUTED}│${C_RESET}       added they're ordinary MCP servers like any other.\n"
   printf "${C_MUTED}│${C_RESET}       ${C_RESET}a> mcp github${C_MUTED} quick-connects to GitHub's official\n"
   printf "${C_MUTED}│${C_RESET}       remote MCP server (repos, issues, PRs, Actions, ...) via\n"
-  printf "${C_MUTED}│${C_RESET}       a personal access token or browser OAuth.\n"
+  printf "${C_MUTED}│${C_RESET}       a personal access token or browser OAuth. ${C_RESET}a> mcp notion${C_MUTED},\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}a> mcp resend${C_MUTED}, ${C_RESET}a> mcp linear${C_MUTED}, and ${C_RESET}a> mcp stripe${C_MUTED} work the\n"
+  printf "${C_MUTED}│${C_RESET}       same way for their own official remote servers — run\n"
+  printf "${C_MUTED}│${C_RESET}       ${C_RESET}a> mcp catalog${C_MUTED} to see every quick-connect shortcut at once.\n"
   printf "${C_ACCENT2}└─────────────────────────────────────────────${C_RESET}\n"
 
   printf "\n${C_ACCENT2}┌─ PLUGINS ─────────────────────────────────────${C_RESET}\n"
@@ -4807,7 +4818,8 @@ mcp_rpc() {
 # an oauth server's token is unrecoverably expired, so callers can tell the
 # user to reconnect rather than just report a generic auth failure.
 mcp_resolve_key() {
-  local idx="$1" auth_type="${MCP_AUTH_TYPES[$idx]:-apikey}" tok rc
+  local idx="$1" tok rc
+  local auth_type="${MCP_AUTH_TYPES[$idx]:-apikey}"
   if [[ "$auth_type" == "oauth" ]]; then
     tok="$(oauth_get_valid_token "${MCP_OAUTH_CRED_IDS[$idx]}")"; rc=$?
     if [[ $rc -eq 2 ]]; then
@@ -6277,6 +6289,133 @@ mcp_pick_github() {
       return 0
       ;;
   esac
+}
+
+########################################################################
+# KNOWN MCP QUICK-CONNECT (single-server providers)
+#
+# Same idea as the GITHUB MCP QUICK-CONNECT section above, generalized:
+# each entry here is one vendor's official remote MCP server at a fixed,
+# known endpoint, so picking it by name only ever prompts for auth — no
+# URL to type out. Whatever gets picked registers exactly like any
+# 'a> mcp add <name> <url>' server (same arrays, same 'a> mcp
+# list/remove/refresh'). Endpoints/auth verified against each vendor's own
+# docs as of this writing:
+#   Notion  — https://developers.notion.com/guides/mcp/get-started-with-mcp
+#   Resend  — https://resend.com/docs/mcp-server
+#   Linear  — https://linear.app/docs/mcp
+#   Stripe  — https://docs.stripe.com/mcp
+#
+# KNOWN_MCP_PAT_SUPPORTED: 1 if the provider accepts a static bearer
+# token/API key as an alternative to OAuth (like GitHub's PAT above), 0 if
+# the provider's remote server is OAuth-only (Notion has no API-key path
+# for it) — in that case the picker skips the p/o choice and goes
+# straight to OAuth.
+########################################################################
+KNOWN_MCP_NAMES=(notion resend linear stripe)
+KNOWN_MCP_URLS=(
+  "https://mcp.notion.com/mcp"
+  "https://mcp.resend.com/mcp"
+  "https://mcp.linear.app/mcp"
+  "https://mcp.stripe.com"
+)
+KNOWN_MCP_DESCS=(
+  "Search, read, create, and update Notion pages, databases, and comments"
+  "Send email, manage templates/broadcasts/contacts/domains, check logs"
+  "Find, create, and update Linear issues, projects, comments, and cycles"
+  "Read account/customer/payment data, issue refunds, manage subscriptions"
+)
+KNOWN_MCP_PAT_SUPPORTED=(0 1 1 1)
+KNOWN_MCP_PAT_LABELS=(
+  ""
+  "Resend API key"
+  "Linear API key or personal access token"
+  "Stripe restricted API key"
+)
+
+# name -> index in KNOWN_MCP_NAMES, or empty (return 1) if not a known
+# provider. Used both by the 'a> mcp <provider>' router cases and by
+# mcp_show_catalog.
+mcp_known_provider_index() {
+  local name="$1" i
+  for i in "${!KNOWN_MCP_NAMES[@]}"; do
+    [[ "${KNOWN_MCP_NAMES[$i]}" == "$name" ]] && { printf '%s' "$i"; return 0; }
+  done
+  return 1
+}
+
+# 'a> mcp <provider>' for anything in KNOWN_MCP_NAMES — offers a static
+# key or browser OAuth (or skips straight to OAuth for a PAT-less
+# provider), then registers it exactly like a manual 'a> mcp add' /
+# 'a> mcp oauth' would.
+mcp_pick_known_provider() {
+  local name="$1" pidx url desc pat_supported pat_label choice token entered key_var
+
+  pidx="$(mcp_known_provider_index "$name")" || { warn "\"$name\" isn't a known quick-connect provider — see: a> mcp catalog"; return 1; }
+  url="${KNOWN_MCP_URLS[$pidx]}"
+  desc="${KNOWN_MCP_DESCS[$pidx]}"
+  pat_supported="${KNOWN_MCP_PAT_SUPPORTED[$pidx]}"
+  pat_label="${KNOWN_MCP_PAT_LABELS[$pidx]}"
+
+  if mcp_find_index "$name" >/dev/null; then
+    warn "\"$name\" is already configured — 'a> mcp remove $name' first to reconnect."
+    return 1
+  fi
+
+  box_top "$(printf '%s MCP SERVER' "${name^^}")" "$ICON_MCP" "$C_ACCENT2"
+  box_line "$url"
+  box_line "$desc"
+  box_bottom "$C_ACCENT2"
+
+  if [[ "$pat_supported" -ne 1 ]]; then
+    muted "\"$name\" only supports browser OAuth for its remote server — connecting that way."
+    mcp_add_server_oauth "$name" "$url"
+    return
+  fi
+
+  read -r -p "$(printf "${C_ACCENT2}?${C_RESET} Auth via (k)ey or (o)Auth in browser? ${C_MUTED}(k/o, blank to cancel)${C_RESET} ")" choice
+  case "${choice,,}" in
+    k|key|p|pat)
+      key_var="$(mcp_env_key_for "$name")"
+      token="${!key_var:-}"
+      if [[ -z "$token" ]]; then
+        read -r -s -p "${pat_label:-API key} for \"$name\": " entered
+        echo
+        token="$entered"
+      fi
+      if [[ -z "$token" ]]; then
+        warn "No key entered — cancelled."
+        return 1
+      fi
+      if mcp_register_server "$name" "$url" "$token"; then
+        init_history
+        say "Conversation reset so the agent can see the new MCP tools."
+      fi
+      ;;
+    o|oauth)
+      mcp_add_server_oauth "$name" "$url"
+      ;;
+    *)
+      muted "Cancelled."
+      return 0
+      ;;
+  esac
+}
+
+# 'a> mcp catalog' — one place listing every quick-connect shortcut
+# (Cloudflare's own picker, GitHub, and every KNOWN_MCP_NAMES provider) so
+# 'a> mcp add <name> <url>' isn't the only way to discover these exist.
+mcp_show_catalog() {
+  local i
+  box_top "MCP QUICK-CONNECT CATALOG" "$ICON_MCP" "$C_ACCENT2"
+  box_line "a> mcp cloudflare    pick from Cloudflare's managed MCP servers"
+  box_line "a> mcp github        GitHub — repos, issues, PRs, Actions, code search"
+  for i in "${!KNOWN_MCP_NAMES[@]}"; do
+    box_line "$(printf 'a> mcp %-12s %s' "${KNOWN_MCP_NAMES[$i]}" "${KNOWN_MCP_DESCS[$i]}")"
+  done
+  box_line ""
+  box_line "Anything else: a> mcp add <name> <url> (or a> mcp oauth <name> <url>)"
+  box_bottom "$C_ACCENT2"
 }
 
 # Builds the chunk of the system prompt describing connected MCP servers'
@@ -7821,7 +7960,8 @@ plugin_tree_checksum() {
 # (local folder, zip URL, GitHub), so every plugin on disk carries a hash
 # of what was actually delivered.
 plugin_stamp_integrity() {
-  local dest="$1" manifest="$dest/plugin.json" hash stamped
+  local dest="$1" hash stamped
+  local manifest="$dest/plugin.json"
   [[ -f "$manifest" ]] || return 1
   hash="$(plugin_tree_checksum "$dest")"
   stamped="$(jq --arg h "$hash" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
@@ -9468,6 +9608,13 @@ command_router() {
       ;;
     mcp\ github|mcp\ gh)
       mcp_pick_github
+      ;;
+    mcp\ catalog)
+      mcp_show_catalog
+      ;;
+    mcp\ notion|mcp\ resend|mcp\ linear|mcp\ stripe)
+      rest="${cmd#mcp }"
+      mcp_pick_known_provider "$rest"
       ;;
     mcp\ oauth\ *)
       rest="${cmd#mcp oauth }"

@@ -1,7 +1,7 @@
 {
   "name": "skills",
   "description": "On every chat message, checks a local library of Claude-style SKILL.md files and injects every skill that plausibly applies (not just the single best match) before the message reaches the model -- the same way Claude consults its own skills",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "entry": "python3 skills.py",
   "runtime": "python3",
   "mode": "hook",
