@@ -277,10 +277,10 @@ Aulthium
 ### 🎮 Plugin commands
 
 ```text
-t> plugin list
-t> plugin info <name>
-t> plugin install /path/to/plugin
-t> plugin run <name>
+a> plugin list
+a> plugin info <name>
+a> plugin install /path/to/plugin
+a> plugin run <name>
 ```
 
 ### 💡 What can plugins do?
@@ -315,7 +315,7 @@ Aulthium ships with a built-in **WebChat plugin**.
 Instead of interacting with the agent entirely through the terminal, you can open a local browser interface.
 
 ```text
-t> plugin run webchat
+a> plugin run webchat
 ```
 
 WebChat is designed to be:
@@ -360,7 +360,7 @@ Aulthium is designed so the AI doesn't simply execute everything without you.
 For example:
 
 ```text
-┌─ ❯ SHELL RUN ───────────────────────────────
+┌─ ❯ SHELL RUN ─────────────────────────────────
 │ cwd: /your/project
 │ npm install example-package
 └──────────────────────────────────────────────
