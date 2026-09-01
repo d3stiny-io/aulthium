@@ -360,10 +360,10 @@ Aulthium is designed so the AI doesn't simply execute everything without you.
 For example:
 
 ```text
-┌─ ❯ SHELL RUN ─────────────────────────────────
-│ cwd: /your/project
-│ npm install example-package
-└──────────────────────────────────────────────
+┌─ ❯ SHELL RUN ─────────────────────────────────┐
+│ cwd: /your/project                                  │
+│ npm install example-package                         │
+└─────────────────────────────────────────────┘
 ⚠ This is NOT sandboxed to the workspace folder.
 ? Run this command? [y/N]
 ```
