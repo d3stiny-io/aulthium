@@ -39,7 +39,7 @@
 ---
 
 <p align="center">
-  <img src="assets/src/public/demo.mp4" alt="Aulthium Demo">
+  <img src="assets/src/public/demo.webp" alt="Aulthium Demo">
 </p>
 
 <p align="center">
