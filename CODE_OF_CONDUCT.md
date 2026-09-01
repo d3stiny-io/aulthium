@@ -1,9 +1,11 @@
 # Code of Conduct
- 
+
 ## Our Pledge
- 
+
+Aulthium is built by people running it on very different setups — laptops, servers, phones via Termux — and we want the community around it to be just as welcoming as the tool itself.
+
 We are committed to making Aulthium a welcoming, respectful, and constructive open-source project for everyone.
- 
+
 We expect contributors, maintainers, users, and community members to participate in good faith and treat others with respect.
  
 ## Expected Behavior

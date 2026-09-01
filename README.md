@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/src/public/icon.png" width="180" alt="Aulthium">
+  <img src="assets/src/public/logo.png" width="180" alt="Aulthium">
 </p>
 
 <h1 align="center">Aulthium</h1>
@@ -39,7 +39,7 @@
 ---
 
 <p align="center">
-  <img src="assets/src/public/banner.gif" alt="Aulthium Demo">
+  <img src="assets/src/public/demo.mp4" alt="Aulthium Demo">
 </p>
 
 <p align="center">
@@ -72,17 +72,23 @@ Aulthium takes a different approach:
 
 ```text
                  ┌──────────────────────┐
-                 │      AULTHIUM        │
-                 │      AI AGENT        │
+                 │       AULTHIUM           │
+                 │       AI AGENT           │
                  └──────────┬───────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-    Your Code          Your Terminal        The Web
-        │                   │                   │
-        └───────────────────┼───────────────────┘
-                            │
-                       Your Plugins
+                              │
+         ┌─────────────────┼─────────────────┐
+         │                    │                    │
+         ▼                    ▼                   ▼
+   ┌────────────┐    ┌────────────┐    ┌────────────┐
+   │ YOUR CODE    │    │  TERMINAL    │    │  THE WEB     │
+   └────┬───────┘    └────┬───────┘    └─────┬──────┘
+         │                   │                     │
+         └────────────────┼──────────────────┘
+                             │
+                             ▼
+                 ┌──────────────────────┐
+                 │    YOUR PLUGINS          │
+                 └──────────────────────┘
 ```
 
 Bring your own provider.

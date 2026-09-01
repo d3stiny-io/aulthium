@@ -1,7 +1,7 @@
 # Security Policy
- 
-Security is important to Aulthium.
- 
+
+Aulthium can touch your files, your shell, and your credentials — on a laptop, a server, or the phone in your pocket. We don't take that lightly.
+
 Aulthium is an AI coding agent that can interact with files, terminals, plugins, MCP servers, external services, and user-configured AI providers. Because of this, security issues can potentially affect both Aulthium and the environments where it runs.
  
 ## Supported Versions
