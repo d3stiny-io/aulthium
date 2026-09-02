@@ -38,7 +38,7 @@
 
 ---
 
-https://github.com/user-attachments/assets/1aeb8736-0c0a-4b64-9d69-9958a5e3bc76
+https://github.com/user-attachments/assets/c4a7ad5e-46a2-4ff5-adab-224e1a591480
 
 <p align="center">
   <em>The terminal is your workspace. Aulthium is your agent.</em>
