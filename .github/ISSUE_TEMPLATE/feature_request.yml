@@ -1,0 +1,61 @@
+name: 💡 Feature Request
+description: Suggest an idea or improvement for Aulthium.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an idea! Before requesting a core feature, consider whether it could be built as a **[plugin](../../docs/guides/plugin/BUILD_PLUGIN.md) or skill** instead — most functionality doesn't need to live in the core agent.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the problem or limitation you're running into.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How do you expect this to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: who-benefits
+    attributes:
+      label: Who would benefit from this?
+      description: Who else might find this useful (e.g. all users, Termux/Android users, plugin authors)?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Could this be a plugin or skill instead of a core change?
+      options:
+        - "Yes, it could be a plugin"
+        - "Yes, it could be a skill"
+        - "No, it needs to be part of the core"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds you've tried or thought about.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that would help us understand the request (mockups, examples, links, etc).
+    validations:
+      required: false

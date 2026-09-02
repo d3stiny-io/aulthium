@@ -1,0 +1,102 @@
+name: 🐛 Bug Report
+description: Report something that isn't working as expected in Aulthium.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please search [existing issues](../../issues) first to avoid duplicates.
+
+        ⚠️ **Never include API keys, OAuth tokens, passwords, or other secrets** in this report or in any attached logs.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce the issue?
+      placeholder: |
+        1. Run '...'
+        2. Do '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened instead?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Aulthium version
+      description: Run `aulthium --version` (or check your install) and paste the output.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Device / OS
+      options:
+        - Linux
+        - macOS
+        - Android (Termux)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: termux-version
+    attributes:
+      label: Termux version (if applicable)
+      description: Only relevant if you're running Aulthium on Android/Termux.
+    validations:
+      required: false
+
+  - type: textarea
+    id: plugins
+    attributes:
+      label: Plugins / skills / MCP servers in use
+      description: List any plugins, skills, or MCP integrations that are enabled and may be related.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error messages
+      description: |
+        Paste any relevant logs or error output. This will be rendered as code automatically.
+        **Please scrub any secrets, tokens, or credentials before pasting.**
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that might help us understand the problem.
+    validations:
+      required: false

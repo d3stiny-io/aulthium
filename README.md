@@ -38,12 +38,32 @@
 
 ---
 
-<p align="center">
-  <img src="assets/src/public/demo.webp" alt="Aulthium Demo">
-</p>
+https://github.com/user-attachments/assets/1aeb8736-0c0a-4b64-9d69-9958a5e3bc76
 
 <p align="center">
   <em>The terminal is your workspace. Aulthium is your agent.</em>
+</p>
+
+---
+
+## 🚀 Quick Start
+
+Run Aulthium with a single command:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/aulthium/main/aulthium.sh)
+```
+
+Then configure your AI provider and start working. That's it.
+
+> [!IMPORTANT]
+> This one-liner downloads and runs a shell script directly from this repo. Always read [`aulthium.sh`](aulthium.sh) yourself before piping it into `bash` if you want to know exactly what it does on your machine.
+
+> [!TIP]
+> On Android, install [Termux](https://f-droid.org/en/packages/com.termux/) first, then run the same command above — no other setup required.
+
+<p align="center">
+  <a href="#-requirements"><strong>See full requirements ↓</strong></a>
 </p>
 
 ---
@@ -57,10 +77,6 @@ It can understand your project, work with files, execute commands, search the we
 Most AI coding agents assume you're at a desk. Aulthium doesn't. Install it on a Linux box, a macOS laptop, a remote server, or straight onto your Android phone via **Termux** — same agent, same plugins, same control, wherever your terminal is.
 
 > **AI proposes. You stay in control.**
-
-<p align="center">
-  <a href="#-quick-start"><strong>Get started in one command →</strong></a>
-</p>
 
 ---
 
@@ -304,7 +320,8 @@ Want something that Aulthium doesn't have?
 
 📚 **[Read the Plugin Development Guide](docs/guides/plugin/BUILD_PLUGIN.md)**
 
-> ⚠️ Plugins are trusted programs and may run with your normal user permissions. Only install plugins you trust.
+> [!WARNING]
+> Plugins are trusted programs and may run with your normal user permissions. Only install plugins you trust.
 
 ---
 
@@ -328,6 +345,9 @@ WebChat is designed to be:
 
 **Terminal when you want it.  
 WebChat when you don't.**
+
+> [!NOTE]
+> WebChat runs entirely on your machine — nothing is sent anywhere except to your configured AI provider.
 
 ---
 
@@ -420,20 +440,6 @@ Aulthium is designed for environments where a terminal is available.
 - 📱 Android through Termux
 
 That means you can have an AI coding agent on a phone without needing a traditional desktop IDE.
-
----
-
-# 🚀 Quick Start
-
-Run Aulthium:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/d3stiny-io/aulthium/main/aulthium.sh)
-```
-
-Configure your AI provider and start working.
-
-That's it.
 
 ---
 
