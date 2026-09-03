@@ -37,6 +37,9 @@
   <a href="https://discord.gg/vG7dVzX5W8">
     <img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord">
   </a>
+  <a href="https://youtube.com/@aulthium?si=ky2BqDb9Oj2jJzdX">
+    <img src="https://img.shields.io/badge/YouTube-Subscribe-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube">
+  </a>
 </p>
 
 ---
@@ -499,6 +502,10 @@ If something breaks:
 Join the Aulthium community on Discord to ask questions, share plugins, and connect with other users.
 
 **[👉 Join our Discord](https://discord.gg/vG7dVzX5W8)**
+
+Subscribe to the official YouTube channel for demos, updates, and tutorials.
+
+**[▶️ Watch on YouTube](https://youtube.com/@aulthium?si=ky2BqDb9Oj2jJzdX)**
 
 ---
 
