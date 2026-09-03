@@ -34,6 +34,9 @@
   <a href="https://github.com/d3stiny-io/aulthium">
     <img src="https://img.shields.io/github/repo-size/d3stiny-io/aulthium?style=for-the-badge&label=Size" alt="Repository Size">
   </a>
+  <a href="https://discord.gg/vG7dVzX5W8">
+    <img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord">
+  </a>
 </p>
 
 ---
@@ -488,6 +491,14 @@ The plugin ecosystem, MCP functionality, WebChat, and agent capabilities are con
 If something breaks:
 
 **Tell us. Fix it. Build on it.**
+
+---
+
+# 💬 Community
+
+Join the Aulthium community on Discord to ask questions, share plugins, and connect with other users.
+
+**[👉 Join our Discord](https://discord.gg/vG7dVzX5W8)**
 
 ---
 
